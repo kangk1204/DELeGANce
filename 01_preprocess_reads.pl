@@ -142,7 +142,7 @@ my ($OPT_FASTQ_REGEX);
 sub print_usage {
     my $script = $0;
     # Try to align with repo naming; fall back to auto-detect
-    my $default_bb     = File::Spec->catfile($Bin, "00_DELeGANce_DIRK1A_BB_information.txt");
+    my $default_bb     = File::Spec->catfile($Bin, "00_BB_information.txt");
     my $default_fastq  = File::Spec->catdir($Bin, "00_original_files");
     my $default_base   = File::Spec->catdir($Bin, "DELeGANce_out");
     my $default_thr    = $ENV{FASTP_THREADS} // 4;
@@ -176,8 +176,8 @@ Optional:
   -h, --help                이 도움말 출력 후 종료
 
 Examples:
-  perl $script -b $default_bb -o DIRK1A_delegance_out
-  perl $script -b /data/BB_info.tsv -f /data/fastq -o /data/runs/DIRK1A_20250815 -t 6 --mismatch hp_op_cp
+  perl $script -b $default_bb -o example_run
+  perl $script -b /data/BB_info.tsv -f /data/fastq -o /data/runs/example_20250815 -t 6 --mismatch hp_op_cp
 USAGE
 }
 
@@ -251,8 +251,8 @@ sub _auto_detect_bbinfo {
     closedir($DH);
     return undef unless @candidates;
     return $candidates[0] if @candidates == 1;
-    # Prefer a file containing 'DELeGANce' or 'DIRK1A' if multiple
-    my @prefer = grep { /DELeGANce|DIRK1A/i } @candidates;
+    # Prefer a file containing 'DELeGANce' or 'BB_information' if multiple
+    my @prefer = grep { /DELeGANce|BB[_-]?information/i } @candidates;
     return $prefer[0] if @prefer;
     return $candidates[0];
 }

@@ -9,12 +9,34 @@ import numpy as np
 import pandas as pd
 
 
-def _find_latest_annot(run_root: Path) -> Path:
+def _resolve_annot(run_root: Path, prefer_dir: str) -> Path:
+    if prefer_dir:
+        preferred = run_root / prefer_dir / "05_hybrid_annot.tsv"
+        if preferred.exists():
+            return preferred
+    fallback = run_root / "03_normalized" / "05_hybrid_annot.tsv"
+    if fallback.exists():
+        return fallback
+
     candidates = list(run_root.rglob("05_hybrid_annot.tsv"))
     if not candidates:
         raise FileNotFoundError(f"[ERROR] 05_hybrid_annot.tsv not found under {run_root}")
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    msg = "\n".join(str(c) for c in sorted(candidates))
+    raise FileNotFoundError(
+        "[ERROR] Multiple 05_hybrid_annot.tsv files found. "
+        "Specify --annot_tsv or --prefer_dir.\n" + msg
+    )
+
+
+def _guess_run_name(annot_path: Path) -> str:
+    parts = list(annot_path.parts)
+    if "03_normalized" in parts:
+        idx = parts.index("03_normalized")
+        if idx > 0:
+            return parts[idx - 1]
+    return annot_path.parent.name
 
 
 def _pick_col(cols: List[str], preferred: List[str]) -> Optional[str]:
@@ -200,13 +222,19 @@ def _html_table(df: pd.DataFrame) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Beginner-friendly QC report for DELeGANce outputs")
-    ap.add_argument("--run_root", action="append", required=True, help="Run root (e.g., DELeGANce_out/my_run)")
+    ap.add_argument("--run_root", action="append", default=[], help="Run root (e.g., DELeGANce_out/my_run)")
+    ap.add_argument("--annot_tsv", action="append", default=[], help="Explicit 05_hybrid_annot.tsv path (repeatable)")
+    ap.add_argument("--prefer_dir", default="03_normalized/glm_full_dev_cpu_fp64",
+                    help="Preferred subdir under run_root for 05_hybrid_annot.tsv")
     ap.add_argument("--out_html", default="DELeGANce_out/Beginner_QC_Report.html")
     ap.add_argument("--out_tsv", default="DELeGANce_out/Beginner_QC_TopHits.tsv")
     ap.add_argument("--top_n", type=int, default=200, help="Top N hits per run (HitScore ranking)")
     args = ap.parse_args()
 
+    annot_paths = [Path(p) for p in args.annot_tsv]
     run_roots = [Path(p) for p in args.run_root]
+    if not annot_paths and not run_roots:
+        raise SystemExit("[ERROR] --run_root or --annot_tsv is required.")
     out_html = Path(args.out_html)
     out_tsv = Path(args.out_tsv)
 
@@ -214,8 +242,27 @@ def main() -> None:
     top_tables = []
     per_run_html = []
 
+    for annot_path in annot_paths:
+        if not annot_path.exists():
+            raise FileNotFoundError(f"[ERROR] annot_tsv not found: {annot_path}")
+        df = pd.read_csv(annot_path, sep="\t", low_memory=False)
+        run_name = _guess_run_name(annot_path)
+        summary = _summary_counts(df)
+        summary["run"] = run_name
+        summaries.append(summary)
+
+        top_table, del2_col = _build_top_table(df, args.top_n)
+        top_table.insert(1, "Run", run_name)
+        top_tables.append(top_table)
+
+        per_run_html.append(
+            f"<h2>{html.escape(run_name)}</h2>"
+            f"<p>Top {args.top_n} by HitScore (HitScore_GLM/HitScore_RS fallback).</p>"
+            f"{_html_table(top_table)}"
+        )
+
     for run_root in run_roots:
-        annot_path = _find_latest_annot(run_root)
+        annot_path = _resolve_annot(run_root, args.prefer_dir)
         df = pd.read_csv(annot_path, sep="\t", low_memory=False)
 
         run_name = run_root.name

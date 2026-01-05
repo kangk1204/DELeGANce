@@ -32,12 +32,15 @@ DELeGANce_out/
 
 # Local input data folders
 00_*_input_fastq/
+00_input_fastq*/
 00_original_files/
 00_demo_fastqs/
 
 # Local BB metadata (non-code)
 00_*_BB_information*.txt
 00_*_BB_information*.tsv
+00_BB_information*.txt
+00_BB_information*.tsv
 
 # Images / figures
 *.png
@@ -54,3 +57,7 @@ DELeGANce_out/
 # Temporary files
 *.tmp
 *.swp
+
+# Local-only mapping files (never commit)
+local_target_map.tsv
+local_target_map.json
