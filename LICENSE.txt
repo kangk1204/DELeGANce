@@ -1,0 +1,49 @@
+DELeGANce Non-Commercial Academic Research License
+
+Copyright (c) 2026 Keunsoo Kang
+
+Permission is hereby granted to use, copy, modify, and distribute this
+software and associated documentation files (the "Software") solely for
+non-commercial academic and research purposes, subject to the conditions
+below.
+
+Definitions
+1) "Non-Commercial Academic and Research Purposes" means use by academic,
+   educational, or research organizations for scholarly, educational, or
+   scientific work that is not intended for, or directed toward, commercial
+   advantage or monetary compensation.
+2) "Commercial Use" includes, without limitation:
+   a) use by or for a for-profit entity;
+   b) use in the development, production, or provision of a product or
+      service for sale or for-profit use;
+   c) use in contract research, fee-for-service work, or consulting for a
+      commercial entity;
+   d) use where results are sold, licensed, or otherwise exploited for
+      commercial advantage or monetary compensation.
+
+Restrictions
+1) Commercial Use is strictly prohibited without prior written permission
+   from the copyright holder.
+2) Any distribution of the Software must include this license and the above
+   copyright notice.
+3) This license does not grant any rights to trademarks, service marks,
+   trade names, or logos of the copyright holder.
+4) You may not imply endorsement by the copyright holder.
+
+Termination
+This license will terminate automatically if you violate any of its terms.
+Upon termination, you must cease all use and distribution of the Software.
+
+For commercial licensing inquiries, please contact:
+keunsoo.kang@your-email-domain
+
+Disclaimer of Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+Limitation of Liability
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -1,0 +1,1938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+03_call_hits.py (formerly 03_all_in_one_hitcaller_250829p3.py)
+
+DELeGANce — All‑in‑one: GLM(Rk vs DEL2) + ReadScaler + NEG penalty/gating + NEG-centering + Annotation + Report
+
+Highlights
+----------
+- GLM은 모든 효과를 Rk vs DEL2 일관척도로 산출(논문 보고/재현성 ↑).
+- NEG는 과산포 학습(w_neg & fix_neg_poisson), GLM 벌점(Penalty_NEG), q-게이팅, 선택적 하드게이트로 반영.
+- NEG‑Centering: null subset에서의 중앙값으로 LFC_NEG를 센터링하고(표기상 0 근처),
+  선택적으로 max_neg_centered_lfc 초과 레코드를 하드게이팅.
+- ReadScaler: R1/R2 vs BEAD, paired‑boost, q‑value, MAD 기반 분산패널티.
+- Annotation: type==Codon만 (LIB_ID, BB_ID) 우선 매칭(없으면 BB_ID 폴백).
+- 보고물: TSV 일괄 + PNG 플롯 3종 + HTML 요약 리포트.
+
+References (design rationales)
+- Rk vs DEL2 일관척도 GLM 및 HitScore 구조.  [internal ref]  :contentReference[oaicite:3]{index=3}
+- ReadScaler 지표/필터(q‑value, paired‑boost, MAD penalty).       [internal ref]  :contentReference[oaicite:4]{index=4}
+- BB metadata (type==Codon, CP→Codon·BB 매핑 규칙).               [internal ref]  :contentReference[oaicite:5]{index=5}
+"""
+
+import os, sys, argparse, csv, re, math, json, warnings
+from html import escape as html_escape
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import pandas as pd
+try:
+    from rdkit import Chem  # type: ignore
+    _HAS_RDKIT = True
+except Exception:
+    _HAS_RDKIT = False
+
+# Optional deps
+_HAS_TORCH = True
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")   # Best-effort: reduce TorchDynamo overhead on PyTorch 2.x
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1") # Best-effort: skip TorchDynamo compile path when supported
+if os.environ.get("DELEGANCE_DISABLE_TORCH", "").strip() in ("1","true","TRUE","yes"):
+    _HAS_TORCH = False
+else:
+    try:
+        import torch
+        # Default stays float64 for numerical stability; we override per-model tensors.
+        torch.set_default_dtype(torch.float64)
+        # Torch may lazily import networkx via torch._dynamo/_compile wrappers even on CPU.
+        # If networkx is missing or broken, proactively disable torch backend to avoid runtime crashes.
+        try:
+            import networkx  # type: ignore  # noqa: F401
+        except Exception as e:
+            _HAS_TORCH = False
+            try:
+                warnings.warn(
+                    f"[WARN] Disabling PyTorch backend because importing networkx failed: {e}. "
+                    "Set DELEGANCE_DISABLE_TORCH=1 to silence this warning.",
+                    RuntimeWarning,
+                )
+            except Exception:
+                pass
+    except Exception:
+        _HAS_TORCH = False
+        try:
+            warnings.warn("[INFO] PyTorch not available; using lightweight GLM fallback (reduced accuracy, slower on CPU).", RuntimeWarning)
+        except Exception:
+            pass
+
+_HAS_SCIPY = True
+try:
+    from scipy import stats
+except Exception:
+    _HAS_SCIPY = False
+
+# Matplotlib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+DEFAULT_OUTDIR = "hybrid_allinone_out"
+
+# -------------------------------
+# Utils
+# -------------------------------
+def ensure_dir(p: str):
+    if p:
+        os.makedirs(p, exist_ok=True)
+
+def norm_header(name: str) -> str:
+    s = str(name).lstrip("\ufeff").strip().strip('"').strip("'")
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("-", "_").replace(".", "_")
+    s = re.sub(r"_+", "_", s)
+    return s.upper()
+
+def apply_header_norm(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [norm_header(c) for c in df.columns]
+    return df
+
+def normalize_sep(sep: Optional[str]) -> str:
+    if sep is None: return "\t"
+    s = str(sep)
+    if s in {"\\t", r"\\t", "TAB", "tab"}: return "\t"
+    if len(s) == 1: return s
+    if s.strip() == "": return "\t"
+    return s
+
+def safe_read_table(path: str, sep: str) -> pd.DataFrame:
+    # Accept both plain text and gzipped inputs; fall back to a manual CSV parser
+    # when pandas bumps into ragged rows so downstream logic always gets a frame.
+    def _read_c():
+        return pd.read_csv(path, sep=sep, engine="c", low_memory=False, dtype=str)
+    def _read_custom():
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f, delimiter=sep if len(sep)==1 else "\t", quoting=csv.QUOTE_MINIMAL)
+            rows = list(reader)
+        if not rows:
+            raise SystemExit(f"[ERROR] empty file: {path}")
+        n = len(rows[0]); fixed=[rows[0]]
+        for r in rows[1:]:
+            if len(r) > n:   fixed.append(r[:n])
+            elif len(r) < n: fixed.append(r + [""]*(n-len(r)))
+            else:            fixed.append(r)
+        return pd.DataFrame(fixed[1:], columns=fixed[0])
+    if not os.path.isfile(path):
+        gz = path + ".gz"
+        if os.path.isfile(gz): path = gz
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    try:
+        df = _read_c()
+    except Exception:
+        df = _read_custom()
+    return apply_header_norm(df)
+
+
+def streaming_group_counts(path: str, sep: str, id_col: str, del2_col: str, count_cols: List[str],
+                           lib_col: Optional[str], chunksize: int = 500000) -> pd.DataFrame:
+    """
+    Memory-lean aggregation: stream chunks, normalise headers, sum counts by (lib,id).
+    """
+    usecols = [id_col, del2_col] + [c for c in count_cols if c not in (id_col, del2_col)]
+    if lib_col:
+        usecols.append(lib_col)
+    # Get header to map to normalized names
+    head = pd.read_csv(path, sep=sep, nrows=0, dtype=str)
+    col_map = {c: norm_header(c) for c in head.columns}
+    norm_usecols = []
+    for c in head.columns:
+        nc = col_map[c]
+        if nc in usecols:
+            norm_usecols.append(c)
+    accum: Dict[Tuple[str, str], List[float]] = {}
+    for chunk in pd.read_csv(path, sep=sep, chunksize=chunksize, dtype=str, usecols=norm_usecols):
+        chunk.rename(columns=col_map, inplace=True)
+        if lib_col and lib_col not in chunk.columns:
+            chunk[lib_col] = ""
+        elif not lib_col:
+            chunk["LIB_ID_TMP"] = ""
+            lib_col = "LIB_ID_TMP"
+        for c in usecols:
+            if c not in chunk.columns:
+                chunk[c] = 0
+        for c in [del2_col] + count_cols:
+            chunk[c] = pd.to_numeric(chunk[c], errors="coerce").fillna(0.0)
+        grouped = chunk.groupby([lib_col, id_col], as_index=False)[[del2_col] + count_cols].sum()
+        for _, row in grouped.iterrows():
+            key = (str(row[lib_col]), str(row[id_col]))
+            if key not in accum:
+                accum[key] = [0.0 for _ in [del2_col] + count_cols]
+            vals = [row[del2_col]] + [row[c] for c in count_cols]
+            accum[key] = [accum[key][i] + float(vals[i]) for i in range(len(vals))]
+    records = []
+    for (lib, idv), vals in accum.items():
+        rec = {"LIB_ID": lib, id_col: idv}
+        rec[del2_col] = vals[0]
+        for c, v in zip(count_cols, vals[1:]):
+            rec[c] = v
+        records.append(rec)
+    df = pd.DataFrame.from_records(records)
+    if "LIB_ID" not in df.columns:
+        df["LIB_ID"] = ""
+    return df
+
+def to_numeric_inplace(df: pd.DataFrame, cols: List[str]):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+def coeff_var(arr: np.ndarray) -> float:
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0: return np.nan
+    m = float(np.mean(arr))
+    if m <= 0: return np.nan
+    s = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+    return s / m
+
+def winsorize(x: float, lo: float, hi: float) -> float:
+    x = float(x) if x == x else 0.0
+    return max(lo, min(hi, x))
+
+def safe_log2_ratio(a: float, b: float, pc: float) -> float:
+    return math.log((a + pc) / (b + pc), 2.0)
+
+# -------------------------------
+# Robust ID parser  (cycles, BB1..BB4, CP)
+# -------------------------------
+def parse_id_fields(id_str: str) -> Tuple[int, str, str, str, str, str]:
+    s = str(id_str or "").strip()
+    if s == "":
+        return 3, "NA","NA","NA","NA","NA"
+    raw = [t for t in re.split(r"[\|_,:;/\s]+", s) if t != ""]
+
+    # cycles (optional)
+    cyc = None
+    if raw and re.fullmatch(r"\d+", raw[0]):
+        try:
+            cyc = int(raw[0])
+            raw = raw[1:]
+        except Exception:
+            cyc = None
+
+    # Consume BB1..BB4 while stitching namespaced IDs like XBA0038_LIBDEL004.
+    # NOTE: In the fixed BB table we namespace cross-library reuse as "<bb>_LIB<lib>".
+    # Because decoded IDs themselves are underscore-separated, any BB token can be split
+    # into ["<bb>", "LIB<lib>"] during tokenisation — not just BB1.
+    parts: List[str] = []
+    i = 0
+    while i < len(raw) and len(parts) < 4:
+        t = raw[i]
+        if t == "":
+            i += 1
+            continue
+        if (
+            i + 1 < len(raw)
+            and raw[i + 1].startswith("LIB")
+            and (t not in ("NA", "") and not t.startswith("LIB"))
+        ):
+            parts.append(f"{t}_{raw[i + 1]}")
+            i += 2
+        else:
+            parts.append(t)
+            i += 1
+    while len(parts) < 4:
+        parts.append("NA")
+    bb1, bb2, bb3, bb4 = parts[:4]
+
+    # Optional CP token (legacy): only look at leftover tokens *after* BB1..BB4 are parsed,
+    # and never treat LIB* fragments as CP (to avoid misclassifying namespaced BB IDs).
+    cp = "NA"
+    leftover = raw[i:]
+    if leftover:
+        last = str(leftover[-1])
+        if re.match(r"^(DEL|CP)[A-Za-z0-9]+$", last, flags=re.IGNORECASE):
+            cp = last
+
+    if cyc is None:
+        cyc = 4 if str(bb4) != "NA" else 3
+    return int(cyc), str(bb1), str(bb2), str(bb3), str(bb4), str(cp)
+
+# -------------------------------
+# Prefilter & normalization
+# -------------------------------
+def prefilter_df_sum(df_sum: pd.DataFrame, del2_col: str, all_count_cols: List[str],
+                     q_del2: float, min_abs_del2: int, min_total_counts: int) -> pd.DataFrame:
+    base = df_sum.copy()
+    if base.shape[0] == 0:
+        print("[PREFILTER] kept 0/0 (empty input)")
+        return base
+    for c in [del2_col] + all_count_cols:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
+    del2_vals = base[del2_col].values
+    thr_q = np.quantile(del2_vals, q_del2) if (0.0 < q_del2 < 1.0) else 0.0
+    thr = max(float(thr_q), float(min_abs_del2))
+    keep_del2 = del2_vals >= thr
+    total = base[[del2_col] + all_count_cols].sum(axis=1).values
+    keep_tot = total >= float(min_total_counts)
+    keep = keep_del2 & keep_tot
+    print(f"[PREFILTER] kept {int(keep.sum()):,}/{base.shape[0]:,} (DEL2>= {thr:.3f}, total>= {min_total_counts})")
+    return base.loc[keep].reset_index(drop=True)
+
+def build_size_factors(df_sum: pd.DataFrame, sample_cols: List[str], method: str, lib_col: Optional[str] = None):
+    """
+    Returns either:
+      - dict(sample -> sf) when single-library or lib_col not provided
+      - dict(lib -> dict(sample -> sf)) when multiple libraries present
+    """
+    if method == "none":
+        if lib_col and lib_col in df_sum.columns and df_sum[lib_col].nunique() > 1:
+            return {lib: {c: 1.0 for c in sample_cols} for lib in df_sum[lib_col].unique()}
+        return {c: 1.0 for c in sample_cols}
+
+    if lib_col and lib_col in df_sum.columns and df_sum[lib_col].nunique() > 1:
+        sfs = {}
+        for lib, sub in df_sum.groupby(lib_col):
+            totals = sub[sample_cols].sum(axis=0).astype(float)
+            med = float(np.median(totals.values)) if len(totals) else 1.0
+            if med <= 0:
+                sfs[lib] = {c: 1.0 for c in sample_cols}
+            else:
+                sfs[lib] = {c: float(totals[c]) / med for c in sample_cols}
+        return sfs
+    totals = df_sum[sample_cols].sum(axis=0).astype(float)
+    med = float(np.median(totals.values)) if len(totals) else 1.0
+    if med <= 0:
+        return {c: 1.0 for c in sample_cols}
+    return {c: float(totals[c]) / med for c in sample_cols}
+
+def _sfs_lookup(sfs, lib: str, sample: str) -> float:
+    if not sfs:
+        return 1.0
+    first_val = next(iter(sfs.values())) if isinstance(sfs, dict) else None
+    if isinstance(first_val, dict):  # multi-lib map
+        return float(sfs.get(lib, {}).get(sample, 1.0))
+    return float(sfs.get(sample, 1.0)) if isinstance(sfs, dict) else 1.0
+
+def add_cpm_columns(df_sum: pd.DataFrame, sample_cols: List[str], totals_by_lib: Dict[str, Dict[str, float]], lib_col: str) -> pd.DataFrame:
+    df = df_sum.copy()
+    libs = df[lib_col].astype(str).tolist() if lib_col in df.columns else ["" for _ in range(len(df))]
+    for c in sample_cols:
+        newc = f"{c}_CPM"
+        vals = pd.to_numeric(df[c], errors="coerce").astype(float).values
+        den = np.array([float(totals_by_lib.get(lib, {}).get(c, np.nan)) for lib in libs], dtype=float)
+        safe = np.zeros_like(vals, dtype=float)
+        np.divide(vals, den, out=safe, where=den > 0)
+        safe = safe * 1e6
+        df[newc] = safe
+    return df
+
+# -------------------------------
+# BB metadata loader (Codon only)
+# -------------------------------
+def _peek_headerless(file_path: str, sep: str) -> bool:
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        first = f.readline().strip()
+    low = first.lower()
+    header_tokens = ["type", "seq", "code", "pos", "name", "lib_id", "smiles", "bb_id"]
+    if any(h in low for h in header_tokens):
+        return False
+    toks = re.split(r"\t|,|\s{2,}", first)
+    return len(toks) >= 5
+
+def load_bbinfo_auto(path: str, needed_bbs: List[str]) -> pd.DataFrame:
+    """
+    Load BB metadata (Codon rows only), tolerant to column-name variants from preprocess.
+    Accepts: bb_id or bb_id_fixed; tag_uid or tag_id; lib_id; seq; smiles; cycle.
+    """
+    if not os.path.isfile(path):
+        gz = path + ".gz"
+        if os.path.isfile(gz):
+            path = gz
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"[metadata] 파일을 찾을 수 없습니다: {path}")
+    sep = "\t"
+    headerless = _peek_headerless(path, sep)
+    if headerless:
+        df = pd.read_csv(path, sep=sep, header=None, dtype=str,
+                         names=["type","seq","bb_id","cycle","tag_uid","lib_id","smiles"])
+    else:
+        df = pd.read_csv(path, sep=sep, dtype=str, header=0)
+    # Strip NBSP/whitespace
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    # Case-insensitive column resolver
+    low = {c.lower(): c for c in df.columns}
+    def has(k: str) -> bool: return k.lower() in low
+    def col(k: str) -> Optional[str]: return low.get(k.lower())
+    # Filter Codon rows if type exists
+    if has("type"):
+        tcol = col("type");
+        t = df[tcol].astype(str).str.lower()
+        if any(t.str.contains("codon", regex=False)):
+            df = df[t.str.contains("codon", regex=False)].copy()
+    # Normalize expected columns
+    # bb_id: prefer bb_id; else bb_id_fixed
+    if not has("bb_id") and has("bb_id_fixed"):
+        df["bb_id"] = df[col("bb_id_fixed")]
+    elif has("bb_id"):
+        if col("bb_id") != "bb_id":
+            df["bb_id"] = df[col("bb_id")]
+    else:
+        df["bb_id"] = ""
+    # tag_uid: prefer tag_uid; else tag_id
+    if not has("tag_uid") and has("tag_id"):
+        df["tag_uid"] = df[col("tag_id")]
+    elif has("tag_uid"):
+        if col("tag_uid") != "tag_uid":
+            df["tag_uid"] = df[col("tag_uid")]
+    else:
+        df["tag_uid"] = ""
+    # lib_id, smiles, seq, cycle
+    for k in ("lib_id","smiles","seq","cycle"):
+        if has(k):
+            if col(k) != k:
+                df[k] = df[col(k)]
+        else:
+            df[k] = ""
+    # Tag sequence uppercase/no spaces
+    df["tag_seq"] = df["seq"].astype(str).replace(" ", "", regex=False).str.upper()
+    keep = df[["bb_id","lib_id","smiles","tag_uid","tag_seq","cycle"]].drop_duplicates()
+    return keep
+
+
+def validate_smiles_report(df_hits: pd.DataFrame, out_path: str):
+    if not _HAS_RDKIT:
+        print("[WARN] RDKit not available; skip SMILES validation.")
+        return
+    rows = []
+    for _, r in df_hits.iterrows():
+        idv = r.get("ID", "")
+        for i in range(1,5):
+            bbid = str(r.get(f"bb{i}_id", "") or "NA")
+            smi = str(r.get(f"bb{i}_smiles", "") or "").strip()
+            if smi in ("", "NA"):
+                continue
+            try:
+                mol = Chem.MolFromSmiles(smi)
+                ok = mol is not None
+                err = "" if ok else "RDKit parse failed"
+            except Exception as e:
+                ok = False; err = str(e)
+            rows.append({"ID": idv, "BB_pos": f"BB{i}", "BB_ID": bbid, "SMILES": smi, "is_valid": ok, "error": err})
+    if not rows:
+        print("[INFO] SMILES validation: nothing to validate.")
+        return
+    df = pd.DataFrame.from_records(rows)
+    df.to_csv(out_path, sep="\t", index=False)
+    print(f"[OK] Wrote SMILES validation report: {out_path}")
+
+# -------------------------------
+# ReadScaler (with BEAD q-value gating)
+# -------------------------------
+def ttest_onesample_p(mean: float, sd: float, n: int) -> float:
+    if n is None or n < 2 or not np.isfinite(sd) or sd <= 0 or not np.isfinite(mean):
+        return 1.0
+    t = mean / (sd / math.sqrt(n))
+    if _HAS_SCIPY:
+        return float(2.0 * stats.t.sf(abs(t), df=n - 1))
+    try:
+        from math import erf
+        z = abs(t)
+        p_half = 0.5 * (1.0 - erf(z / math.sqrt(2.0)))
+        return float(2.0 * p_half)
+    except Exception:
+        return 1.0
+
+def bh_fdr(pvals: List[float]) -> List[float]:
+    p = np.array([1.0 if (x is None or not np.isfinite(x)) else float(x) for x in pvals], dtype=float)
+    n = len(p)
+    order = np.argsort(p)
+    ranks = np.empty(n, dtype=int); ranks[order] = np.arange(1, n + 1)
+    q = p * n / ranks
+    q_sorted = q[order]
+    for i in range(n - 2, -1, -1):
+        q_sorted[i] = min(q_sorted[i], q_sorted[i + 1])
+    out = np.empty(n, dtype=float)
+    out[order] = np.clip(q_sorted, 0.0, 1.0)
+    return out.tolist()
+
+def compute_readscaler_row(row: pd.Series, r1_cols: List[str], r2_cols: List[str],
+                           del2_col: Optional[str], neg_r1_col: Optional[str],
+                           neg_r2_col: Optional[str], eps: float) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    R1 = [float(row[c]) for c in r1_cols if c in row and pd.notna(row[c])]
+    R2 = [float(row[c]) for c in r2_cols if c in row and pd.notna(row[c])] if r2_cols else []
+    BEAD1 = float(row[neg_r1_col]) if (neg_r1_col and neg_r1_col in row and pd.notna(row[neg_r1_col])) else None
+    BEAD2 = float(row[neg_r2_col]) if (neg_r2_col and neg_r2_col in row and pd.notna(row[neg_r2_col])) else None
+    DEL2  = float(row[del2_col])   if (del2_col and del2_col in row and pd.notna(row[del2_col])) else None
+
+    avg_R1 = float(np.mean(R1)) if R1 else np.nan
+    sd_R1  = float(np.std(R1, ddof=1)) if len(R1)>=2 else (0.0 if len(R1)==1 else np.nan)
+    avg_R2 = float(np.mean(R2)) if R2 else np.nan
+    out.update(dict(avg_R1=avg_R1, sd_R1=sd_R1, avg_R2=avg_R2))
+    out["zscore_avgR1"] = np.nan
+
+    if DEL2 is not None and len(R1)>0:
+        lfc = [math.log2((x + eps)/(DEL2 + eps)) for x in R1]
+        m = float(np.mean(lfc))
+        sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
+        se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
+        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        out.update(dict(mean_log2FC_DEL2=m, sd_log2FC_DEL2=sd, se_log2FC_DEL2=se, p_DEL2=p))
+    else:
+        out.update(dict(mean_log2FC_DEL2=np.nan, sd_log2FC_DEL2=np.nan, se_log2FC_DEL2=np.nan, p_DEL2=np.nan))
+
+    if BEAD1 is not None and len(R1)>0:
+        lfc = [math.log2((x + eps)/(BEAD1 + eps)) for x in R1]
+        m = float(np.mean(lfc))
+        sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
+        se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
+        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        out.update(dict(mean_log2FC_BEAD=m, sd_log2FC_BEAD=sd, se_log2FC_BEAD=se, p_BEAD=p))
+    else:
+        out.update(dict(mean_log2FC_BEAD=np.nan, sd_log2FC_BEAD=np.nan, se_log2FC_BEAD=np.nan, p_BEAD=np.nan))
+
+    if BEAD2 is not None and len(R2)>0:
+        lfc = [math.log2((x + eps)/(BEAD2 + eps)) for x in R2]
+        m = float(np.mean(lfc))
+        sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
+        se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
+        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        out.update(dict(mean_log2FC_BEAD_R2=m, sd_log2FC_BEAD_R2=sd, se_log2FC_BEAD_R2=se, p_BEAD_R2=p))
+    else:
+        out.update(dict(mean_log2FC_BEAD_R2=np.nan, sd_log2FC_BEAD_R2=np.nan, se_log2FC_BEAD_R2=np.nan, p_BEAD_R2=np.nan))
+
+    out["log2Boost_R2vsR1"] = math.log2((avg_R2 + eps)/(avg_R1 + eps)) if (len(R1)>0 and len(R2)>0) else np.nan
+
+    paired = []
+    n_pairs = min(len(R1), len(R2))
+    if n_pairs >= 1:
+        paired = [math.log2((R2[i] + eps)/(R1[i] + eps)) for i in range(n_pairs)]
+        mp = float(np.mean(paired))
+        sdp= float(np.std(paired, ddof=1)) if n_pairs>=2 else (0.0 if n_pairs==1 else np.nan)
+        sep= float(sdp / math.sqrt(n_pairs)) if n_pairs>=1 else np.nan
+        pp = ttest_onesample_p(mp, sdp if sdp>0 else 1e-9, n_pairs)
+        out.update(dict(mean_log2Boost_R2vsR1_paired=mp,
+                        sd_log2Boost_R2vsR1_paired=sdp,
+                        se_log2Boost_R2vsR1_paired=sep,
+                        n_pairs_paired=int(n_pairs),
+                        p_BoostPaired=pp))
+    else:
+        out.update(dict(mean_log2Boost_R2vsR1_paired=np.nan,
+                        sd_log2Boost_R2vsR1_paired=np.nan,
+                        se_log2Boost_R2vsR1_paired=np.nan,
+                        n_pairs_paired=0,
+                        p_BoostPaired=np.nan))
+    return out
+
+def add_mads(df: pd.DataFrame) -> pd.DataFrame:
+    def mad_series(x):
+        x = pd.to_numeric(x, errors="coerce")
+        med = np.nanmedian(x)
+        return float(np.nanmedian(np.abs(x - med)))
+    for raw in ["mean_log2FC_DEL2", "mean_log2FC_BEAD", "mean_log2Boost_R2vsR1_paired"]:
+        col = raw.replace("mean_", "mad_")
+        if raw in df.columns:
+            df[col] = mad_series(df[raw])
+        else:
+            df[col] = np.nan
+    return df
+
+# -------------------------------
+# GLM (Poisson<->NB2)
+# -------------------------------
+class ElasticTagGLM:
+    def __init__(self, conds: List[str], w_map: Dict[str,float],
+                 alpha_l1: float = 1e-3, alpha_l2: float = 1e-4,
+                 lr: float = 0.1, max_steps: int = 500, tol: float = 1e-6,
+                 dispersion_mode: str = "by_condition", fix_neg_poisson: bool = True,
+                 device: str = "cpu", dtype: str = "float64",
+                 neg_conds: Optional[List[str]] = None):
+        self.conds = conds[:]
+        self.w = {k: float(np.clip(w_map.get(k, 0.7), 0.0, 1.0)) for k in self.conds}
+        self.alpha_l1 = float(alpha_l1); self.alpha_l2 = float(alpha_l2)
+        self.lr = float(lr); self.max_steps = int(max_steps); self.tol = float(tol)
+        assert dispersion_mode in {"shared","by_condition"}
+        self.dispersion_mode = dispersion_mode
+        self.fix_neg_poisson = bool(fix_neg_poisson)
+        self.neg_conds = [c for c in (neg_conds or ["NEG"]) if c]
+        self.neg_conds_set = set(self.neg_conds)
+        # Avoid referencing torch when it's not available
+        if _HAS_TORCH:
+            self.device = torch.device(device)
+            # Map dtype string to torch dtype
+            self.dtype = torch.float32 if str(dtype).lower() in ("float32","fp32","single") else torch.float64
+        else:
+            self.device = "cpu"
+            self.dtype = None
+
+    @staticmethod
+    def _init_delta(y: np.ndarray, offset_log: float, rep_log_offs: Optional[np.ndarray]) -> float:
+        eps = 1e-6
+        m = float(np.mean(y)) if y.size > 0 else 0.0
+        mean_sf = float(np.mean(rep_log_offs)) if rep_log_offs is not None and len(rep_log_offs) > 0 else 0.0
+        base = math.exp(offset_log + mean_sf)
+        return math.log((m + eps) / (base + eps))
+
+    def _is_neg(self, cond: str) -> bool:
+        return cond in self.neg_conds_set
+
+    def fit_one(self, y_dict, offs_dict, offset_log: float) -> Dict[str,float]:
+        if not _HAS_TORCH:
+            out = {}
+            ln2 = math.log(2.0)
+            alpha_by_cond: Dict[str, float] = {}
+            for cond in self.conds:
+                y = np.asarray(y_dict.get(cond, np.array([])), dtype=float)
+                if y.size == 0:
+                    out[f"delta_{cond}"] = 0.0
+                    out[f"mu_{cond}_hat"] = math.exp(float(offset_log))
+                    out[f"LFC_{cond}_vs_DEL2"] = 0.0
+                    alpha_by_cond[cond] = 0.0
+                    continue
+
+                offs = np.asarray(offs_dict.get(cond, np.zeros_like(y)), dtype=float)
+                if offs.shape != y.shape:
+                    offs = np.zeros_like(y, dtype=float)
+
+                off = float(offset_log) + offs
+                base = np.exp(off)
+                sum_y = float(np.sum(y))
+                sum_base = float(np.sum(base))
+                eps = 1e-12
+                d = math.log((sum_y + eps) / (sum_base + eps))
+                out[f"delta_{cond}"] = d
+                out[f"LFC_{cond}_vs_DEL2"] = d / ln2
+                out[f"mu_{cond}_hat"] = math.exp(float(offset_log) + d)
+
+                # Method-of-moments alpha for NB2, adjusted for offset-induced mu variation.
+                # Var(y) ≈ mean(mu) + alpha*mean(mu^2) + Var(mu)
+                if self._is_neg(cond) and self.fix_neg_poisson:
+                    alpha_by_cond[cond] = 0.0
+                else:
+                    if y.size >= 2:
+                        mu_i = base * math.exp(d)
+                        mu_bar = float(np.mean(mu_i))
+                        var_mu = float(np.var(mu_i, ddof=1))
+                        mean_mu2 = float(np.mean(mu_i ** 2))
+                        var_y = float(np.var(y, ddof=1))
+                        alpha = (var_y - mu_bar - var_mu) / max(mean_mu2, eps)
+                        alpha_by_cond[cond] = float(max(0.0, alpha))
+                    else:
+                        alpha_by_cond[cond] = 0.0
+
+            neg_first = self.neg_conds[0] if self.neg_conds else None
+            if neg_first:
+                out["delta_NEG"] = out.get(f"delta_{neg_first}", 0.0)
+                out["LFC_NEG_vs_DEL2"] = out.get(f"LFC_{neg_first}_vs_DEL2", 0.0)
+                out["mu_NEG_hat"] = out.get(f"mu_{neg_first}_hat", math.exp(float(offset_log)))
+            else:
+                out["delta_NEG"] = 0.0
+                out["LFC_NEG_vs_DEL2"] = 0.0
+                out["mu_NEG_hat"] = math.exp(float(offset_log))
+            alphas = [alpha_by_cond.get(k, 0.0) for k in self.conds if not self._is_neg(k)]
+            out["alpha_for_penalty"] = float(np.mean(alphas)) if alphas else 0.0
+            return out
+
+        y = {k: torch.tensor(y_dict[k], dtype=self.dtype, device=self.device) for k in self.conds}
+        offs = {k: torch.tensor(offs_dict.get(k, np.zeros_like(y_dict[k])), dtype=self.dtype, device=self.device)
+                for k in self.conds}
+        off0 = torch.tensor(offset_log, dtype=self.dtype, device=self.device)
+
+        def poisson_nll(y, mu):
+            eps = 1e-12
+            return (mu - y * torch.log(mu + eps) + torch.lgamma(y + 1.0)).mean()
+
+        def nb2_logpmf(y, mu, alpha):
+            eps = 1e-12
+            r = 1.0 / (alpha + eps)
+            log_p = torch.log(r + eps) - torch.log(r + mu + eps)
+            log1mp = torch.log(mu + eps) - torch.log(r + mu + eps)
+            return (torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1.0)
+                    + r * log_p + y * log1mp)
+
+        def nb2_nll(y, mu, alpha): return -nb2_logpmf(y, mu, alpha).mean()
+
+        d0 = {k: self._init_delta(y_dict[k], offset_log, offs_dict.get(k, None)) for k in self.conds}
+        delta = {k: torch.nn.Parameter(torch.tensor(v, dtype=self.dtype, device=self.device))
+                 for k, v in d0.items()}
+
+        if self.dispersion_mode == "shared":
+            log_alpha = {"SHARED": torch.nn.Parameter(torch.tensor(-3.0, dtype=self.dtype, device=self.device))}
+        else:
+            log_alpha = {}
+            for cond in self.conds:
+                if self._is_neg(cond) and self.fix_neg_poisson:
+                    log_alpha[cond] = None
+                else:
+                    init = -3.0 if (self._is_neg(cond) or cond == "R1") else -2.0
+                    log_alpha[cond] = torch.nn.Parameter(torch.tensor(init, dtype=self.dtype, device=self.device))
+
+        params = list(delta.values()) + [p for p in log_alpha.values() if p is not None]
+        opt = torch.optim.Adam(params, lr=self.lr)
+
+        def alpha_of(cond: str) -> torch.Tensor:
+            if self.dispersion_mode == "shared":
+                return torch.nn.functional.softplus(log_alpha["SHARED"])
+            if self._is_neg(cond) and self.fix_neg_poisson:
+                return torch.tensor(0.0, dtype=self.dtype, device=self.device)
+            return torch.nn.functional.softplus(log_alpha[cond])
+
+        prev = None
+        for _ in range(self.max_steps):
+            opt.zero_grad()
+            loss = 0.0
+            for cond in self.conds:
+                if y[cond].numel() == 0:
+                    continue
+                mu = torch.exp(off0 + delta[cond] + offs[cond])
+                nll_p = poisson_nll(y[cond], mu)
+                a = alpha_of(cond)
+                nll_nb = nb2_nll(y[cond], mu, a)
+                loss = loss + (1.0 - self.w[cond]) * nll_p + self.w[cond] * nll_nb
+                if self.dispersion_mode == "shared":
+                    a_use = torch.nn.functional.softplus(log_alpha["SHARED"])
+                    loss = loss + self.alpha_l1 * a_use + self.alpha_l2 * (a_use ** 2)
+                    break
+                else:
+                    if not (self._is_neg(cond) and self.fix_neg_poisson):
+                        loss = loss + self.alpha_l1 * a + self.alpha_l2 * (a ** 2)
+            loss.backward()
+            opt.step()
+            val = float(loss.detach().cpu().numpy())
+            if prev is not None and abs(prev - val) < self.tol:
+                break
+            prev = val
+
+        d_hat = {k: float(v.detach().cpu().numpy()) for k, v in delta.items()}
+        if self.dispersion_mode == "shared":
+            a_hat = {"SHARED": float(torch.nn.functional.softplus(log_alpha["SHARED"]).detach().cpu().numpy())}
+        else:
+            a_hat = {}
+            for cond in self.conds:
+                a_hat[cond] = 0.0 if (self._is_neg(cond) and self.fix_neg_poisson) else \
+                              float(torch.nn.functional.softplus(log_alpha[cond]).detach().cpu().numpy())
+
+        ln2 = math.log(2.0)
+        out = {}
+        for cond in self.conds:
+            out[f"delta_{cond}"] = d_hat[cond]
+        for cond in self.conds:
+            out[f"LFC_{cond}_vs_DEL2"] = d_hat[cond] / ln2
+        for cond in self.conds:
+            out[f"mu_{cond}_hat"] = math.exp(float(offset_log) + d_hat[cond])
+        if self.dispersion_mode == "shared":
+            out["alpha_for_penalty"] = float(torch.nn.functional.softplus(log_alpha["SHARED"]).detach().cpu().numpy())
+        else:
+            alphas = [a_hat[k] for k in self.conds if not self._is_neg(k)]
+            out["alpha_for_penalty"] = float(np.mean(alphas)) if len(alphas) else 0.0
+        neg_first = self.neg_conds[0] if self.neg_conds else None
+        if neg_first:
+            out["delta_NEG"] = d_hat.get(neg_first, 0.0)
+            out["LFC_NEG_vs_DEL2"] = out.get(f"LFC_{neg_first}_vs_DEL2", 0.0)
+            out["mu_NEG_hat"] = math.exp(float(offset_log) + d_hat.get(neg_first, 0.0))
+        else:
+            out["delta_NEG"] = 0.0
+            out["LFC_NEG_vs_DEL2"] = 0.0
+            out["mu_NEG_hat"] = math.exp(float(offset_log))
+        return out
+
+# -------------------------------
+# Synthon score (hardened)
+# -------------------------------
+def _to_hashable_scalar(x):
+    if x is None: return np.nan
+    if isinstance(x, float) and np.isnan(x): return np.nan
+    if isinstance(x, (list, tuple)):
+        if len(x) == 0: return "NA"
+        return str(x[0])
+    return str(x)
+
+def compute_synthon_scores(df: pd.DataFrame, e_col: str, bb_cols=["BB1","BB2","BB3","BB4"]) -> pd.DataFrame:
+    if e_col is None or e_col == "" or e_col not in df.columns:
+        df = df.copy(); df["SynthonScore"] = 0.0; return df
+    df = df.copy()
+    for pos in bb_cols:
+        if pos in df.columns:
+            df[pos] = df[pos].apply(_to_hashable_scalar)
+    z_maps: Dict[str, Dict[str, float]] = {pos:{} for pos in bb_cols}
+    for pos in bb_cols:
+        if pos not in df.columns: continue
+        med_by_bb = df.groupby(pos, dropna=False)[e_col].median()
+        if med_by_bb.empty: continue
+        v = med_by_bb.values.astype(float)
+        med = np.median(v); mad = np.median(np.abs(v - med))
+        if mad <= 1e-12:
+            mu, sd = float(np.mean(v)), float(np.std(v) + 1e-12)
+            for bb, m in med_by_bb.items():
+                z_maps[pos][bb] = float(np.clip((m - mu)/sd, -3.0, 3.0))
+        else:
+            z = 0.6745 * (v - med) / mad
+            for bb, zval in zip(med_by_bb.index.tolist(), z):
+                z_maps[pos][bb] = float(np.clip(zval, -3.0, 3.0))
+    syn = []
+    for _, r in df.iterrows():
+        s = 0.0
+        for pos in bb_cols:
+            bb = r.get(pos, None)
+            if bb is None or (isinstance(bb, float) and np.isnan(bb)): continue
+            s += float(z_maps.get(pos, {}).get(bb, 0.0))
+        syn.append(s)
+    df["SynthonScore"] = syn
+    return df
+
+# -------------------------------
+# Plotting
+# -------------------------------
+def plot_rank_glm(df, out_png, top_annotate=20):
+    y = pd.to_numeric(df["HitScore_GLM"], errors="coerce").fillna(0.0).values
+    order = np.argsort(-y)
+    y_sorted = y[order]; x = np.arange(1, len(y_sorted)+1)
+    plt.figure(); plt.plot(x, y_sorted, linewidth=1.2)
+    plt.xlabel("Rank (descending)"); plt.ylabel("HitScore_GLM"); plt.title("GLM HitScore Rank")
+    ids = df["ID"].astype(str).values[order]
+    for i in range(min(top_annotate, len(x))):
+        plt.text(x[i], y_sorted[i], ids[i], fontsize=6, rotation=45)
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
+def plot_scatter_glm_vs_rs(df, out_png):
+    x = pd.to_numeric(df.get("HitScore_GLM", np.nan), errors="coerce").values
+    y = pd.to_numeric(df.get("HitScore_RS", np.nan), errors="coerce").values
+    mask = np.isfinite(x) & np.isfinite(y)
+    plt.figure(); plt.scatter(x[mask], y[mask], s=8, alpha=0.6)
+    plt.xlabel("HitScore_GLM"); plt.ylabel("HitScore_RS"); plt.title("GLM vs ReadScaler")
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
+def plot_consensus_counts(df, out_png):
+    a = int(df["GLM_hit"].sum()) if "GLM_hit" in df.columns else 0
+    b = int(df["RS_pass"].sum()) if "RS_pass" in df.columns else 0
+    c = int(df["Consensus_hit"].sum()) if "Consensus_hit" in df.columns else 0
+    labs = ["GLM_hit", "RS_pass", "Consensus"]; vals = [a, b, c]
+    plt.figure(); plt.bar(np.arange(len(vals)), vals); plt.xticks(np.arange(len(vals)), labs)
+    plt.ylabel("Count"); plt.title("Consensus Summary")
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
+# -------------------------------
+# HTML report
+# -------------------------------
+def write_html_report(outdir: str, plots_dir: str, topk_consensus_path: str, neg_summary: Dict[str, str]):
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>DELeGANce — All-in-one Report</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;line-height:1.5;color:#222}}
+h1,h2{{margin-top:0.2em;margin-bottom:0.2em}} .row{{display:flex;gap:24px;flex-wrap:wrap}}
+.card{{border:1px solid #e5e7eb;border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.05);flex:1;min-width:280px}}
+.kv{{display:grid;grid-template-columns:auto auto;gap:8px 16px;margin-top:8px}}
+.kv b{{text-align:right}}
+table{{border-collapse:collapse;width:100%;font-size:12px}}
+thead th{{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;background:#fafafa}}
+tbody td{{border-bottom:1px solid #f3f4f6;padding:6px}}
+.small{{font-size:12px;color:#666}}
+img{{max-width:100%;height:auto;border:1px solid #eee;border-radius:6px}}
+.badge{{display:inline-block;background:#eef2ff;border:1px solid #c7d2fe;border-radius:16px;padding:2px 8px;margin:2px}}
+</style></head><body>
+<h1>DELeGANce — All-in-one Hit Caller</h1>
+<div class="card">
+  <h2>NEG settings & summary</h2>
+  <div class="kv">
+    <b>neg_strict</b><span>{neg_summary.get('neg_strict')}</span>
+    <b>neg_gate_mode</b><span>{neg_summary.get('neg_gate_mode')}</span>
+    <b>lambda_neg_glm</b><span>{neg_summary.get('lambda_neg_glm')}</span>
+    <b>tau_neg_lfc</b><span>{neg_summary.get('tau_neg_lfc')}</span>
+    <b>neg_control_used</b><span>{neg_summary.get('neg_control_used')}</span>
+    <b>neg_penalty_used</b><span>{neg_summary.get('neg_penalty_used')}</span>
+    <b>neg_penalty_weights</b><span>{neg_summary.get('neg_penalty_weights')}</span>
+    <b>min_log2fc_bead (R1)</b><span>{neg_summary.get('min_log2fc_bead')}</span>
+    <b>max_q_bead</b><span>{neg_summary.get('max_q_bead')}</span>
+    <b>neg_centering</b><span>{neg_summary.get('neg_centering')}</span>
+    <b>neg_center_shift</b><span>{neg_summary.get('neg_center_shift')}</span>
+    <b>max_neg_centered_lfc</b><span>{neg_summary.get('max_neg_centered_lfc')}</span>
+    <b>NEG_hard_fail</b><span>{neg_summary.get('neg_hard_fail_count')}</span>
+  </div>
+</div>
+<div class="row">
+  <div class="card"><h2>Rank plot (GLM)</h2><img src="{plots_dir}/01_rankplot_glm.png"/></div>
+  <div class="card"><h2>GLM vs RS</h2><img src="{plots_dir}/02_glm_vs_rs_scatter.png"/></div>
+  <div class="card"><h2>Consensus counts</h2><img src="{plots_dir}/03_consensus_counts.png"/></div>
+</div>
+<h2>Top consensus hits</h2>
+<p class="small">From <code>{os.path.basename(topk_consensus_path)}</code></p>
+<table><thead><tr><th>ID</th><th>HitScore_GLM</th><th>HitScore_RS</th><th>E_component</th><th>W_count</th><th>Penalty</th><th>LFC_NEG_centered</th></tr></thead>
+<tbody>
+"""
+    try:
+        df = pd.read_csv(topk_consensus_path, sep="\t", dtype=str)
+        shift_str = neg_summary.get('neg_center_shift')
+        def _h(v):
+            return html_escape(str(v), quote=True)
+        for _, r in df.head(20).iterrows():
+            html += "<tr>"
+            # ID fallback: handle ID_x/ID_y cases
+            rid = r.get('ID', '') or r.get('id', '') or r.get('ID_x', '') or r.get('ID_y', '')
+            html += f"<td>{_h(rid)}</td>"
+            html += f"<td>{_h(r.get('HitScore_GLM',''))}</td>"
+            html += f"<td>{_h(r.get('HitScore_RS',''))}</td>"
+            html += f"<td>{_h(r.get('E_component',''))}</td>"
+            html += f"<td>{_h(r.get('W_count',''))}</td>"
+            html += f"<td>{_h(r.get('Penalty',''))}</td>"
+            # LFC_NEG_centered fallback: compute on the fly when missing
+            lfc_ctr = r.get('LFC_NEG_centered', '')
+            if (lfc_ctr is None) or (str(lfc_ctr).strip() == ''):
+                try:
+                    v = float(r.get('LFC_NEG_vs_DEL2_used') or r.get('LFC_NEG_vs_DEL2'))
+                    sh = float(shift_str) if (shift_str not in (None, '', 'NA')) else 0.0
+                    lfc_ctr = f"{v - sh}"
+                except Exception:
+                    lfc_ctr = ''
+            html += f"<td>{_h(lfc_ctr)}</td>"
+            html += "</tr>"
+    except Exception as e:
+        html += f"<tr><td colspan='7'>Unable to read top consensus: {html_escape(str(e), quote=True)}</td></tr>"
+    html += "</tbody></table></body></html>"
+    with open(os.path.join(outdir, "report.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"[OK] Wrote HTML report: {os.path.join(outdir,'report.html')}")
+
+# -------------------------------
+# NEG centering
+# -------------------------------
+def neg_centering(hybrid: pd.DataFrame,
+                  quantile: float = 0.50,
+                  r2_lfc_max: float = 0.50,
+                  max_centered_lfc: Optional[float] = None) -> Tuple[pd.DataFrame, float, int]:
+    df = hybrid.copy()
+    lfc_col = "LFC_NEG_vs_DEL2_used" if "LFC_NEG_vs_DEL2_used" in df.columns else "LFC_NEG_vs_DEL2"
+    delta_col = "delta_NEG_used" if "delta_NEG_used" in df.columns else "delta_NEG"
+    for c in ["E_for_synthon","LFC_R2_vs_DEL2_used", lfc_col, delta_col]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if lfc_col not in df.columns:
+        return df, float("nan"), 0
+
+    qv = np.nanquantile(df["E_for_synthon"], min(max(quantile, 0.05), 0.95))
+    null_mask = (df["E_for_synthon"] <= qv)
+    if "LFC_R2_vs_DEL2_used" in df.columns and r2_lfc_max is not None:
+        null_mask &= (df["LFC_R2_vs_DEL2_used"] <= float(r2_lfc_max))
+    base = df.loc[null_mask, lfc_col].astype(float)
+    neg_shift = float(np.nanmedian(base)) if base.size else 0.0
+
+    df["LFC_NEG_centered"] = df[lfc_col] - neg_shift
+    ln2 = math.log(2.0)
+    if delta_col in df.columns:
+        df["delta_NEG_centered"] = df[delta_col] - neg_shift * ln2
+
+    fail_count = 0
+    if max_centered_lfc is not None:
+        df["NEG_center_fail"] = (df["LFC_NEG_centered"] > float(max_centered_lfc))
+        fail_count = int(df["NEG_center_fail"].sum())
+    else:
+        df["NEG_center_fail"] = False
+
+    return df, neg_shift, fail_count
+
+
+def compute_centered_values(df: pd.DataFrame,
+                            lfc_col: str,
+                            quantile: float,
+                            r2_lfc_max: Optional[float],
+                            lfc_filter_col: Optional[str] = None) -> Tuple[pd.Series, float]:
+    if lfc_col not in df.columns:
+        return pd.Series([np.nan] * len(df), index=df.index), float("nan")
+
+    e = pd.to_numeric(df.get("E_for_synthon", np.nan), errors="coerce")
+    lfc = pd.to_numeric(df.get(lfc_col, np.nan), errors="coerce")
+
+    if not np.isfinite(e).any():
+        return lfc, 0.0
+
+    qv = np.nanquantile(e, min(max(quantile, 0.05), 0.95))
+    null_mask = (e <= qv)
+
+    if lfc_filter_col and (lfc_filter_col in df.columns) and r2_lfc_max is not None:
+        lfc_f = pd.to_numeric(df.get(lfc_filter_col, np.nan), errors="coerce")
+        null_mask &= (lfc_f <= float(r2_lfc_max))
+    elif (lfc_filter_col is None) and ("LFC_R2_vs_DEL2_used" in df.columns) and r2_lfc_max is not None:
+        lfc_r2 = pd.to_numeric(df.get("LFC_R2_vs_DEL2_used", np.nan), errors="coerce")
+        null_mask &= (lfc_r2 <= float(r2_lfc_max))
+
+    base = lfc[null_mask]
+    neg_shift = float(np.nanmedian(base)) if np.isfinite(base).any() else 0.0
+    return lfc - neg_shift, neg_shift
+
+# -------------------------------
+# CLI
+# -------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="DELeGANce: Single-file GLM+ReadScaler+NEG penalty/gating+NEG-centering+Annotation+Report",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    # Inputs: default to outputs from preprocess/decoder
+    p.add_argument("--matrix_tsv", default=None, help="raw_counts_matrix.tsv (default: RUN_ROOT/02_decoded/raw_counts_matrix.tsv)")
+    p.add_argument("--metadata_tsv", default=None, help="BB information fixed file (default: RUN_ROOT/BB_information_fixed.tsv)")
+    p.add_argument("--run_root", default="DELeGANce_out", help="Preprocess output root (RUN_ROOT)")
+    p.add_argument("--decoded_dir", default=None, help="Override decoded dir (default: RUN_ROOT/02_decoded)")
+    p.add_argument("--sep", default="\\t")
+    p.add_argument("--outdir", default=DEFAULT_OUTDIR)
+
+    p.add_argument("--r1_cols", nargs="+", default=["D_R1C1","D_R1C2","D_R1C3"])
+    p.add_argument("--r2_cols", nargs="*", default=[], help="Optional R2 columns (omit for R1-only)")
+    p.add_argument("--r3_cols", nargs="*", default=None)
+    p.add_argument("--del2_col", default="DEL2")
+    p.add_argument("--neg_r1_col", default="D_R1C4")
+    p.add_argument("--neg_r2_col", default="")
+
+    p.add_argument("--libsize_norm", choices=["total","none"], default="total")
+    p.add_argument("--prefilter_del2_q", type=float, default=0.0)
+    p.add_argument("--prefilter_min_del2", type=int, default=0)
+    p.add_argument("--prefilter_min_total", type=int, default=0)
+    p.add_argument("--pseudocount_k", type=float, default=0.5, help="pseudo-count scaled by DEL2")
+    p.add_argument("--streaming_agg", type=int, choices=[0,1], default=0,
+                   help="1이면 raw matrix를 청크 단위로 합산해 메모리 사용을 줄입니다.")
+    p.add_argument("--streaming_chunk_rows", type=int, default=500000,
+                   help="streaming_agg 사용 시 pandas chunksize")
+    p.add_argument("--validate_smiles", type=int, choices=[0,1], default=0,
+                   help="1이면 consensus TopK의 BB SMILES를 RDKit으로 검증하고 리포트를 저장합니다.")
+
+    p.add_argument("--dispersion", choices=["shared","by_condition"], default="by_condition")
+    p.add_argument("--fix_neg_poisson", type=int, choices=[0,1], default=1)
+    p.add_argument("--w_neg", type=float, default=0.0)
+    p.add_argument("--w_r1", type=float, default=0.25)
+    p.add_argument("--w_r2", type=float, default=0.7)
+    p.add_argument("--w_r3", type=float, default=0.7)
+    p.add_argument("--alpha_l1", type=float, default=1e-3)
+    p.add_argument("--alpha_l2", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=0.1)
+    p.add_argument("--max_steps", type=int, default=500)
+    p.add_argument("--tol", type=float, default=1e-6)
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--dtype", choices=["auto","float32","float64"], default="auto",
+                   help="Numeric precision for GLM tensors. auto: float32 on CUDA, float64 on CPU")
+
+    p.add_argument("--w1", type=float, default=0.5)
+    p.add_argument("--w2", type=float, default=0.4)
+    p.add_argument("--w3", type=float, default=0.4)
+    p.add_argument("--c1", type=float, default=4.0)
+    p.add_argument("--c2", type=float, default=4.0)
+    p.add_argument("--c3", type=float, default=4.0)
+    p.add_argument("--rho_syn", type=float, default=0.15)
+    p.add_argument("--lambda_alpha", type=float, default=0.5)
+    p.add_argument("--lambda_cv", type=float, default=0.5)
+    p.add_argument("--cv_cap", type=float, default=1.0)
+    p.add_argument("--t0", type=float, default=2.7)
+    p.add_argument("--slope", type=float, default=0.4)
+
+    p.add_argument("--auto_tune", type=int, choices=[0,1], default=1)
+    p.add_argument("--auto_t0_pct", type=float, default=0.60)
+    p.add_argument("--auto_syn_target", type=float, default=0.20)
+    p.add_argument("--auto_lock", nargs="*", default=[])
+    p.add_argument("--auto_save_json", default=None)
+
+    # Presets / Quick toggles
+    p.add_argument("--hard_filter", type=int, choices=[0,1], default=0,
+                   help="1이면 non-specific 제거를 강하게 적용하는 프리셋(NEG heavy) 활성화")
+    p.add_argument("--preset", choices=["auto","balanced","neg_heavy","lenient","medium","very_hard"], default="auto",
+                   help="간편 프리셋: auto(현 설정 유지), balanced, medium, neg_heavy(강력), very_hard(매우 강력), lenient(느슨)")
+
+    p.add_argument("--alpha_boost", type=float, default=0.5)
+    p.add_argument("--beta_bead_r2", type=float, default=0.0)
+    p.add_argument("--gamma_paired_boost", type=float, default=0.0)
+    p.add_argument("--lambda_var", type=float, default=0.3)
+
+    p.add_argument("--min_avg_r1", type=float, default=0.0)
+    p.add_argument("--max_sd_r1", type=float, default=1e9)
+    p.add_argument("--min_log2fc_del2", type=float, default=None)
+    p.add_argument("--min_log2fc_bead", type=float, default=0.0)
+    p.add_argument("--min_log2fc_bead_r2", type=float, default=None)
+    p.add_argument("--min_log2boost", type=float, default=0.0)
+    p.add_argument("--min_log2boost_paired", type=float, default=None)
+    p.add_argument("--max_q_paired_boost", type=float, default=None)
+    p.add_argument("--min_zscore_avgR1", type=float, default=None)
+
+    # NEW: NEG-strong knobs
+    p.add_argument("--neg_strict", type=int, choices=[0,1], default=0,
+                   help="1이면 NEG을 강하게 사용(w_neg 상향, fix_neg_poisson=0).")
+    p.add_argument("--lambda_neg_glm", type=float, default=0.5,
+                   help="GLM 벌점 가중치(NEG가 DEL2보다 높을수록 벌점).")
+    p.add_argument("--tau_neg_lfc", type=float, default=0.0,
+                   help="NEG 벌점을 시작하는 LFC_NEG_vs_DEL2 임계치(기본 0).")
+    p.add_argument("--max_q_bead", type=float, default=None,
+                   help="R1 vs BEAD q-value 상한(지정 시 필터).")
+    p.add_argument("--max_q_bead_r2", type=float, default=None,
+                   help="R2 vs BEAD q-value 상한(지정 시 필터).")
+    p.add_argument("--neg_gate_mode", choices=["none","soft","hard"], default="soft",
+                   help="soft: 벌점/RS필터만, hard: NEG/BEAD/center 필터 실패 시 GLM_hit도 무효.")
+
+    # NEW: NEG-centering knobs
+    p.add_argument("--neg_centering", type=int, choices=[0,1], default=0,
+                   help="1이면 LFC_NEG를 null subset 중앙값으로 센터링하여 LFC_NEG_centered 생성.")
+    p.add_argument("--neg_center_quantile", type=float, default=0.50,
+                   help="null subset 정의용 E_for_synthon 분위수(<= 이하면 포함).")
+    p.add_argument("--neg_center_r2_lfc_max", type=float, default=0.50,
+                   help="null subset 보조 조건: LFC_R2_vs_DEL2_used ≤ 값.")
+    p.add_argument("--max_neg_centered_lfc", type=float, default=None,
+                   help="설정 시, LFC_NEG_centered > 값이면 하드 실패 플래그(neg_gate_mode=hard이면 GLM_hit 무효).")
+
+    p.add_argument("--glm_pct_cut", type=float, default=95.0)
+    p.add_argument("--glm_min_wcount", type=float, default=0.5)
+    p.add_argument("--glm_min_lfc_r2", type=float, default=0.0)
+    p.add_argument("--topk", type=int, default=50)
+
+    # Performance controls for very large libraries
+    p.add_argument("--glm_mode", choices=["full","top","skip"], default="full",
+                   help="GLM fitting strategy: full=all IDs, top=fit only top candidates by baseline score, skip=use baseline only")
+    p.add_argument("--glm_top_pct", type=float, default=5.0,
+                   help="When --glm_mode=top, percentage of IDs to run GLM on (e.g., 5 = top 5%%)")
+    p.add_argument("--glm_top_k", type=int, default=None,
+                   help="When --glm_mode=top, cap number of IDs to run GLM (overrides pct if smaller)")
+
+    return p
+
+# -------------------------------
+# Main
+# -------------------------------
+def main():
+    ap = build_parser(); args = ap.parse_args()
+    sep = normalize_sep(args.sep)
+    ensure_dir(args.outdir); ensure_dir(os.path.join(args.outdir, "plots"))
+
+    # Resolve defaults for inputs
+    run_root = args.run_root or "DELeGANce_out"
+    decoded_dir = args.decoded_dir or os.path.join(run_root, "02_decoded")
+
+    if not args.matrix_tsv:
+        cand = [
+            os.path.join(decoded_dir, "raw_counts_matrix.tsv"),
+            os.path.join(decoded_dir, "raw_counts_matrix.tsv.gz"),
+        ]
+        args.matrix_tsv = next((p for p in cand if os.path.isfile(p)), cand[0])
+        if not os.path.isfile(args.matrix_tsv):
+            raise SystemExit(
+                "[ERROR] raw_counts_matrix.tsv not found. "
+                "DELeGANce hit calling requires raw counts; "
+                "rerun decode to generate raw_counts_matrix.tsv."
+            )
+    else:
+        if not os.path.isfile(args.matrix_tsv):
+            gz = args.matrix_tsv + ".gz"
+            if os.path.isfile(gz):
+                args.matrix_tsv = gz
+    if os.path.basename(args.matrix_tsv).startswith("scaled_counts_matrix"):
+        raise SystemExit(
+            "[ERROR] scaled_counts_matrix.tsv is not accepted for hit calling. "
+            "Use raw_counts_matrix.tsv instead."
+        )
+    if not args.metadata_tsv:
+        cand = [
+            os.path.join(run_root, "BB_information_fixed.tsv"),
+            os.path.join(run_root, "BB_information_fixed.tsv.gz"),
+        ]
+        args.metadata_tsv = next((p for p in cand if os.path.isfile(p)), cand[0])
+    print(f"[INFO] matrix_tsv = {args.matrix_tsv}")
+    print(f"[INFO] metadata_tsv = {args.metadata_tsv}")
+
+    # Apply presets / hard filter
+    def _apply_neg_heavy(a):
+        a.neg_strict = 1
+        a.lambda_neg_glm = 1.0
+        a.tau_neg_lfc = 0.1
+        a.neg_gate_mode = "hard"
+        a.max_q_bead = 0.05
+        # R2 controls only if available
+        a.max_q_bead_r2 = 0.05
+        a.min_log2fc_bead = 0.5
+        a.min_log2fc_bead_r2 = 0.5
+        a.neg_centering = 1
+        a.neg_center_quantile = 0.50
+        a.neg_center_r2_lfc_max = 0.50
+        a.max_neg_centered_lfc = 0.20
+        # Slightly strengthen RS weights
+        a.alpha_boost = max(float(a.alpha_boost), 0.7)
+        a.gamma_paired_boost = max(float(a.gamma_paired_boost), 0.2)
+
+    def _apply_balanced(a):
+        a.neg_strict = 0
+        a.lambda_neg_glm = 0.5
+        a.tau_neg_lfc = 0.0
+        a.neg_gate_mode = "soft"
+        a.max_q_bead = None
+        a.max_q_bead_r2 = None
+        a.min_log2fc_bead = 0.0
+        a.min_log2fc_bead_r2 = None
+        a.neg_centering = 0
+        a.max_neg_centered_lfc = None
+
+    def _apply_lenient(a):
+        a.neg_strict = 0
+        a.lambda_neg_glm = 0.3
+        a.tau_neg_lfc = 0.0
+        a.neg_gate_mode = "none"
+        a.max_q_bead = None
+        a.max_q_bead_r2 = None
+        a.min_log2fc_bead = 0.0
+        a.min_log2fc_bead_r2 = None
+        a.neg_centering = 0
+        a.max_neg_centered_lfc = None
+
+    def _apply_medium(a):
+        a.neg_strict = 1
+        a.lambda_neg_glm = 0.7
+        a.tau_neg_lfc = 0.05
+        a.neg_gate_mode = "soft"
+        a.max_q_bead = 0.10
+        a.max_q_bead_r2 = 0.10
+        a.min_log2fc_bead = 0.3
+        a.min_log2fc_bead_r2 = 0.3
+        a.neg_centering = 1
+        a.neg_center_quantile = 0.50
+        a.neg_center_r2_lfc_max = 0.60
+        a.max_neg_centered_lfc = 0.30
+        a.alpha_boost = max(float(a.alpha_boost), 0.6)
+        a.gamma_paired_boost = max(float(a.gamma_paired_boost), 0.15)
+
+    def _apply_very_hard(a):
+        a.neg_strict = 1
+        a.lambda_neg_glm = 1.2
+        a.tau_neg_lfc = 0.0
+        a.neg_gate_mode = "hard"
+        a.max_q_bead = 0.01
+        a.max_q_bead_r2 = 0.01
+        a.min_log2fc_bead = 1.0
+        a.min_log2fc_bead_r2 = 1.0
+        a.neg_centering = 1
+        a.neg_center_quantile = 0.40
+        a.neg_center_r2_lfc_max = 0.40
+        a.max_neg_centered_lfc = 0.10
+        a.alpha_boost = max(float(a.alpha_boost), 0.8)
+        a.gamma_paired_boost = max(float(a.gamma_paired_boost), 0.3)
+        # Tighten GLM gates slightly
+        a.glm_pct_cut = max(float(a.glm_pct_cut), 97.0)
+        a.glm_min_wcount = max(float(a.glm_min_wcount), 0.6)
+        a.glm_min_lfc_r2 = max(float(a.glm_min_lfc_r2), 0.2)
+
+    if int(getattr(args, 'hard_filter', 0)) == 1:
+        _apply_neg_heavy(args)
+        print("[PRESET] hard_filter=1 → neg_heavy preset applied")
+    elif getattr(args, 'preset', 'auto') == 'neg_heavy':
+        _apply_neg_heavy(args); print("[PRESET] preset=neg_heavy applied")
+    elif getattr(args, 'preset', 'auto') == 'balanced':
+        _apply_balanced(args); print("[PRESET] preset=balanced applied")
+    elif getattr(args, 'preset', 'auto') == 'medium':
+        _apply_medium(args); print("[PRESET] preset=medium applied")
+    elif getattr(args, 'preset', 'auto') == 'very_hard':
+        _apply_very_hard(args); print("[PRESET] preset=very_hard applied")
+    elif getattr(args, 'preset', 'auto') == 'lenient':
+        _apply_lenient(args); print("[PRESET] preset=lenient applied")
+
+    # Load & sum-by-ID
+    # Load & sum-by-ID
+    if not os.path.isfile(args.matrix_tsv):
+        raise SystemExit(
+            f"[ERROR] matrix file not found: {args.matrix_tsv}\n"
+            f"  Tried defaults under: run_root={run_root}, decoded_dir={decoded_dir}"
+        )
+    # Common normalized column names
+    id_col = norm_header("id")
+    del2_col = norm_header(args.del2_col)
+    r1_cols = [norm_header(c) for c in (args.r1_cols or [])]
+    r2_cols = [norm_header(c) for c in (args.r2_cols or [])]
+    r3_cols = [norm_header(c) for c in (args.r3_cols or [])] if args.r3_cols else []
+    neg_r1_col = norm_header(args.neg_r1_col) if args.neg_r1_col else None
+    neg_r2_col = norm_header(args.neg_r2_col) if args.neg_r2_col else None
+    has_r2 = len(r2_cols) > 0
+    has_r3 = len(r3_cols) > 0
+
+    # Detect lib column presence from header (normalized)
+    head_cols = [norm_header(c) for c in pd.read_csv(args.matrix_tsv, sep=sep, nrows=0, dtype=str).columns]
+    has_lib = norm_header("lib_id") in head_cols
+
+    # Library separation is mandatory: different libraries reuse BB IDs differently
+    if not has_lib:
+        raise SystemExit(
+            "[ERROR] Matrix is missing a lib_id column. "
+            "Provide the decoded matrix from 02_decode_reads.pl (raw/scaled_counts_matrix.tsv) "
+            "so library-specific BB/CP mappings are preserved."
+        )
+
+    need_cols = set([id_col, del2_col] + r1_cols + r2_cols + r3_cols)
+    if has_lib:
+        need_cols.add(norm_header("lib_id"))
+    if neg_r1_col: need_cols.add(neg_r1_col)
+    if neg_r2_col: need_cols.add(neg_r2_col)
+
+    missing_head = [c for c in need_cols if c not in head_cols]
+    if missing_head:
+        raise SystemExit("[ERROR] Missing required columns in matrix header: " + ", ".join(missing_head))
+
+    if int(args.streaming_agg) == 1:
+        print("[INFO] Streaming aggregation enabled")
+        count_cols = r1_cols + r2_cols + r3_cols + ([neg_r1_col] if neg_r1_col else []) + ([neg_r2_col] if neg_r2_col else [])
+        df_sum = streaming_group_counts(args.matrix_tsv, sep=sep, id_col=id_col, del2_col=del2_col,
+                                        count_cols=count_cols, lib_col=(norm_header("lib_id") if has_lib else None),
+                                        chunksize=int(args.streaming_chunk_rows))
+    else:
+        df0 = safe_read_table(args.matrix_tsv, sep=sep)
+        count_cols = [del2_col] + r1_cols + r2_cols + r3_cols + ([neg_r1_col] if neg_r1_col else []) + ([neg_r2_col] if neg_r2_col else [])
+        to_numeric_inplace(df0, count_cols)
+        if has_lib:
+            lib_col = norm_header("lib_id")
+            agg_map = {c: "sum" for c in count_cols}
+            df_sum = (
+                df0.groupby([lib_col, id_col], as_index=False)
+                   .agg(agg_map)
+                   .rename(columns={lib_col: "LIB_ID"})
+            )
+        else:
+            df_sum = df0.groupby(id_col, as_index=False)[count_cols].sum()
+            df_sum["LIB_ID"] = ""
+
+    all_count_cols = r1_cols + r2_cols + r3_cols + ([neg_r1_col] if neg_r1_col else []) + ([neg_r2_col] if neg_r2_col else [])
+    sample_cols = [del2_col] + all_count_cols
+    # Build normalization factors on the full matrix to avoid prefilter bias.
+    sfs = build_size_factors(df_sum, sample_cols=sample_cols, method=args.libsize_norm, lib_col="LIB_ID")
+    totals_by_lib = {}
+    for lib, sub in df_sum.groupby("LIB_ID"):
+        totals_by_lib[lib] = sub[sample_cols].sum(axis=0).astype(float).to_dict()
+
+    # Prefilter
+    df_sum = prefilter_df_sum(df_sum, del2_col=del2_col, all_count_cols=all_count_cols,
+                              q_del2=args.prefilter_del2_q, min_abs_del2=args.prefilter_min_del2,
+                              min_total_counts=args.prefilter_min_total)
+
+    # Abort early when nothing passes (or matrix is empty) to avoid downstream KeyErrors
+    if df_sum.shape[0] == 0:
+        raise SystemExit(
+            "[ERROR] No rows available for hit calling after prefilter. "
+            "Check the decoded matrix (lib_id, counts) and prefilter thresholds; "
+            "use looser filters (e.g., --prefilter_min_total 0 --prefilter_min_del2 0 --prefilter_del2_q 0) "
+            "or ensure decoding produced rows."
+        )
+
+    # Save raw_by_id
+    raw_out = os.path.join(args.outdir, "01_raw_by_id.tsv")
+    df_sum.to_csv(raw_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {raw_out}")
+
+    # Parse ID → cycles, BB1..BB4, CP
+    parsed = df_sum[id_col].apply(parse_id_fields).apply(pd.Series)
+    parsed.columns = ["cycles","BB1","BB2","BB3","BB4","CP"]
+    for c in ["BB1","BB2","BB3","BB4","CP"]:
+        parsed[c] = parsed[c].astype(str)
+    df_sum = pd.concat([df_sum, parsed], axis=1)
+
+    # CPM (library-aware) using full-matrix totals
+    df_cpm = add_cpm_columns(df_sum, sample_cols=sample_cols, totals_by_lib=totals_by_lib, lib_col="LIB_ID")
+    cpm_out = os.path.join(args.outdir, "02_cpm_by_id.tsv")
+    df_cpm.to_csv(cpm_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {cpm_out}")
+
+    # Baseline stats
+    def rep_log_offs(lib_val: str, cols_norm: List[str]) -> np.ndarray:
+        return np.array([math.log(max(_sfs_lookup(sfs, lib_val, c), 1e-12)) for c in cols_norm], dtype=np.float64)
+    def arr_norm(row: pd.Series, cols_norm: List[str], lib_val: str) -> np.ndarray:
+        return np.array([float(row[c]) / max(_sfs_lookup(sfs, lib_val, c), 1e-12) for c in cols_norm], dtype=float)
+
+    offs_neg1_map = {}  # lib -> offsets (NEG_R1)
+    offs_neg2_map = {}  # lib -> offsets (NEG_R2)
+    offs_r1_map = {}
+    offs_r2_map = {}
+    offs_r3_map = {}
+    libs_unique = df_sum["LIB_ID"].unique().tolist()
+    for lib in libs_unique:
+        offs_neg1_map[lib] = rep_log_offs(lib, [neg_r1_col] if neg_r1_col else [])
+        offs_neg2_map[lib] = rep_log_offs(lib, [neg_r2_col] if neg_r2_col else [])
+        offs_r1_map[lib] = rep_log_offs(lib, r1_cols)
+        offs_r2_map[lib] = rep_log_offs(lib, r2_cols)
+        if has_r3:
+            offs_r3_map[lib] = rep_log_offs(lib, r3_cols)
+    mean_r1, mean_r2, mean_r3, del2_norms, cv_r1, cv_r2, cv_r3 = [], [], [], [], [], [], []
+    mean_neg1, mean_neg2 = [], []
+    lfc_r1_b, lfc_r2_b, lfc_r3_b = [], [], []
+    lfc_neg1_b, lfc_neg2_b = [], []
+    for _, row in df_sum.iterrows():
+        r1 = arr_norm(row, r1_cols, row["LIB_ID"]); r2 = arr_norm(row, r2_cols, row["LIB_ID"]); r3 = arr_norm(row, r3_cols, row["LIB_ID"]) if has_r3 else np.array([])
+        neg1 = arr_norm(row, [neg_r1_col], row["LIB_ID"]) if neg_r1_col else np.array([])
+        neg2 = arr_norm(row, [neg_r2_col], row["LIB_ID"]) if neg_r2_col else np.array([])
+        del2_norm = float(row[del2_col]) / max(_sfs_lookup(sfs, row["LIB_ID"], del2_col), 1e-12)
+        m_r1 = float(np.mean(r1)) if r1.size else 0.0
+        m_r2 = float(np.mean(r2)) if r2.size else 0.0
+        m_r3 = float(np.mean(r3)) if r3.size else 0.0
+        m_n1 = float(np.mean(neg1)) if neg1.size else np.nan
+        m_n2 = float(np.mean(neg2)) if neg2.size else np.nan
+        mean_r1.append(m_r1); mean_r2.append(m_r2); 
+        if has_r3: mean_r3.append(m_r3)
+        mean_neg1.append(m_n1); mean_neg2.append(m_n2)
+        del2_norms.append(del2_norm)
+        cv_r1.append(coeff_var(r1)); cv_r2.append(coeff_var(r2)); 
+        if has_r3: cv_r3.append(coeff_var(r3))
+        epsk = args.pseudocount_k * max(1.0, del2_norm)
+        lfc_r1_b.append(safe_log2_ratio(m_r1, del2_norm, epsk))
+        lfc_r2_b.append(safe_log2_ratio(m_r2, del2_norm, epsk))
+        if has_r3: lfc_r3_b.append(safe_log2_ratio(m_r3, del2_norm, epsk))
+        lfc_neg1_b.append(safe_log2_ratio(m_n1, del2_norm, epsk) if neg1.size else np.nan)
+        lfc_neg2_b.append(safe_log2_ratio(m_n2, del2_norm, epsk) if neg2.size else np.nan)
+
+    df_sum["mean_R1_norm"] = mean_r1; df_sum["mean_R2_norm"] = mean_r2
+    if has_r3: df_sum["mean_R3_norm"] = mean_r3
+    df_sum["DEL2_norm"] = del2_norms
+    df_sum["CV_R1"] = cv_r1; df_sum["CV_R2"] = cv_r2; 
+    if has_r3: df_sum["CV_R3"] = cv_r3
+    df_sum["LFC_R1_vs_DEL2_baseline"] = lfc_r1_b
+    df_sum["LFC_R2_vs_DEL2_baseline"] = lfc_r2_b
+    if has_r3: df_sum["LFC_R3_vs_DEL2_baseline"] = lfc_r3_b
+    if neg_r1_col:
+        df_sum["mean_NEG1_norm"] = mean_neg1
+        df_sum["LFC_NEG_R1_vs_DEL2"] = lfc_neg1_b
+    if neg_r2_col:
+        df_sum["mean_NEG2_norm"] = mean_neg2
+        df_sum["LFC_NEG_R2_vs_DEL2"] = lfc_neg2_b
+
+    # ---------- Auto-tune (pre-GLM) ----------
+    def _fanomed(arrs: List[np.ndarray]) -> float:
+        fanos = []
+        for a in arrs:
+            a = np.asarray(a, dtype=float); a = a[~np.isnan(a)]
+            if a.size < 2: continue
+            m = float(np.mean(a)); 
+            if m <= 0: continue
+            v = float(np.var(a, ddof=1))
+            fanos.append(v / m)
+        return float(np.median(fanos)) if fanos else np.nan
+    def _interp_clip(x, xs, ys, lo=0.0, hi=1.0):
+        return float(np.clip(np.interp(x, xs, ys), lo, hi))
+    def autotune_pre(df_sum: pd.DataFrame, r1_cols, r2_cols, neg_groups, r3_cols, sfs) -> Dict[str,float]:
+        def arr_norm(row, cols):
+            lib = row.get("LIB_ID", "")
+            return np.array([float(row[c]) / max(_sfs_lookup(sfs, lib, c), 1e-12) for c in cols], dtype=float)
+        r1_vecs, r2_vecs, r3_vecs, neg_vecs = [], [], [], []
+        for _, row in df_sum.iterrows():
+            if len(r1_cols) >= 2: r1_vecs.append(arr_norm(row, r1_cols))
+            if len(r2_cols) >= 2: r2_vecs.append(arr_norm(row, r2_cols))
+            if r3_cols and len(r3_cols) >= 2: r3_vecs.append(arr_norm(row, r3_cols))
+            # Do not pool NEG across rounds; compute per-group if replicates exist.
+        neg_fanos = []
+        for cols in (neg_groups or []):
+            if len(cols) < 2:
+                continue
+            neg_vecs = []
+            for _, row in df_sum.iterrows():
+                neg_vecs.append(arr_norm(row, cols))
+            fn_g = _fanomed(neg_vecs)
+            if not np.isnan(fn_g):
+                neg_fanos.append(fn_g)
+        f1 = _fanomed(r1_vecs); f2 = _fanomed(r2_vecs); f3 = _fanomed(r3_vecs) if len(r3_vecs) else np.nan; fn = (max(neg_fanos) if neg_fanos else np.nan)
+        w_r1 = _interp_clip(f1 if not np.isnan(f1) else 1.5, [1.0, 3.0], [0.1, 0.9], 0.0, 0.95)
+        w_r2 = _interp_clip(f2 if not np.isnan(f2) else 2.0, [1.0, 3.0], [0.3, 0.95], 0.1, 0.98)
+        w_r3 = _interp_clip(f3 if not np.isnan(f3) else 2.0, [1.0, 3.0], [0.3, 0.95], 0.1, 0.98) if not np.isnan(f3) else w_r2
+        if not neg_fanos or np.isnan(fn) or fn <= 1.3:
+            fix_neg_poisson = 1; w_neg = 0.0
+        else:
+            fix_neg_poisson = 0; w_neg = _interp_clip(fn, [1.3, 3.0], [0.2, 0.6], 0.0, 0.8)
+        return {"w_neg": w_neg, "w_r1": w_r1, "w_r2": w_r2, "w_r3": w_r3, "fix_neg_poisson": fix_neg_poisson}
+    neg_groups = []
+    if neg_r1_col:
+        neg_groups.append([neg_r1_col])
+    if neg_r2_col:
+        neg_groups.append([neg_r2_col])
+    pre = autotune_pre(df_sum, r1_cols, r2_cols, neg_groups, r3_cols, sfs)
+    # NEG 강화 모드
+    if args.neg_strict == 1 and neg_r1_col:
+        pre["w_neg"] = max(pre.get("w_neg", 0.0), 0.6)
+        pre["fix_neg_poisson"] = 0
+        print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
+    args.w_neg = float(pre.get("w_neg", args.w_neg)); args.w_r1 = float(pre.get("w_r1", args.w_r1)); args.w_r2 = float(pre.get("w_r2", args.w_r2)); 
+    if not has_r2:
+        args.w_r2 = 0.0
+    if has_r3:
+        args.w_r3 = float(pre.get("w_r3", args.w_r3))
+    args.fix_neg_poisson = int(pre.get("fix_neg_poisson", args.fix_neg_poisson))
+    print(f"[AUTO] Pre-GLM tuned: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
+
+    # Fit GLM per ID with performance modes
+    neg_conds = []
+    if neg_r1_col: neg_conds.append("NEG_R1")
+    if neg_r2_col: neg_conds.append("NEG_R2")
+    conds = neg_conds + ["R1"] + (["R2"] if has_r2 else []) + (["R3"] if has_r3 else [])
+    w_map = {"R1": args.w_r1}
+    for nc in neg_conds:
+        w_map[nc] = args.w_neg
+    if has_r2: w_map["R2"] = args.w_r2
+    if has_r3: w_map["R3"] = args.w_r3
+    # Resolve dtype for maximum performance on GPU
+    dtype_choice = str(getattr(args, 'dtype', 'auto')).lower()
+    if dtype_choice == 'auto':
+        dtype_choice = 'float32' if (_HAS_TORCH and args.device and str(args.device).startswith('cuda')) else 'float64'
+    if _HAS_TORCH and str(args.device).startswith('cuda') and hasattr(torch, 'set_float32_matmul_precision') and dtype_choice == 'float32':
+        try:
+            torch.set_float32_matmul_precision('high')  # speedup on Ampere+
+        except Exception:
+            pass
+    model = ElasticTagGLM(conds=conds, w_map=w_map, alpha_l1=args.alpha_l1, alpha_l2=args.alpha_l2,
+                          lr=args.lr, max_steps=args.max_steps, tol=args.tol,
+                          dispersion_mode=args.dispersion, fix_neg_poisson=bool(args.fix_neg_poisson),
+                          device=args.device if _HAS_TORCH else "cpu", dtype=dtype_choice,
+                          neg_conds=neg_conds)
+
+    # Pre-rank by a cheap baseline score (no GLM): E_baseline * W_count
+    # Use winsorized baseline LFCs and logistic W_count from mean reads
+    def _clip_series_vals(vals, cap):
+        return np.array([winsorize(float(v) if v==v else 0.0, 0.0, cap) for v in vals], dtype=float)
+    e1b = _clip_series_vals(np.array(lfc_r1_b, dtype=float), float(args.c1))
+    e2b = _clip_series_vals(np.array(lfc_r2_b, dtype=float), float(args.c2))
+    e3b = _clip_series_vals(np.array(lfc_r3_b, dtype=float), float(args.c3)) if has_r3 else None
+    log10_mean = np.log10(np.array(mean_r1, dtype=float) + np.array(mean_r2, dtype=float) +
+                          (np.array(mean_r3, dtype=float) if has_r3 else 0.0) + 1.0)
+    # A light auto-tune for t0/slope based on current distribution
+    try:
+        q25 = float(np.nanquantile(log10_mean, 0.25)); q60 = float(np.nanquantile(log10_mean, 0.60)); q75 = float(np.nanquantile(log10_mean, 0.75))
+        slope0 = float(np.clip((q75 - q25) / 2.772, 0.2, 1.0)); t0_0 = q60
+    except Exception:
+        slope0 = float(args.slope); t0_0 = float(args.t0)
+    wcount_b = 1.0 / (1.0 + np.exp(-(log10_mean - t0_0) / slope0))
+    ecomp_b = float(args.w1) * e1b + (float(args.w2) * e2b if has_r2 else 0.0) + ((float(args.w3) * e3b) if has_r3 else 0.0)
+    base_score = ecomp_b * wcount_b
+
+    N = len(df_sum)
+    if args.glm_mode == 'skip':
+        to_fit_idx = np.array([], dtype=int)
+        print(f"[GLM] Mode=skip → using baseline only for {N:,} IDs")
+    elif args.glm_mode == 'top':
+        pct = max(0.01, min(float(args.glm_top_pct), 100.0))
+        k_by_pct = int(max(1, round(N * (pct / 100.0))))
+        k_by_arg = int(args.glm_top_k) if args.glm_top_k is not None else k_by_pct
+        K = int(max(1, min(N, k_by_arg)))
+        order = np.argsort(-base_score)
+        to_fit_idx = np.asarray(order[:K], dtype=int)
+        print(f"[GLM] Mode=top → fitting top {K:,} IDs (pct={pct}%) out of {N:,}")
+    else:
+        to_fit_idx = np.arange(N, dtype=int)
+        print(f"[GLM] Mode=full → fitting all {N:,} IDs")
+
+    to_fit_set = set(int(x) for x in to_fit_idx.tolist())
+    glm_rows = []
+    for i, row in df_sum.iterrows():
+        tag_id = str(row[id_col]); del2_val = float(row[del2_col]); lib_val = row.get("LIB_ID", "")
+        if i not in to_fit_set:
+            # Placeholder; downstream will fall back to baseline LFCs
+            glm_rows.append({"ID": tag_id, "LIB_ID": lib_val, "DEL2_sum": del2_val, "alpha_for_penalty": 0.0})
+            continue
+        y_dict = {"R1": row[r1_cols].values.astype(float)}
+        offs_dict = {"R1": offs_r1_map.get(lib_val, np.zeros_like(offs_r1_map.get(lib_val, np.array([]))))}
+        if neg_r1_col:
+            y_dict["NEG_R1"] = row[[neg_r1_col]].values.astype(float)
+            offs_dict["NEG_R1"] = offs_neg1_map.get(lib_val, np.zeros_like(offs_neg1_map.get(lib_val, np.array([]))))
+        if neg_r2_col:
+            y_dict["NEG_R2"] = row[[neg_r2_col]].values.astype(float)
+            offs_dict["NEG_R2"] = offs_neg2_map.get(lib_val, np.zeros_like(offs_neg2_map.get(lib_val, np.array([]))))
+        if has_r2:
+            y_dict["R2"] = row[r2_cols].values.astype(float); offs_dict["R2"] = offs_r2_map.get(lib_val, np.zeros_like(offs_r2_map.get(lib_val, np.array([]))))
+        if has_r3:
+            y_dict["R3"] = row[r3_cols].values.astype(float); offs_dict["R3"] = offs_r3_map.get(lib_val, np.zeros_like(offs_r3_map.get(lib_val, np.array([]))))
+        sf_del2 = max(_sfs_lookup(sfs, lib_val, del2_col), 1e-12)
+        del2_norm = del2_val / sf_del2
+        off_log = math.log(del2_norm + args.pseudocount_k * max(1.0, del2_norm))
+        fit = model.fit_one(y_dict=y_dict, offs_dict=offs_dict, offset_log=off_log)
+        fit["ID"] = tag_id; fit["LIB_ID"] = lib_val; fit["DEL2_sum"] = del2_val
+        glm_rows.append(fit)
+        if (len(glm_rows) % 1000) == 0:
+            print(f"[INFO] GLM processed {min(len(glm_rows), len(to_fit_set))}/{len(to_fit_set)} (subset)", file=sys.stderr)
+
+    df_glm = pd.DataFrame(glm_rows)
+    df_sum_id = df_sum.rename(columns={id_col:"ID"})
+    baseline_cols = ["LFC_R1_vs_DEL2_baseline"] + (["LFC_R2_vs_DEL2_baseline"] if has_r2 else []) + (["LFC_R3_vs_DEL2_baseline"] if has_r3 else [])
+    keep_bl = ["ID","LIB_ID"] + [c for c in baseline_cols if c in df_sum_id.columns]
+    df_glm = df_glm.merge(df_sum_id[keep_bl], on=["ID","LIB_ID"], how="left")
+    glm_out = os.path.join(args.outdir, "03_glm_results.csv")
+    df_glm.to_csv(glm_out, index=False); print(f"[OK] Wrote {glm_out}")
+
+    # Choose LFC pref vs baseline
+    # NOTE: df_sum_id already has baseline columns; df_glm may also carry them (merged above).
+    # Use explicit suffixes so baseline columns keep their original names (needed for --glm_mode skip).
+    m = df_sum_id.merge(df_glm, on=["ID","LIB_ID"], how="left", suffixes=("", "_glm"))
+    def pick(df, pref, base):
+        if pref not in df.columns:
+            return df[base]
+        pref_vals = pd.to_numeric(df[pref], errors="coerce")
+        if base in df.columns:
+            base_vals = pd.to_numeric(df[base], errors="coerce")
+            return pref_vals.where(pref_vals.notna(), base_vals)
+        return pref_vals
+    m["LFC_R1_vs_DEL2_used"] = pick(m, "LFC_R1_vs_DEL2", "LFC_R1_vs_DEL2_baseline")
+    if has_r2:
+        m["LFC_R2_vs_DEL2_used"] = pick(m, "LFC_R2_vs_DEL2", "LFC_R2_vs_DEL2_baseline")
+    else:
+        m["LFC_R2_vs_DEL2_used"] = 0.0
+    if has_r3:
+        m["LFC_R3_vs_DEL2_used"] = pick(m, "LFC_R3_vs_DEL2", "LFC_R3_vs_DEL2_baseline")
+
+    # Ensure NEG columns exist even when --glm_mode=skip (placeholders carry no GLM fields).
+    if "LFC_NEG_vs_DEL2" not in m.columns:
+        m["LFC_NEG_vs_DEL2"] = 0.0
+    if "delta_NEG" not in m.columns:
+        m["delta_NEG"] = 0.0
+
+    # R1 NEG: prefer GLM NEG when available, else baseline NEG_R1.
+    if neg_r1_col:
+        if "LFC_NEG_R1_vs_DEL2_glm" in m.columns or "LFC_NEG_R1_vs_DEL2" in m.columns:
+            m["LFC_NEG_R1_vs_DEL2_used"] = pick(m, "LFC_NEG_R1_vs_DEL2_glm", "LFC_NEG_R1_vs_DEL2").fillna(0.0)
+
+    # R2 NEG: prefer GLM NEG when available, else baseline NEG_R2.
+    if neg_r2_col:
+        if "LFC_NEG_R2_vs_DEL2_glm" in m.columns or "LFC_NEG_R2_vs_DEL2" in m.columns:
+            m["LFC_NEG_R2_vs_DEL2_used"] = pick(m, "LFC_NEG_R2_vs_DEL2_glm", "LFC_NEG_R2_vs_DEL2").fillna(0.0)
+
+    has_neg_r1 = bool(neg_r1_col and "LFC_NEG_R1_vs_DEL2_used" in m.columns)
+    has_neg_r2 = bool(neg_r2_col and "LFC_NEG_R2_vs_DEL2_used" in m.columns)
+
+    # Select NEG control for centering: prefer NEG_R2 when available (second-round control).
+    if has_neg_r2:
+        neg_used = m["LFC_NEG_R2_vs_DEL2_used"]
+        neg_used_label = "NEG_R2"
+    elif has_neg_r1:
+        neg_used = m["LFC_NEG_R1_vs_DEL2_used"]
+        neg_used_label = "NEG_R1"
+    else:
+        neg_used = m["LFC_NEG_vs_DEL2"]
+        neg_used_label = "NEG_GLM"
+    m["NEG_control_used"] = neg_used_label
+    m["LFC_NEG_vs_DEL2_used"] = pd.to_numeric(neg_used, errors="coerce").fillna(0.0)
+    m["delta_NEG_used"] = m["LFC_NEG_vs_DEL2_used"] * math.log(2.0)
+
+    # NEG penalty sources (R1/R2)
+    if has_neg_r1 and has_neg_r2:
+        neg_penalty_label = "NEG_R1+NEG_R2"
+        neg_w_r1, neg_w_r2 = 0.5, 0.5
+    elif has_neg_r2:
+        neg_penalty_label = "NEG_R2"
+        neg_w_r1, neg_w_r2 = 0.0, 1.0
+    elif has_neg_r1:
+        neg_penalty_label = "NEG_R1"
+        neg_w_r1, neg_w_r2 = 1.0, 0.0
+    else:
+        neg_penalty_label = "NEG_GLM"
+        neg_w_r1, neg_w_r2 = 0.0, 0.0
+    m["NEG_penalty_used"] = neg_penalty_label
+
+    # ---------- Auto-tune (post-GLM) ----------
+    def _nanquantile(a, q):
+        a = np.asarray(a, dtype=float); a = a[~np.isnan(a)]
+        return float(np.quantile(a, q)) if a.size else np.nan
+    def autotune_post(m: pd.DataFrame, has_r3: bool, auto_t0_pct: float, syn_target_amp: float) -> Dict[str,float]:
+        out = {}
+        log10_mean = np.log10(pd.to_numeric(m["mean_R1_norm"], errors="coerce").fillna(0.0).values
+                              + pd.to_numeric(m["mean_R2_norm"], errors="coerce").fillna(0.0).values
+                              + (pd.to_numeric(m["mean_R3_norm"], errors="coerce").fillna(0.0).values if has_r3 else 0.0)
+                              + 1.0)
+        q25 = _nanquantile(log10_mean, 0.25); q60 = _nanquantile(log10_mean, min(max(auto_t0_pct,0.05),0.95)); q75 = _nanquantile(log10_mean, 0.75)
+        iqr = (q75 - q25) if (q75==q75 and q25==q25) else 1.0
+        slope = float(np.clip(iqr / 2.772, 0.2, 1.0)); t0 = float(q60 if q60==q60 else 2.7)
+        out.update({"t0": t0, "slope": slope})
+        l1 = pd.to_numeric(m.get("LFC_R1_vs_DEL2_used", np.nan), errors="coerce")
+        l2 = pd.to_numeric(m.get("LFC_R2_vs_DEL2_used", np.nan), errors="coerce")
+        l3 = pd.to_numeric(m.get("LFC_R3_vs_DEL2_used", np.nan), errors="coerce") if has_r3 else None
+        c1 = float(np.clip(_nanquantile(l1, 0.90), 2.0, 5.0)) if l1 is not None else 3.0
+        c2 = float(np.clip(_nanquantile(l2, 0.90), 2.0, 5.0)) if l2 is not None else 3.0
+        c3 = float(np.clip(_nanquantile(l3, 0.90), 2.0, 5.0)) if (has_r3 and l3 is not None) else 3.0
+        out.update({"c1": c1, "c2": c2, "c3": c3})
+        ppos_r2 = float(np.mean(l2 > 0)) if np.isfinite(l2).any() else 0.6
+        w2 = float(np.clip(np.interp(ppos_r2, [0.30, 0.90], [0.30, 0.90]), 0.30, 0.90))
+        out.update({"w1": 0.5, "w2": w2, "w3": 0.4})
+        a = pd.to_numeric(m.get("alpha_for_penalty", 0.0), errors="coerce").fillna(0.0).values
+        a75 = min(_nanquantile(a, 0.75), 1.0) if _nanquantile(a,0.75)==_nanquantile(a,0.75) else 0.3
+        lambda_alpha = float(np.clip(0.3 + 0.6 * a75, 0.3, 1.0))
+        cv_cols = [pd.to_numeric(m[c], errors="coerce").values for c in ["CV_R1","CV_R2"] if c in m.columns] + \
+                  ([pd.to_numeric(m["CV_R3"], errors="coerce").values] if has_r3 and "CV_R3" in m.columns else [])
+        cvs = np.concatenate([c[~np.isnan(c)] for c in cv_cols]) if len(cv_cols) else np.array([0.5])
+        q75_cv = _nanquantile(cvs, 0.75); q90_cv = _nanquantile(cvs, 0.90)
+        lambda_cv = float(np.clip(0.3 + 0.7 * (q75_cv / 1.0 if (q75_cv==q75_cv) else 0.5), 0.3, 1.0))
+        cv_cap = float(np.clip(q90_cv if (q90_cv==q90_cv) else 1.0, 0.6, 1.2))
+        out.update({"lambda_alpha": lambda_alpha, "lambda_cv": lambda_cv, "cv_cap": cv_cap})
+        def _clip_series(x, lo, hi):
+            return np.array([winsorize(float(v) if v==v else 0.0, lo, hi) for v in x], dtype=float)
+        e1 = _clip_series(l1.values, 0.0, c1) if l1 is not None else 0.0
+        e2 = _clip_series(l2.values, 0.0, c2) if l2 is not None else 0.0
+        e3 = (_clip_series(l3.values, 0.0, c3) if (has_r3 and l3 is not None) else 0.0)
+        e_for_syn = (0.5*e1 + 1.0*e2 + (0.25*e3 if has_r3 else 0.0)) if isinstance(e1, np.ndarray) else 0.0
+        tmp = m.copy(); tmp["E_for_synthon"] = e_for_syn
+        tmp = compute_synthon_scores(tmp, e_col="E_for_synthon")
+        syn = pd.to_numeric(tmp["SynthonScore"], errors="coerce").fillna(0.0).values
+        if syn.size == 0:
+            rho_syn = 0.15
+        else:
+            q05 = np.nanquantile(syn, 0.05); q95 = np.nanquantile(syn, 0.95)
+            denom = max(abs(q95), abs(q05), 1e-6); rho_syn = float(np.clip(0.20 / denom, 0.05, 0.35))
+        out.update({"rho_syn": rho_syn})
+        return out
+    post = autotune_post(m, has_r3=bool(has_r3), auto_t0_pct=args.auto_t0_pct, syn_target_amp=args.auto_syn_target)
+    for k in ["t0","slope","c1","c2","c3","w1","w2","w3","lambda_alpha","lambda_cv","cv_cap","rho_syn"]:
+        if k in (args.auto_lock or []): continue
+        setattr(args, k, float(post[k]))
+    if not has_r2:
+        args.w2 = 0.0
+
+    # E/W/Synthon/Penalty/HitScore_GLM
+    e1 = np.array([winsorize(x, 0.0, args.c1) for x in pd.to_numeric(m["LFC_R1_vs_DEL2_used"], errors="coerce").fillna(0.0)], dtype=float)
+    if has_r2:
+        e2 = np.array([winsorize(x, 0.0, args.c2) for x in pd.to_numeric(m["LFC_R2_vs_DEL2_used"], errors="coerce").fillna(0.0)], dtype=float)
+    else:
+        e2 = np.zeros_like(e1)
+    e3 = np.array([winsorize(x, 0.0, args.c3) for x in pd.to_numeric(m["LFC_R3_vs_DEL2_used"], errors="coerce").fillna(0.0)], dtype=float) if has_r3 else np.zeros_like(e2)
+    m["E_component"] = args.w1*e1 + (args.w2*e2 if has_r2 else 0.0) + (args.w3*e3 if has_r3 else 0.0)
+
+    log10_mean = np.log10(pd.to_numeric(m["mean_R1_norm"], errors="coerce").fillna(0.0).values
+                          + pd.to_numeric(m.get("mean_R2_norm", 0.0), errors="coerce").fillna(0.0).values
+                          + (pd.to_numeric(m["mean_R3_norm"], errors="coerce").fillna(0.0).values if has_r3 else 0.0)
+                          + 1.0)
+    m["W_count"] = 1.0 / (1.0 + np.exp(-(log10_mean - args.t0) / args.slope))
+
+    m["E_for_synthon"] = 0.5*e1 + (1.0*e2 if has_r2 else 0.0) + (0.25*e3 if has_r3 else 0.0)
+    m = compute_synthon_scores(m, e_col="E_for_synthon")
+    m["SynthonBonus"] = 1.0 + args.rho_syn * pd.to_numeric(m["SynthonScore"], errors="coerce").fillna(0.0)
+
+    def _cap_norm_cv(col, cap):
+        v = np.nan_to_num(pd.to_numeric(m.get(col, np.nan), errors="coerce").values, nan=cap)
+        return np.minimum(v, cap) / cap
+    cv_cap = float(args.cv_cap)
+    cv_parts = [_cap_norm_cv("CV_R1", cv_cap)] + (([_cap_norm_cv("CV_R2", cv_cap)] if has_r2 else [])) + ([_cap_norm_cv("CV_R3", cv_cap)] if has_r3 else [])
+    cv_avg = np.mean(np.vstack(cv_parts), axis=0) if len(cv_parts) else 0.0
+    Penalty = args.lambda_alpha * np.minimum(pd.to_numeric(m.get("alpha_for_penalty", 0.0), errors="coerce").fillna(0.0).values, 1.0) + args.lambda_cv * cv_avg
+
+    # NEW: NEG 벌점 (GLM) — R1/R2 분리 반영
+    if "LFC_NEG_R1_vs_DEL2_used" in m.columns:
+        lfc_neg_r1 = pd.to_numeric(m["LFC_NEG_R1_vs_DEL2_used"], errors="coerce").fillna(0.0).values
+    else:
+        lfc_neg_r1 = np.zeros(len(m), dtype=float)
+    if "LFC_NEG_R2_vs_DEL2_used" in m.columns:
+        lfc_neg_r2 = pd.to_numeric(m["LFC_NEG_R2_vs_DEL2_used"], errors="coerce").fillna(0.0).values
+    else:
+        lfc_neg_r2 = np.zeros(len(m), dtype=float)
+    pen_r1 = np.maximum(0.0, lfc_neg_r1 - float(args.tau_neg_lfc))
+    pen_r2 = np.maximum(0.0, lfc_neg_r2 - float(args.tau_neg_lfc))
+    m["Penalty_NEG_R1"] = pen_r1
+    m["Penalty_NEG_R2"] = pen_r2
+    Penalty_NEG = float(args.lambda_neg_glm) * (neg_w_r1 * pen_r1 + neg_w_r2 * pen_r2)
+    m["Penalty_NEG"] = Penalty_NEG
+    m["Penalty"] = Penalty + m["Penalty_NEG"]
+    m["HitScore_GLM"] = m["E_component"].astype(float).values * m["W_count"].astype(float).values * m["SynthonBonus"].astype(float).values - m["Penalty"].astype(float).values
+    m["HitScore_pct"] = m["HitScore_GLM"].rank(pct=True) * 100.0
+
+    # ---------- ReadScaler ----------
+    rs_rows = []
+    for _, row in df_cpm.iterrows():
+        rs = compute_readscaler_row(row, r1_cols, r2_cols, del2_col, neg_r1_col, neg_r2_col, eps=0.5)
+        rs["id"] = row[id_col]
+        rs["LIB_ID"] = row.get("LIB_ID", "")
+        rs_rows.append(rs)
+    df_rs = pd.DataFrame.from_records(rs_rows)
+    for pcol, qcol in [("p_DEL2","q_DEL2"), ("p_BEAD","q_BEAD"), ("p_BEAD_R2","q_BEAD_R2"), ("p_BoostPaired","q_BoostPaired")]:
+        if pcol in df_rs.columns: df_rs[qcol] = bh_fdr(df_rs[pcol].tolist())
+        else: df_rs[qcol] = np.nan
+    mu = float(np.nanmean(df_rs["avg_R1"])); sd = float(np.nanstd(df_rs["avg_R1"]))
+    df_rs["zscore_avgR1"] = (df_rs["avg_R1"] - mu) / sd if sd > 0 else np.nan
+    df_rs = add_mads(df_rs)
+    def compute_var_penalty(rec: pd.Series, lambda_var: float = 0.3) -> float:
+        triples = []
+        for sd_col, mad_col in [("sd_log2FC_DEL2","mad_log2FC_DEL2"),("sd_log2FC_BEAD","mad_log2FC_BEAD"),("sd_log2Boost_R2vsR1_paired","mad_log2Boost_R2vsR1_paired")]:
+            sd  = rec.get(sd_col, np.nan)
+            mad = rec.get(mad_col, np.nan)
+            if np.isfinite(sd) and sd>0 and np.isfinite(mad) and mad>0:
+                triples.append(sd / mad)
+        if not triples: return 0.0
+        return float(lambda_var * np.mean(triples))
+    df_rs["var_penalty"] = df_rs.apply(lambda r: compute_var_penalty(r, lambda_var=args.lambda_var), axis=1)
+    df_rs["HitScore_RS"] = (
+        args.alpha_boost * df_rs["log2Boost_R2vsR1"].fillna(0.0) +
+        args.beta_bead_r2 * df_rs["mean_log2FC_BEAD_R2"].fillna(0.0) +
+        args.gamma_paired_boost * df_rs["mean_log2Boost_R2vsR1_paired"].fillna(0.0) -
+        df_rs["var_penalty"].fillna(0.0)
+    )
+
+    # RS 필터(NEG 강화를 위한 q_BEAD 옵션 추가)
+    def fail_reason_rs(r) -> List[str]:
+        fs = []
+        if args.min_avg_r1 is not None and np.isfinite(r["avg_R1"]) and (r["avg_R1"] < args.min_avg_r1): fs.append("avg_R1")
+        if args.max_sd_r1 is not None and np.isfinite(r["sd_R1"]) and (r["sd_R1"] > args.max_sd_r1): fs.append("sd_R1")
+        if args.min_log2fc_del2 is not None and np.isfinite(r["mean_log2FC_DEL2"]) and (r["mean_log2FC_DEL2"] < args.min_log2fc_del2): fs.append("DEL2")
+        if args.min_log2fc_bead is not None and np.isfinite(r["mean_log2FC_BEAD"]) and (r["mean_log2FC_BEAD"] < args.min_log2fc_bead): fs.append("BEAD_R1")
+        if args.min_log2fc_bead_r2 is not None and np.isfinite(r["mean_log2FC_BEAD_R2"]) and (r["mean_log2FC_BEAD_R2"] < args.min_log2fc_bead_r2): fs.append("BEAD_R2")
+        if args.max_q_bead is not None and np.isfinite(r.get("q_BEAD", np.nan)) and (r["q_BEAD"] > args.max_q_bead): fs.append("BEAD_R1_q")
+        if args.max_q_bead_r2 is not None and np.isfinite(r.get("q_BEAD_R2", np.nan)) and (r["q_BEAD_R2"] > args.max_q_bead_r2): fs.append("BEAD_R2_q")
+        if args.min_log2boost is not None and np.isfinite(r["log2Boost_R2vsR1"]) and (r["log2Boost_R2vsR1"] < args.min_log2boost): fs.append("R2Boost_avg")
+        if args.min_log2boost_paired is not None and np.isfinite(r["mean_log2Boost_R2vsR1_paired"]) and (r["mean_log2Boost_R2vsR1_paired"] < args.min_log2boost_paired): fs.append("R2Boost_paired_mean")
+        if args.max_q_paired_boost is not None and np.isfinite(r["q_BoostPaired"]) and (r["q_BoostPaired"] > args.max_q_paired_boost): fs.append("R2Boost_paired_q")
+        if args.min_zscore_avgR1 is not None and np.isfinite(r["zscore_avgR1"]) and (r["zscore_avgR1"] < args.min_zscore_avgR1): fs.append("zscore")
+        return fs
+    df_rs["fail_reasons"] = df_rs.apply(lambda r: ";".join(fail_reason_rs(r)) if len(fail_reason_rs(r))>0 else "", axis=1)
+    df_rs["pass_filters"] = df_rs["fail_reasons"].astype(str).str.strip().eq("")
+    rs_out = os.path.join(args.outdir, "04_read_scaler.tsv")
+    df_rs.to_csv(rs_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {rs_out}")
+
+    # Annotation (Codon; LIB-aware)
+    tmp = pd.DataFrame({"ID": df_sum_id["ID"].values})
+    for i in range(1,5):
+        tmp[f"bb{i}_id"] = df_sum_id[f"BB{i}"].astype(str).values
+    meta = load_bbinfo_auto(args.metadata_tsv, needed_bbs=list(tmp["bb1_id"].astype(str)) + list(tmp["bb2_id"].astype(str)) + list(tmp["bb3_id"].astype(str)) + list(tmp["bb4_id"].astype(str)))
+    meta_lib = meta.copy()
+    for k in ["bb_id","lib_id","smiles","tag_uid","tag_seq"]:
+        if k not in meta_lib.columns: meta_lib[k] = ""
+    meta_lib = meta_lib[["bb_id","lib_id","smiles","tag_uid","tag_seq"]].drop_duplicates()
+    def lookup(lib: str, bb: str) -> Dict[str,str]:
+        lib = str(lib) if lib is not None else ""; bb  = str(bb)
+        rec = meta_lib[(meta_lib["bb_id"]==bb)]
+        if lib != "":
+            rec2 = rec[rec["lib_id"]==lib]
+            if len(rec2)>0: rec = rec2
+        if len(rec)>0:
+            r = rec.iloc[0]
+            return {"smiles": r["smiles"], "tag_uid": r["tag_uid"], "tag_seq": (r["tag_seq"] or "").replace(" ","").upper()}
+        r2 = meta_lib[meta_lib["bb_id"]==bb]
+        if len(r2)>0:
+            r = r2.iloc[0]
+            return {"smiles": r["smiles"], "tag_uid": r["tag_uid"], "tag_seq": (r["tag_seq"] or "").replace(" ","").upper()}
+        return {"smiles":"", "tag_uid":"", "tag_seq":""}
+    ann_cols = ["bb1_id","bb1_smiles","bb1_tag_uid","bb1_tag_seq",
+                "bb2_id","bb2_smiles","bb2_tag_uid","bb2_tag_seq",
+                "bb3_id","bb3_smiles","bb3_tag_uid","bb3_tag_seq",
+                "bb4_id","bb4_smiles","bb4_tag_uid","bb4_tag_seq",
+                "BB_SMILES_CONCAT"]
+    ann_df = pd.DataFrame(index=tmp.index, columns=ann_cols, dtype="object")
+    for idx, r in tmp.iterrows():
+        lib = df_sum_id.iloc[idx]["LIB_ID"] if "LIB_ID" in df_sum_id.columns else ""
+        sm_list = []
+        for i in range(1,5):
+            bb = str(r[f"bb{i}_id"])
+            ann_df.at[idx, f"bb{i}_id"] = bb if bb else "NA"
+            if bb and bb != "NA":
+                info = lookup(lib, bb)
+                tseq = (info["tag_seq"] or "").replace(" ", "").upper()
+                ann_df.at[idx, f"bb{i}_smiles"]  = info["smiles"] if info["smiles"] else "NA"
+                ann_df.at[idx, f"bb{i}_tag_uid"] = info["tag_uid"] if info["tag_uid"] else "NA"
+                ann_df.at[idx, f"bb{i}_tag_seq"] = tseq if tseq else "NA"
+                if info["smiles"]: sm_list.append(info["smiles"])
+            else:
+                ann_df.at[idx, f"bb{i}_smiles"]  = "NA"
+                ann_df.at[idx, f"bb{i}_tag_uid"] = "NA"
+                ann_df.at[idx, f"bb{i}_tag_seq"] = "NA"
+        ann_df.at[idx, "BB_SMILES_CONCAT"] = ".".join(sm_list) if sm_list else "NA"
+
+    # Merge GLM + RS + CPM + Annotation (Hybrid)
+    glm_hit_rule = (
+        (m["HitScore_pct"] >= float(args.glm_pct_cut)) &
+        (m["W_count"] >= float(args.glm_min_wcount)) &
+        ((m["LFC_R2_vs_DEL2_used"].fillna(0.0) >= float(args.glm_min_lfc_r2)) if has_r2 else True)
+    )
+    m["GLM_hit"] = glm_hit_rule.astype(bool)
+
+    hybrid = m.merge(df_rs.rename(columns={"id":"ID"}), left_on=["ID","LIB_ID"], right_on=["ID","LIB_ID"], how="left", suffixes=("","_RS"))
+    hybrid = hybrid.merge(
+        df_cpm.rename(columns={id_col:"ID"})[["ID","LIB_ID"] + [c for c in df_cpm.columns if c.endswith("_CPM")]],
+        on=["ID","LIB_ID"],
+        how="left"
+    )
+    hybrid = hybrid.merge(ann_df.join(df_sum_id[["ID","LIB_ID","BB1","BB2","BB3","BB4","CP"]]), left_index=True, right_index=True, how="left")
+    hybrid["RS_pass"] = hybrid["pass_filters"].fillna(False)
+
+    # NEW: NEG hard gate (BEAD/q + (optional) centered LFC)
+    neg_fail = pd.Series([False]*len(hybrid))
+    if args.min_log2fc_bead is not None and "mean_log2FC_BEAD" in hybrid.columns:
+        neg_fail = neg_fail | (hybrid["mean_log2FC_BEAD"] < float(args.min_log2fc_bead))
+    if args.min_log2fc_bead_r2 is not None and "mean_log2FC_BEAD_R2" in hybrid.columns:
+        neg_fail = neg_fail | (hybrid["mean_log2FC_BEAD_R2"] < float(args.min_log2fc_bead_r2))
+    if args.max_q_bead is not None and "q_BEAD" in hybrid.columns:
+        neg_fail = neg_fail | (hybrid["q_BEAD"] > float(args.max_q_bead))
+    if args.max_q_bead_r2 is not None and "q_BEAD_R2" in hybrid.columns:
+        neg_fail = neg_fail | (hybrid["q_BEAD_R2"] > float(args.max_q_bead_r2))
+    hybrid["NEG_hard_fail"] = neg_fail.fillna(False)
+
+    # NEG‑Centering(선택) + gate 병합
+    neg_shift = float("nan"); neg_center_fail_count = 0
+    # Always compute LFC_NEG_centered for reporting; only gate when neg_centering==1
+    do_gate = int(args.neg_centering) == 1
+    tmp_neg, neg_shift, neg_center_fail_count = neg_centering(
+        hybrid,
+        quantile=float(args.neg_center_quantile),
+        r2_lfc_max=float(args.neg_center_r2_lfc_max),
+        max_centered_lfc=(float(args.max_neg_centered_lfc) if (do_gate and args.max_neg_centered_lfc is not None) else None)
+    )
+    # Assign centered columns
+    for col in ("LFC_NEG_centered","delta_NEG_centered","NEG_center_fail"):
+        if col in tmp_neg.columns:
+            hybrid[col] = tmp_neg[col]
+    # Only merge center-fail into hard gate when gating is requested
+    if do_gate and args.max_neg_centered_lfc is not None and "NEG_center_fail" in hybrid.columns:
+        hybrid["NEG_hard_fail"] = hybrid["NEG_hard_fail"] | hybrid["NEG_center_fail"].fillna(False)
+
+    # R1/R2 centered values for QC display (no gating)
+    if "LFC_NEG_R1_vs_DEL2_used" in hybrid.columns:
+        hybrid["LFC_NEG_centered_R1"], neg_shift_r1 = compute_centered_values(
+            hybrid,
+            lfc_col="LFC_NEG_R1_vs_DEL2_used",
+            quantile=float(args.neg_center_quantile),
+            r2_lfc_max=float(args.neg_center_r2_lfc_max),
+            lfc_filter_col="LFC_R1_vs_DEL2_used",
+        )
+        hybrid["NEG_center_shift_R1"] = neg_shift_r1
+    if "LFC_NEG_R2_vs_DEL2_used" in hybrid.columns:
+        hybrid["LFC_NEG_centered_R2"], neg_shift_r2 = compute_centered_values(
+            hybrid,
+            lfc_col="LFC_NEG_R2_vs_DEL2_used",
+            quantile=float(args.neg_center_quantile),
+            r2_lfc_max=float(args.neg_center_r2_lfc_max),
+            lfc_filter_col="LFC_R2_vs_DEL2_used",
+        )
+        hybrid["NEG_center_shift_R2"] = neg_shift_r2
+
+    if args.neg_gate_mode == "hard":
+        hybrid["GLM_hit"] = hybrid["GLM_hit"] & (~hybrid["NEG_hard_fail"])
+
+    hybrid["Consensus_hit"] = hybrid["GLM_hit"] & hybrid["RS_pass"]
+
+    # Save hybrid & topKs
+    hybrid_out = os.path.join(args.outdir, "05_hybrid_annot.tsv")
+    hybrid.to_csv(hybrid_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {hybrid_out}")
+    top_glm = m.sort_values("HitScore_GLM", ascending=False).head(int(args.topk))
+    top_rs  = df_rs.sort_values("HitScore_RS", ascending=False).head(int(args.topk))
+    top_cons= hybrid[hybrid["Consensus_hit"]].sort_values(["HitScore_GLM","HitScore_RS"], ascending=[False,False]).head(int(args.topk))
+    top_glm.to_csv(os.path.join(args.outdir,"06_topk_glm.tsv"), sep="\t", index=False, na_rep="NA")
+    top_rs.to_csv(os.path.join(args.outdir,"07_topk_rs.tsv"), sep="\t", index=False, na_rep="NA")
+    top_cons_path = os.path.join(args.outdir,"08_topk_consensus.tsv")
+    top_cons.to_csv(top_cons_path, sep="\t", index=False, na_rep="NA")
+    if int(getattr(args, "validate_smiles", 0)) == 1:
+        validate_smiles_report(top_cons, os.path.join(args.outdir, "smiles_validation.tsv"))
+
+    # Plots & HTML
+    plots_dir = os.path.join(args.outdir,"plots"); ensure_dir(plots_dir)
+    plot_rank_glm(m, os.path.join(plots_dir,"01_rankplot_glm.png"), top_annotate=min(20, int(args.topk)))
+    plot_scatter_glm_vs_rs(hybrid, os.path.join(plots_dir,"02_glm_vs_rs_scatter.png"))
+    plot_consensus_counts(hybrid, os.path.join(plots_dir,"03_consensus_counts.png"))
+
+    neg_summary = {
+        "neg_strict": args.neg_strict,
+        "neg_gate_mode": args.neg_gate_mode,
+        "lambda_neg_glm": args.lambda_neg_glm,
+        "tau_neg_lfc": args.tau_neg_lfc,
+        "neg_control_used": (hybrid["NEG_control_used"].iloc[0] if ("NEG_control_used" in hybrid.columns and len(hybrid)) else "NA"),
+        "neg_penalty_used": (hybrid["NEG_penalty_used"].iloc[0] if ("NEG_penalty_used" in hybrid.columns and len(hybrid)) else "NA"),
+        "neg_penalty_weights": f"R1={neg_w_r1:.2f}, R2={neg_w_r2:.2f}",
+        "min_log2fc_bead": args.min_log2fc_bead,
+        "max_q_bead": args.max_q_bead,
+        "neg_centering": int(args.neg_centering),
+        "neg_center_shift": (f"{neg_shift:.4f}" if neg_shift==neg_shift else "NA"),
+        "max_neg_centered_lfc": (args.max_neg_centered_lfc if args.max_neg_centered_lfc is not None else "NA"),
+        "neg_hard_fail_count": int(hybrid["NEG_hard_fail"].sum())
+    }
+    write_html_report(args.outdir, plots_dir, top_cons_path, neg_summary)
+
+    print("\n[Summary]")
+    print(f" - GLM rows: {len(m):,}, GLM_hit: {int(m['GLM_hit'].sum()):,}")
+    print(f" - RS rows:  {len(df_rs):,}, RS_pass: {int(hybrid['RS_pass'].sum()):,}")
+    print(f" - NEG_hard_fail: {int(hybrid['NEG_hard_fail'].sum())} (mode={args.neg_gate_mode})")
+    if int(args.neg_centering) == 1:
+        print(f" - NEG centering shift: {neg_shift:.4f}, center_fail: {neg_center_fail_count}")
+    print(f" - Consensus: {int(hybrid['Consensus_hit'].sum()):,}")
+    print(f" - Outputs in '{args.outdir}'")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

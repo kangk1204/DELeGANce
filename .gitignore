@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+.env/
+.conda/
+
+# Logs
+*.log
+
+# Outputs
+DELeGANce_out/
+
+# Data exports
+*.tsv
+*.csv
+*.xlsx
+
+# FASTQ/FASTA
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fasta
+*.fa
+*.fna
+
+# Local input data folders
+00_*_input_fastq/
+00_original_files/
+00_demo_fastqs/
+
+# Local BB metadata (non-code)
+00_*_BB_information*.txt
+00_*_BB_information*.tsv
+
+# Images / figures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.swp
