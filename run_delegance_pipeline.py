@@ -18,19 +18,19 @@ Examples
   # Full run (requires explicit fastq_dir, bbinfo, output_dir, and column names)
   python3 run_delegance_pipeline.py \
       --fastq-dir 00_original_files \
-      --bbinfo 00_DELeGANce_KRASMAT2A_BB_information.txt \
-      --output-dir DELeGANce_out/KRAS_example_run \
-      --r1 D_R1C1,D_R1C2,D_R1C3 \
-      --r2 D_R2C1,D_R2C2,D_R2C3 \
-      --neg D_R1C4 \
+      --bbinfo 00_BB_information.txt \
+      --output-dir DELeGANce_out/example_run \
+      --r1 R1C1,R1C2,R1C3 \
+      --r2 R2C1,R2C2,R2C3 \
+      --neg NEG_R1 \
       --del2 DEL2 \
       --threads 6 --mismatch hp_op_cp
 
   # Hit stage only on an existing run (still requires column names)
   python3 run_delegance_pipeline.py \
       --only hit \
-      --output-dir DELeGANce_out/KRAS_example_run \
-      --r1 D_R1C1,D_R1C2,D_R1C3 --r2 D_R2C1,D_R2C2,D_R2C3 --neg D_R1C4 --del2 DEL2
+      --output-dir DELeGANce_out/example_run \
+      --r1 R1C1,R1C2,R1C3 --r2 R2C1,R2C2,R2C3 --neg NEG_R1 --del2 DEL2
 """
 
 import os

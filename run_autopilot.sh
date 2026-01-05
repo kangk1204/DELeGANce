@@ -3,21 +3,21 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-RUN_NAME="${RUN_NAME:-KRAS_6DEL_full}"
+RUN_NAME="${RUN_NAME:-full_run}"
 RUN_ROOT="${RUN_ROOT:-$ROOT_DIR/DELeGANce_out/$RUN_NAME}"
 
 # Reuse already-merged FASTQs + fastp JSONs from an existing run to avoid re-running fastp.
-SRC_FASTP_OUT="${SRC_FASTP_OUT:-$ROOT_DIR/DELeGANce_out/KRAS_both/01_fastp_out}"
+SRC_FASTP_OUT="${SRC_FASTP_OUT:-$ROOT_DIR/DELeGANce_out/base_run/01_fastp_out}"
 
-FASTQ_DIR="${FASTQ_DIR:-$ROOT_DIR/00_KRAS_input_fastq}"
-BBINFO="${BBINFO:-$ROOT_DIR/00_6DEL_BB_information_20241013.txt}"
+FASTQ_DIR="${FASTQ_DIR:-$ROOT_DIR/00_input_fastq}"
+BBINFO="${BBINFO:-$ROOT_DIR/00_BB_information.txt}"
 THREADS="${THREADS:-6}"
 MISMATCH_MODE="${MISMATCH_MODE:-hp_op_cp}"
 
-R1_COLS=(K_R2C1 K_R2C2 K_R2C3 K_R2C4)
-R2_COLS=(K_R3C1 K_R3C2 K_R3C3 K_R3C4)
-NEG_COLS=(K_R2C5 K_R3C5)
-DEL2_COL="${DEL2_COL:-DEL234}"
+R1_COLS=(R1C1 R1C2 R1C3 R1C4)
+R2_COLS=(R2C1 R2C2 R2C3 R2C4)
+NEG_COLS=(NEG_R1 NEG_R2)
+DEL2_COL="${DEL2_COL:-DEL2}"
 
 usage() {
   cat <<EOF

@@ -214,7 +214,7 @@ my $FASTP_DIR     = File::Spec->catdir($RUN_DIR, "01_fastp_out");
 my $DECODE_DIR    = File::Spec->catdir($RUN_DIR, "02_decoded");
 my $NORM_DIR      = File::Spec->catdir($RUN_DIR, "03_normalized");
 
-my $BB_INFO_FILE       = $OPT_BBINFO // File::Spec->catfile($Bin, "00_DELeGANce_KRASMAT2A_BB_information.txt");
+my $BB_INFO_FILE       = $OPT_BBINFO // File::Spec->catfile($Bin, "00_BB_information.txt");
 my $BB_INFO_FIXED_FILE = File::Spec->catfile($RUN_DIR, "BB_information_fixed.tsv");
 my $BB_ID_MAP_FILE     = File::Spec->catfile($RUN_DIR, "BB_id_resolution_map.tsv");
 my $BB_ID_CHGONLY_FILE = File::Spec->catfile($RUN_DIR, "BB_id_changes_only.tsv");

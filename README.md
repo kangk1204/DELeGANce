@@ -1,10 +1,10 @@
-# DELeGANce KRAS Screening Pipeline
+# DELeGANce Screening Pipeline
 
-DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing analysis: FASTQ preprocessing, barcode decoding, hit calling (GLM-based), and interactive reporting. This repository is a ready-to-run KRAS workflow with example input folders and scripts you can use as a template for new targets.
+DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing analysis: FASTQ preprocessing, barcode decoding, hit calling (GLM-based), and interactive reporting. This repository provides a ready-to-run workflow you can use as a template for new targets. The target is fully user-defined via your input FASTQs and sample columns.
 
 ---
 
-## Quick Start (KRAS demo)
+## Quick Start
 
 1) **Create a clean environment**
 ```bash
@@ -17,23 +17,23 @@ conda install -c pytorch pytorch torchvision torchaudio
 conda install -c conda-forge rdkit
 ```
 
-2) **Run the pipeline (KRAS_both)**
+2) **Run the pipeline**
 ```bash
 python3 run_delegance_pipeline.py \
-  --fastq-dir 00_KRAS_input_fastq \
-  --bbinfo 00_DELeGANce_KRASMAT2A_BB_information.txt \
-  --output-dir DELeGANce_out/KRAS_both \
+  --fastq-dir 00_input_fastq \
+  --bbinfo 00_BB_information.txt \
+  --output-dir DELeGANce_out/my_run \
   --threads 6 \
   --mismatch hp_op_cp \
-  --r1 K_R2C1 K_R2C2 K_R2C3 K_R2C4 \
-  --r2 K_R3C1 K_R3C2 K_R3C3 K_R3C4 \
-  --neg K_R2C5 K_R3C5 \
-  --del2 DEL234
+  --r1 R1C1 R1C2 R1C3 R1C4 \
+  --r2 R2C1 R2C2 R2C3 R2C4 \
+  --neg NEG_R1 NEG_R2 \
+  --del2 DEL2
 ```
 
 3) **Open the results**
-- `DELeGANce_out/KRAS_both/index.html`
-- `DELeGANce_out/KRAS_both/03_normalized/.../interactive_hits.html`
+- `DELeGANce_out/my_run/index.html`
+- `DELeGANce_out/my_run/03_normalized/.../interactive_hits.html`
 
 ---
 
@@ -46,9 +46,9 @@ python3 run_delegance_pipeline.py \
 - `04_build_interactive_report.py` - Interactive Bokeh report (Top-N explorer).
 - `export_beginner_qc_report.py` - Beginner-friendly QC HTML/TSV.
 - `export_final_excel.py` - Excel export with a guide tab (for wet-lab review).
-- `run_kras_6del_full_autopilot.sh` - Convenience wrapper for the KRAS_6DEL_full run.
+- `run_*_autopilot.sh` - Optional target-specific helper script (if present).
 - `00_*_input_fastq/` - Input FASTQs (expected format: `<SAMPLE>_1.fastq.gz`, `<SAMPLE>_2.fastq.gz`).
-- `00_DELeGANce_KRASMAT2A_BB_information.txt`, `00_6DEL_BB_information_20241013.txt` - BB metadata tables.
+- `00_*_BB_information*.txt` - BB metadata tables.
 - `DELeGANce_out/` - Outputs (TSV/plots/HTML/logs).
 
 ---
@@ -75,28 +75,15 @@ If you do not know the column names yet, run preprocess+decode first and inspect
 ### 3) Launch a full run
 ```bash
 python3 run_delegance_pipeline.py \
-  --fastq-dir 00_KRAS_input_fastq \
-  --bbinfo 00_DELeGANce_KRASMAT2A_BB_information.txt \
-  --output-dir DELeGANce_out/KRAS_test_run \
+  --fastq-dir 00_input_fastq \
+  --bbinfo 00_BB_information.txt \
+  --output-dir DELeGANce_out/my_run \
   --threads 6 \
   --mismatch hp_op_cp \
-  --r1 K_R2C1 K_R2C2 K_R2C3 K_R2C4 \
-  --r2 K_R3C1 K_R3C2 K_R3C3 K_R3C4 \
-  --neg K_R2C5 K_R3C5 \
-  --del2 DEL234
-```
-
-### 4) Optional: KRAS_6DEL_full shortcut
-This script reuses merged FASTQs from `KRAS_both` and runs the 6-DEL BB table.
-```bash
-bash run_kras_6del_full_autopilot.sh run
-```
-Environment overrides are supported:
-```bash
-RUN_NAME=KRAS_6DEL_full \
-FASTQ_DIR=00_KRAS_input_fastq \
-BBINFO=00_6DEL_BB_information_20241013.txt \
-bash run_kras_6del_full_autopilot.sh run
+  --r1 R1C1 R1C2 R1C3 R1C4 \
+  --r2 R2C1 R2C2 R2C3 R2C4 \
+  --neg NEG_R1 NEG_R2 \
+  --del2 DEL2
 ```
 
 ---
@@ -120,11 +107,11 @@ Key files:
 ```bash
 python3 03_call_hits.py \
   --run_root DELeGANce_out/my_run \
-  --r1_cols K_R2C1 K_R2C2 K_R2C3 K_R2C4 \
-  --r2_cols K_R3C1 K_R3C2 K_R3C3 K_R3C4 \
-  --neg_r1_col K_R2C5 \
-  --neg_r2_col K_R3C5 \
-  --del2_col DEL234 \
+  --r1_cols R1C1 R1C2 R1C3 R1C4 \
+  --r2_cols R2C1 R2C2 R2C3 R2C4 \
+  --neg_r1_col NEG_R1 \
+  --neg_r2_col NEG_R2 \
+  --del2_col DEL2 \
   --preset balanced
 ```
 
@@ -139,14 +126,12 @@ python3 04_build_interactive_report.py \
 ### Export beginner QC + Excel
 ```bash
 python3 export_beginner_qc_report.py \
-  --run_root DELeGANce_out/KRAS_both \
-  --run_root DELeGANce_out/KRAS_6DEL_full \
+  --run_root DELeGANce_out/my_run \
   --out_html DELeGANce_out/Beginner_QC_Report.html \
   --out_tsv DELeGANce_out/Beginner_QC_TopHits.tsv
 
 python3 export_final_excel.py \
-  --run_root DELeGANce_out/KRAS_both \
-  --run_root DELeGANce_out/KRAS_6DEL_full \
+  --run_root DELeGANce_out/my_run \
   --out DELeGANce_out/DELeGANce_final_results.xlsx \
   --top_n 1000
 ```
@@ -184,4 +169,4 @@ See `LICENSE.txt` for the full terms.
 
 ---
 
-If you need a tailored README for another target (e.g., GPCR, MAT2A), tell me the desired folder names and sample columns and I will generate it.
+If you need a tailored README for another target, tell me the folder names and sample columns and I will generate it.

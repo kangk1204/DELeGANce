@@ -200,7 +200,7 @@ def _html_table(df: pd.DataFrame) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Beginner-friendly QC report for DELeGANce outputs")
-    ap.add_argument("--run_root", action="append", required=True, help="Run root (e.g., DELeGANce_out/KRAS_both)")
+    ap.add_argument("--run_root", action="append", required=True, help="Run root (e.g., DELeGANce_out/my_run)")
     ap.add_argument("--out_html", default="DELeGANce_out/Beginner_QC_Report.html")
     ap.add_argument("--out_tsv", default="DELeGANce_out/Beginner_QC_TopHits.tsv")
     ap.add_argument("--top_n", type=int, default=200, help="Top N hits per run (HitScore ranking)")
