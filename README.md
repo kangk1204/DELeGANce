@@ -96,7 +96,8 @@ Key files:
 - `03_normalized/<preset>/05_hybrid_annot.tsv` - main results table
 - `03_normalized/<preset>/report.html` - static summary report
 - `03_normalized/<preset>/interactive_hits.html` - interactive Top-N explorer
-- `Beginner_QC_Report.html` - quick QC overview
+- `Beginner_QC_Report.html` - quick QC overview (includes Tier/PickGroup recommendations)
+- `Beginner_QC_TopHits.tsv` - QC table with Tier/PickGroup columns
 - `DELeGANce_final_results.xlsx` - Excel export for wet-lab review
 
 ---
@@ -128,12 +129,38 @@ python3 04_build_interactive_report.py \
 python3 export_beginner_qc_report.py \
   --run_root DELeGANce_out/my_run \
   --out_html DELeGANce_out/Beginner_QC_Report.html \
-  --out_tsv DELeGANce_out/Beginner_QC_TopHits.tsv
+  --out_tsv DELeGANce_out/Beginner_QC_TopHits.tsv \
+  --neg_high_quantile 0.90 \
+  --recommend_a 50 \
+  --recommend_b 20 \
+  --recommend_diverse 50 \
+  --diverse_key BB1_BB2_BB3
 
 python3 export_final_excel.py \
   --run_root DELeGANce_out/my_run \
   --out DELeGANce_out/DELeGANce_final_results.xlsx \
   --top_n 1000
+```
+
+### Run hit calling + postprocess for multiple runs
+```bash
+bash run_hits_then_postprocess.sh \
+  --run-root DELeGANce_out/run_A \
+  --run-root DELeGANce_out/run_B \
+  --r1 "R1C1 R1C2 R1C3 R1C4" \
+  --r2 "R2C1 R2C2 R2C3 R2C4" \
+  --neg "NEG_R1 NEG_R2" \
+  --del2 DEL2
+```
+
+### Subsample paired FASTQs (for fast testing)
+```bash
+python3 subsample_fastq_pairs.py \
+  --input-dir 00_input_fastq \
+  --output-dir 00_input_fastq_subsampled \
+  --n-pairs 50000 \
+  --mode random \
+  --seed 42
 ```
 
 ---

@@ -351,7 +351,18 @@ log_msg("INFO", "  SKIP_FASTP=$OPT_SKIP_FASTP");
 resolve_bb_id_smiles_and_write_fixed($BB_INFO_FILE, $BB_INFO_FIXED_FILE, $BB_ID_MAP_FILE, $BB_ID_CHGONLY_FILE);
 check_bb_info_and_build_index($BB_INFO_FIXED_FILE, $BB_ERR_FILE);
 
-if (!$OPT_SKIP_FASTP) { run_fastp(); }
+if (!$OPT_SKIP_FASTP) {
+    run_fastp();
+} else {
+    # When skipping fastp, ensure merged FASTQ files already exist.
+    opendir(my $DH, $FASTP_DIR) or die "Cannot open $FASTP_DIR: $!\n";
+    my @merged = grep { /_merged\.(?:fq|fastq)(?:\.gz)?$/i } readdir($DH);
+    closedir($DH);
+    if (!@merged) {
+        die "SKIP_FASTP=1 but no merged FASTQ found in $FASTP_DIR. ".
+            "Provide pre-merged *_merged.fq.gz files or rerun without --skip-fastp.\n";
+    }
+}
 log_msg("INFO", "All done. See log: $LOG_FILE");
 
 #--------------------------- Step 1: bb_id-SMILES fix

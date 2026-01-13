@@ -9,11 +9,26 @@ RUN_ROOT="${RUN_ROOT:-$ROOT_DIR/DELeGANce_out/$RUN_NAME}"
 # Reuse already-merged FASTQs + fastp JSONs from an existing run to avoid re-running fastp.
 SRC_FASTP_OUT="${SRC_FASTP_OUT:-$ROOT_DIR/DELeGANce_out/base_run/01_fastp_out}"
 
-FASTQ_DIR="${FASTQ_DIR:-$ROOT_DIR/00_input_fastq}"
+DEFAULT_FASTQ_DIR=""
+for cand in \
+  "$ROOT_DIR/00_input_fastq" \
+  "$ROOT_DIR/00_input_fastq_set1" \
+  "$ROOT_DIR/00_input_fastq_set2" \
+  "$ROOT_DIR/00_input_fastq_set3" \
+  "$ROOT_DIR/00_input_fastq_set4" \
+  "$ROOT_DIR/00_input_fastq_set5"
+do
+  if [[ -d "$cand" ]]; then
+    DEFAULT_FASTQ_DIR="$cand"
+    break
+  fi
+done
+FASTQ_DIR="${FASTQ_DIR:-$DEFAULT_FASTQ_DIR}"
 BBINFO="${BBINFO:-$ROOT_DIR/00_BB_information.txt}"
 THREADS="${THREADS:-6}"
 MISMATCH_MODE="${MISMATCH_MODE:-hp_op_cp}"
 
+# NOTE: Update these sample column names to match your own decoded matrix.
 R1_COLS=(R1C1 R1C2 R1C3 R1C4)
 R2_COLS=(R2C1 R2C2 R2C3 R2C4)
 NEG_COLS=(NEG_R1 NEG_R2)

@@ -138,6 +138,10 @@ def streaming_group_counts(path: str, sep: str, id_col: str, del2_col: str, coun
     """
     Memory-lean aggregation: stream chunks, normalise headers, sum counts by (lib,id).
     """
+    if not os.path.isfile(path):
+        gz = path + ".gz"
+        if os.path.isfile(gz):
+            path = gz
     usecols = [id_col, del2_col] + [c for c in count_cols if c not in (id_col, del2_col)]
     if lib_col:
         usecols.append(lib_col)
@@ -479,7 +483,7 @@ def compute_readscaler_row(row: pd.Series, r1_cols: List[str], r2_cols: List[str
         m = float(np.mean(lfc))
         sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
         se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
-        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        p = ttest_onesample_p(m, sd, len(lfc))
         out.update(dict(mean_log2FC_DEL2=m, sd_log2FC_DEL2=sd, se_log2FC_DEL2=se, p_DEL2=p))
     else:
         out.update(dict(mean_log2FC_DEL2=np.nan, sd_log2FC_DEL2=np.nan, se_log2FC_DEL2=np.nan, p_DEL2=np.nan))
@@ -489,7 +493,7 @@ def compute_readscaler_row(row: pd.Series, r1_cols: List[str], r2_cols: List[str
         m = float(np.mean(lfc))
         sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
         se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
-        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        p = ttest_onesample_p(m, sd, len(lfc))
         out.update(dict(mean_log2FC_BEAD=m, sd_log2FC_BEAD=sd, se_log2FC_BEAD=se, p_BEAD=p))
     else:
         out.update(dict(mean_log2FC_BEAD=np.nan, sd_log2FC_BEAD=np.nan, se_log2FC_BEAD=np.nan, p_BEAD=np.nan))
@@ -499,7 +503,7 @@ def compute_readscaler_row(row: pd.Series, r1_cols: List[str], r2_cols: List[str
         m = float(np.mean(lfc))
         sd= float(np.std(lfc, ddof=1)) if len(lfc)>=2 else (0.0 if len(lfc)==1 else np.nan)
         se= float(sd / math.sqrt(len(lfc))) if len(lfc)>=1 else np.nan
-        p = ttest_onesample_p(m, sd if sd>0 else 1e-9, len(lfc))
+        p = ttest_onesample_p(m, sd, len(lfc))
         out.update(dict(mean_log2FC_BEAD_R2=m, sd_log2FC_BEAD_R2=sd, se_log2FC_BEAD_R2=se, p_BEAD_R2=p))
     else:
         out.update(dict(mean_log2FC_BEAD_R2=np.nan, sd_log2FC_BEAD_R2=np.nan, se_log2FC_BEAD_R2=np.nan, p_BEAD_R2=np.nan))
@@ -513,7 +517,7 @@ def compute_readscaler_row(row: pd.Series, r1_cols: List[str], r2_cols: List[str
         mp = float(np.mean(paired))
         sdp= float(np.std(paired, ddof=1)) if n_pairs>=2 else (0.0 if n_pairs==1 else np.nan)
         sep= float(sdp / math.sqrt(n_pairs)) if n_pairs>=1 else np.nan
-        pp = ttest_onesample_p(mp, sdp if sdp>0 else 1e-9, n_pairs)
+        pp = ttest_onesample_p(mp, sdp, n_pairs)
         out.update(dict(mean_log2Boost_R2vsR1_paired=mp,
                         sd_log2Boost_R2vsR1_paired=sdp,
                         se_log2Boost_R2vsR1_paired=sep,

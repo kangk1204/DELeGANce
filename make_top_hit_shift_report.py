@@ -32,6 +32,12 @@ def pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
             return c
     return None
 
+def pick_score_col(cols: List[str]) -> Optional[str]:
+    for c in ("HitScore_GLM", "HitScore", "HitScore_RS"):
+        if c in cols:
+            return c
+    return None
+
 
 def parse_id_fields(id_str: str) -> Tuple[str, str, str, str]:
     s = str(id_str or "").strip()
@@ -111,9 +117,19 @@ def main() -> None:
     cur_df = pd.read_csv(args.current, sep="\t", low_memory=False)
     prev_df = pd.read_csv(args.previous, sep="\t", low_memory=False)
 
-    score = "HitScore_GLM" if "HitScore_GLM" in cur_df.columns else ("HitScore" if "HitScore" in cur_df.columns else "HitScore_RS")
-    cur_df[score] = pd.to_numeric(cur_df[score], errors="coerce")
-    prev_df[score] = pd.to_numeric(prev_df[score], errors="coerce")
+    score_cur_col = pick_score_col(cur_df.columns)
+    score_prev_col = pick_score_col(prev_df.columns)
+    if not score_cur_col or not score_prev_col:
+        raise SystemExit("[ERROR] Missing HitScore columns in inputs.")
+
+    if score_cur_col == score_prev_col:
+        score = score_cur_col
+        cur_df[score] = pd.to_numeric(cur_df[score], errors="coerce")
+        prev_df[score] = pd.to_numeric(prev_df[score], errors="coerce")
+    else:
+        score = "_SCORE"
+        cur_df[score] = pd.to_numeric(cur_df[score_cur_col], errors="coerce")
+        prev_df[score] = pd.to_numeric(prev_df[score_prev_col], errors="coerce")
 
     cur_id = pick_col(cur_df.columns, ["ID", "ID_x", "ID_y", "id", "id_x", "id_y"])
     cur_lib = pick_col(cur_df.columns, ["LIB_ID", "LIB_ID_x", "LIB_ID_y"])
@@ -192,6 +208,20 @@ def main() -> None:
         out["NEG_center_shift_diff"] = pd.to_numeric(out["NEG_center_shift_cur"], errors="coerce") - pd.to_numeric(out["NEG_center_shift_prev"], errors="coerce")
     out = out.drop(columns=["_KEY"])
 
+    if score == "_SCORE":
+        out["Score_col_cur"] = score_cur_col
+        out["Score_col_prev"] = score_prev_col
+        out = out.rename(columns={
+            "_SCORE_cur": "Score_cur",
+            "_SCORE_prev": "Score_prev",
+            "_SCORE_diff": "Score_diff",
+        })
+        score_cur_out = "Score_cur"
+        score_diff_out = "Score_diff"
+    else:
+        score_cur_out = f"{score}_cur"
+        score_diff_out = f"{score}_diff"
+
     out = out.sort_values(["status", "rank_cur", "rank_prev"]).reset_index(drop=True)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,9 +232,8 @@ def main() -> None:
     top_df_cur = None
 
     if args.top_summary_out:
-        diff_col = f"{score}_diff"
-        if diff_col in out.columns:
-            top_df = out.reindex(out[diff_col].abs().sort_values(ascending=False).index)
+        if score_diff_out in out.columns:
+            top_df = out.reindex(out[score_diff_out].abs().sort_values(ascending=False).index)
         else:
             top_df = out.copy()
         top_n = max(1, int(args.top_summary_n))
@@ -216,9 +245,8 @@ def main() -> None:
         print(f"[OK] wrote {top_path}")
 
     if args.top_summary_out_current:
-        score_cur = f"{score}_cur"
-        if score_cur in out.columns:
-            top_df = out.reindex(pd.to_numeric(out[score_cur], errors="coerce").sort_values(ascending=False).index)
+        if score_cur_out in out.columns:
+            top_df = out.reindex(pd.to_numeric(out[score_cur_out], errors="coerce").sort_values(ascending=False).index)
         else:
             top_df = out.copy()
         top_n = max(1, int(args.top_summary_n))

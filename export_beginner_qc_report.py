@@ -60,13 +60,33 @@ def _add_hit_score(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_bool(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series([], dtype=bool)
+    if series.dtype == bool:
+        return series.fillna(False)
     if series.dtype == object:
-        s = series.astype(str).str.lower()
+        s = series.astype(str).str.strip().str.lower()
         return s.isin(["true", "1", "yes", "y", "t"])
-    return series.astype(bool)
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0)
+    return s > 0
+
+def _truthy_value(value) -> bool:
+    if value is None:
+        return False
+    try:
+        if isinstance(value, float) and np.isnan(value):
+            return False
+    except Exception:
+        pass
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in ["true", "1", "yes", "y", "t"]
 
 
 def _auto_del2_col(cols: List[str]) -> Optional[str]:
+    if "DEL2_OVERRIDE" in cols:
+        return "DEL2_OVERRIDE"
     # Prefer non-CPM DEL columns
     for c in cols:
         if c.startswith("DEL") and not c.endswith("_CPM"):
@@ -97,7 +117,35 @@ def _make_display_id(lib: str, bb1: str, bb2: str, bb3: str, bb4: str, fallback_
     return _strip_libdel(fallback_id)
 
 
-def _qc_flags(row: pd.Series, del2_col: Optional[str]) -> str:
+def _neg_quantile_threshold(series: pd.Series, quantile: float) -> Optional[float]:
+    if series is None:
+        return None
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return None
+    q = float(s.quantile(quantile))
+    if not np.isfinite(q):
+        return None
+    return max(0.0, q)
+
+
+def _select_diverse_indices(df: pd.DataFrame, key_cols: List[str], max_n: int) -> List[int]:
+    seen = set()
+    picked = []
+    for idx, row in df.iterrows():
+        key = "|".join(str(row.get(c, "NA")) for c in key_cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(idx)
+        if max_n is not None and len(picked) >= max_n:
+            break
+    return picked
+
+
+def _qc_flags(row: pd.Series, del2_col: Optional[str],
+              neg_high_thr: Optional[float],
+              neg_r1_high_thr: Optional[float]) -> str:
     flags = []
 
     if del2_col and pd.notna(row.get(del2_col)):
@@ -105,15 +153,17 @@ def _qc_flags(row: pd.Series, del2_col: Optional[str]) -> str:
             flags.append("LOW_DEL2")
 
     lfc_neg = row.get("LFC_NEG_centered")
-    if pd.notna(lfc_neg) and float(lfc_neg) >= 0:
+    neg_thr = 0.0 if neg_high_thr is None else float(neg_high_thr)
+    if pd.notna(lfc_neg) and float(lfc_neg) >= neg_thr:
         flags.append("NEG_HIGH")
 
     lfc_neg_r1 = row.get("LFC_NEG_centered_R1")
-    if pd.notna(lfc_neg_r1) and float(lfc_neg_r1) >= 0:
+    neg_r1_thr = 0.0 if neg_r1_high_thr is None else float(neg_r1_high_thr)
+    if pd.notna(lfc_neg_r1) and float(lfc_neg_r1) >= neg_r1_thr:
         flags.append("NEG_R1_HIGH")
 
-    lfc_r1 = row.get("LFC_R1_vs_DEL2")
-    lfc_r2 = row.get("LFC_R2_vs_DEL2")
+    lfc_r1 = row.get("LFC_R1_vs_DEL2_used", row.get("LFC_R1_vs_DEL2"))
+    lfc_r2 = row.get("LFC_R2_vs_DEL2_used", row.get("LFC_R2_vs_DEL2"))
     if pd.notna(lfc_r1) and pd.notna(lfc_r2):
         if float(lfc_r2) < float(lfc_r1) - 1.0:
             flags.append("R2_DROP")
@@ -125,16 +175,22 @@ def _qc_flags(row: pd.Series, del2_col: Optional[str]) -> str:
             break
 
     neg_fail = row.get("NEG_hard_fail")
-    if pd.notna(neg_fail) and bool(neg_fail):
+    if _truthy_value(neg_fail):
         flags.append("NEG_HARD_FAIL")
 
     return "OK" if not flags else ";".join(flags)
 
 
-def _build_top_table(df: pd.DataFrame, top_n: int) -> Tuple[pd.DataFrame, str]:
-    df = _add_hit_score(df.copy())
-    df = df[np.isfinite(df["HitScore"])].sort_values("HitScore", ascending=False)
-    df = df.head(top_n).copy()
+def _build_top_table(df: pd.DataFrame, top_n: int, neg_high_quantile: float,
+                     recommend_a: int, recommend_b: int, recommend_diverse: int,
+                     diverse_key: str) -> Tuple[pd.DataFrame, str, dict, dict]:
+    df_all = _add_hit_score(df.copy())
+    df_all = df_all[np.isfinite(df_all["HitScore"])].copy()
+    neg_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered"), neg_high_quantile)
+    neg_r1_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered_R1"), neg_high_quantile)
+
+    df = df_all.sort_values("HitScore", ascending=False).head(top_n).copy()
+    df = df.reset_index(drop=True)
 
     cols = list(df.columns)
     id_col = _pick_col(cols, ["ID", "id", "ID_x", "id_x", "ID_y", "id_y"])
@@ -203,9 +259,65 @@ def _build_top_table(df: pd.DataFrame, top_n: int) -> Tuple[pd.DataFrame, str]:
             ),
             axis=1,
         )
-    table["QC_Flags"] = df.apply(_qc_flags, axis=1, del2_col=del2_col)
+    table["QC_Flags"] = df.apply(
+        _qc_flags,
+        axis=1,
+        del2_col=del2_col,
+        neg_high_thr=neg_thr,
+        neg_r1_high_thr=neg_r1_thr,
+    )
 
-    return table, del2_col or ""
+    # Tiering (A: consensus + no QC flags; B: consensus + has QC flags)
+    consensus = _normalize_bool(df.get("Consensus_hit", pd.Series([False] * len(df))))
+    neg_hard = _normalize_bool(df.get("NEG_hard_fail", pd.Series([False] * len(df))))
+    no_flags = table["QC_Flags"].astype(str).str.upper().eq("OK")
+    tier = np.where(consensus & (~neg_hard) & no_flags, "A",
+                    np.where(consensus & (~neg_hard) & (~no_flags), "B", "Other"))
+    table["Tier"] = tier
+
+    # Pick groups
+    pick_group = [""] * len(table)
+    tier_a_idx = table.index[table["Tier"] == "A"].tolist()
+    tier_b_idx = table.index[table["Tier"] == "B"].tolist()
+
+    pick_a = tier_a_idx[: max(0, int(recommend_a))]
+    pick_b = tier_b_idx[: max(0, int(recommend_b))]
+
+    key_cols = ["BB1", "BB2", "BB3"] if diverse_key == "BB1_BB2_BB3" else \
+               ["BB1", "BB2"] if diverse_key == "BB1_BB2" else \
+               ["BB1", "BB2", "BB3", "BB4"] if diverse_key == "BB1_BB2_BB3_BB4" else \
+               ["BB1"]
+    diverse_candidates = table[table["Tier"] == "A"].copy()
+    diverse_idx = _select_diverse_indices(diverse_candidates, key_cols, max(0, int(recommend_diverse)))
+
+    def _add_tag(idx_list, tag):
+        for i in idx_list:
+            if pick_group[i]:
+                pick_group[i] += ";" + tag
+            else:
+                pick_group[i] = tag
+
+    _add_tag(pick_a, "TierA_Top")
+    _add_tag(pick_b, "TierB_Control")
+    _add_tag(diverse_idx, "TierA_Diverse")
+    table["PickGroup"] = [v if v else "NA" for v in pick_group]
+
+    # Reorder so Tier/PickGroup are near front
+    front = ["Rank", "Tier", "PickGroup"]
+    cols_final = front + [c for c in table.columns if c not in front]
+    table = table[cols_final]
+
+    thresholds = {
+        "neg_high_thr": neg_thr,
+        "neg_r1_high_thr": neg_r1_thr,
+        "neg_high_quantile": neg_high_quantile,
+    }
+    rec_tables = {
+        "tier_a_top": table.loc[pick_a].copy(),
+        "tier_b_control": table.loc[pick_b].copy(),
+        "tier_a_diverse": table.loc[diverse_idx].copy(),
+    }
+    return table, del2_col or "", thresholds, rec_tables
 
 
 def _summary_counts(df: pd.DataFrame) -> dict:
@@ -226,9 +338,17 @@ def main() -> None:
     ap.add_argument("--annot_tsv", action="append", default=[], help="Explicit 05_hybrid_annot.tsv path (repeatable)")
     ap.add_argument("--prefer_dir", default="03_normalized/glm_full_dev_cpu_fp64",
                     help="Preferred subdir under run_root for 05_hybrid_annot.tsv")
+    ap.add_argument("--del2_col", default="", help="DEL2 column name override (optional)")
     ap.add_argument("--out_html", default="DELeGANce_out/Beginner_QC_Report.html")
     ap.add_argument("--out_tsv", default="DELeGANce_out/Beginner_QC_TopHits.tsv")
     ap.add_argument("--top_n", type=int, default=200, help="Top N hits per run (HitScore ranking)")
+    ap.add_argument("--neg_high_quantile", type=float, default=0.90,
+                    help="Quantile for NEG_HIGH/NEG_R1_HIGH flags (per-run, fallback to 0 if lower)")
+    ap.add_argument("--recommend_a", type=int, default=50, help="Tier A top picks per run")
+    ap.add_argument("--recommend_b", type=int, default=20, help="Tier B control picks per run")
+    ap.add_argument("--recommend_diverse", type=int, default=50, help="Tier A diversity picks per run")
+    ap.add_argument("--diverse_key", choices=["BB1", "BB1_BB2", "BB1_BB2_BB3", "BB1_BB2_BB3_BB4"],
+                    default="BB1_BB2_BB3", help="Key for diversity picks")
     args = ap.parse_args()
 
     annot_paths = [Path(p) for p in args.annot_tsv]
@@ -251,14 +371,36 @@ def main() -> None:
         summary["run"] = run_name
         summaries.append(summary)
 
-        top_table, del2_col = _build_top_table(df, args.top_n)
+        if args.del2_col and args.del2_col in df.columns:
+            df = df.rename(columns={args.del2_col: "DEL2_OVERRIDE"})
+        top_table, del2_col, th, rec = _build_top_table(
+            df, args.top_n, args.neg_high_quantile,
+            args.recommend_a, args.recommend_b, args.recommend_diverse, args.diverse_key
+        )
         top_table.insert(1, "Run", run_name)
         top_tables.append(top_table)
 
+        thr_note = (
+            f"<p class='small'>QC thresholds: NEG_HIGH ≥ {th['neg_high_thr']:.3f}, "
+            f"NEG_R1_HIGH ≥ {th['neg_r1_high_thr']:.3f} "
+            f"(quantile={th['neg_high_quantile']:.2f}, min=0)</p>"
+            if th["neg_high_thr"] is not None and th["neg_r1_high_thr"] is not None
+            else f"<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
+        )
+        rec_html = (
+            f"<h3>Recommended Tier A (Top {args.recommend_a})</h3>"
+            f"{_html_table(rec['tier_a_top'])}"
+            f"<h3>Recommended Tier A Diversity (Top {args.recommend_diverse}, key={args.diverse_key})</h3>"
+            f"{_html_table(rec['tier_a_diverse'])}"
+            f"<h3>Recommended Tier B Controls (Top {args.recommend_b})</h3>"
+            f"{_html_table(rec['tier_b_control'])}"
+        )
         per_run_html.append(
             f"<h2>{html.escape(run_name)}</h2>"
             f"<p>Top {args.top_n} by HitScore (HitScore_GLM/HitScore_RS fallback).</p>"
+            f"{thr_note}"
             f"{_html_table(top_table)}"
+            f"{rec_html}"
         )
 
     for run_root in run_roots:
@@ -270,14 +412,36 @@ def main() -> None:
         summary["run"] = run_name
         summaries.append(summary)
 
-        top_table, del2_col = _build_top_table(df, args.top_n)
+        if args.del2_col and args.del2_col in df.columns:
+            df = df.rename(columns={args.del2_col: "DEL2_OVERRIDE"})
+        top_table, del2_col, th, rec = _build_top_table(
+            df, args.top_n, args.neg_high_quantile,
+            args.recommend_a, args.recommend_b, args.recommend_diverse, args.diverse_key
+        )
         top_table.insert(1, "Run", run_name)
         top_tables.append(top_table)
 
+        thr_note = (
+            f"<p class='small'>QC thresholds: NEG_HIGH ≥ {th['neg_high_thr']:.3f}, "
+            f"NEG_R1_HIGH ≥ {th['neg_r1_high_thr']:.3f} "
+            f"(quantile={th['neg_high_quantile']:.2f}, min=0)</p>"
+            if th["neg_high_thr"] is not None and th["neg_r1_high_thr"] is not None
+            else f"<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
+        )
+        rec_html = (
+            f"<h3>Recommended Tier A (Top {args.recommend_a})</h3>"
+            f"{_html_table(rec['tier_a_top'])}"
+            f"<h3>Recommended Tier A Diversity (Top {args.recommend_diverse}, key={args.diverse_key})</h3>"
+            f"{_html_table(rec['tier_a_diverse'])}"
+            f"<h3>Recommended Tier B Controls (Top {args.recommend_b})</h3>"
+            f"{_html_table(rec['tier_b_control'])}"
+        )
         per_run_html.append(
             f"<h2>{html.escape(run_name)}</h2>"
             f"<p>Top {args.top_n} by HitScore (HitScore_GLM/HitScore_RS fallback).</p>"
+            f"{thr_note}"
             f"{_html_table(top_table)}"
+            f"{rec_html}"
         )
 
     # Summary table
@@ -321,6 +485,8 @@ def main() -> None:
     <li><b>LFC_NEG_centered</b>: NEG 대비 특이성 지표 (0 이상이면 NEG가 높을 가능성)</li>
     <li><b>GLM_hit / RS_pass / Consensus_hit</b>: 통계/규칙 기반 필터 통과 여부</li>
     <li><b>NEG_hard_fail</b>: NEG가 너무 높아 탈락한 항목</li>
+    <li><b>Tier</b>: A=합성 우선(Consensus_hit + QC 플래그 없음), B=컨트롤 후보(Consensus_hit + QC 플래그 존재)</li>
+    <li><b>PickGroup</b>: TierA_Top, TierA_Diverse, TierB_Control (아래 추천 리스트와 동일)</li>
   </ul>
 
   <h2>전체 요약</h2>
@@ -329,10 +495,17 @@ def main() -> None:
   <h2>QC 플래그 기준</h2>
   <ul class="small">
     <li><b>LOW_DEL2</b>: DEL2 raw count &lt; 10 (기저 카운트가 낮아 변동성 큼)</li>
-    <li><b>NEG_HIGH</b>: LFC_NEG_centered ≥ 0 (NEG가 충분히 낮지 않음)</li>
+    <li><b>NEG_HIGH</b>: LFC_NEG_centered ≥ Q{int(args.neg_high_quantile * 100)} (per-run, 최소 0)</li>
     <li><b>R2_DROP</b>: LFC_R2_vs_DEL2가 R1보다 1.0 이상 낮음 (재결합 단계에서 급감)</li>
     <li><b>BB_MISSING</b>: BB1~BB3 중 누락</li>
     <li><b>NEG_HARD_FAIL</b>: NEG_hard_fail = TRUE</li>
+  </ul>
+
+  <h2>추천 선택 가이드 (초보자용)</h2>
+  <ul class="small">
+    <li><b>Tier A Top</b>: 합성 우선 후보 (Consensus_hit + QC 플래그 없음)</li>
+    <li><b>Tier A Diversity</b>: BB 조합을 다양화한 추천 (key={args.diverse_key})</li>
+    <li><b>Tier B Control</b>: 리스크/컨트롤 후보 (Consensus_hit이지만 QC 플래그 존재)</li>
   </ul>
 
   {''.join(per_run_html)}
