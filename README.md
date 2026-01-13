@@ -102,6 +102,59 @@ Key files:
 
 ---
 
+## Generic Setup Template (Target-Agnostic)
+
+### 1) Folder layout
+```
+project_root/
+  00_input_fastq/          # paired FASTQs
+    SAMPLE_A_1.fastq.gz
+    SAMPLE_A_2.fastq.gz
+    SAMPLE_B_1.fastq.gz
+    SAMPLE_B_2.fastq.gz
+  00_BB_information.txt     # BB info (tab-delimited)
+  DELeGANce_out/
+```
+
+### 2) BB information file format (tab-delimited)
+Minimum 7 columns in this exact order (header optional):
+```
+type    seq     bb_id   cycle   tag_id  lib_id  smiles
+```
+Notes:
+- `type` includes CODON/HP/OP/CP (CODON rows are used for BB mapping)
+- `cycle` is 1/2/3/4 for each BB
+- `lib_id` is required if multiple libraries are present
+
+### 3) Sample column names
+After decode, column names come from FASTQ sample names.
+Check header of:
+```
+DELeGANce_out/<run_name>/02_decoded/raw_counts_matrix.tsv
+```
+Use those exact names in `--r1`, `--r2`, `--neg`, `--del2`.
+
+### 4) Minimal run command (example template)
+```bash
+python3 run_delegance_pipeline.py \
+  --fastq-dir 00_input_fastq \
+  --bbinfo 00_BB_information.txt \
+  --output-dir DELeGANce_out/my_run \
+  --threads 6 \
+  --mismatch hp_op_cp \
+  --r1 R1C1 R1C2 R1C3 R1C4 \
+  --r2 R2C1 R2C2 R2C3 R2C4 \
+  --neg NEG_R1 NEG_R2 \
+  --del2 DEL2
+```
+
+### 5) Quick validation
+- `02_decoded/raw_counts_matrix.tsv` has `lib_id` and your sample columns
+- `03_normalized/.../05_hybrid_annot.tsv` is produced
+- `Beginner_QC_Report.html` opens without errors
+
+---
+
 ## Useful Stand-Alone Commands
 
 ### Hit calling only (after decode)
