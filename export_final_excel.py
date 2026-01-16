@@ -3,7 +3,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -24,8 +24,38 @@ def strip_lib_suffix(bb: str) -> str:
     return re.sub(r"_LIB[\w\.-]+$", "", s)
 
 
-def load_params(run_root: Path) -> Dict:
-    hp = run_root / "03_normalized" / "glm_full_dev_cpu_fp64" / "hit_params.json"
+def _resolve_annot(run_root: Path, prefer_dir: str) -> Path:
+    if prefer_dir:
+        preferred = run_root / prefer_dir / "05_hybrid_annot.tsv"
+        if preferred.exists():
+            return preferred
+    fallback = run_root / "03_normalized" / "05_hybrid_annot.tsv"
+    if fallback.exists():
+        return fallback
+
+    candidates = list(run_root.rglob("05_hybrid_annot.tsv"))
+    if not candidates:
+        raise FileNotFoundError(f"[ERROR] 05_hybrid_annot.tsv not found under {run_root}")
+    if len(candidates) == 1:
+        return candidates[0]
+    msg = "\n".join(str(c) for c in sorted(candidates))
+    raise FileNotFoundError(
+        "[ERROR] Multiple 05_hybrid_annot.tsv files found. "
+        "Specify --annot_tsv or --prefer_dir.\n" + msg
+    )
+
+
+def _guess_run_name(annot_path: Path) -> str:
+    parts = list(annot_path.parts)
+    if "03_normalized" in parts:
+        idx = parts.index("03_normalized")
+        if idx > 0:
+            return parts[idx - 1]
+    return annot_path.parent.name
+
+
+def load_params_from_annot(annot_path: Path) -> Dict:
+    hp = annot_path.parent / "hit_params.json"
     if hp.exists():
         return json.loads(hp.read_text())
     return {}
@@ -214,12 +244,17 @@ def truthy_mask(series: pd.Series, length: int) -> pd.Series:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run_root", action="append", required=True)
+    p.add_argument("--run_root", action="append", default=[])
+    p.add_argument("--annot_tsv", action="append", default=[])
+    p.add_argument("--prefer_dir", default="",
+                   help="Preferred subdir under run_root for 05_hybrid_annot.tsv")
     p.add_argument("--out", required=True)
     p.add_argument("--top_n", type=int, default=1000)
     args = p.parse_args()
 
     out_path = Path(args.out)
+    if not args.run_root and not args.annot_tsv:
+        raise SystemExit("[ERROR] --run_root or --annot_tsv is required.")
 
     engine = None
     try:
@@ -238,17 +273,22 @@ def main():
 
         summary_rows = []
 
+        annot_jobs: List[Tuple[Path, str]] = []
         for run_root in args.run_root:
-            run_root = Path(run_root)
-            run_name = run_root.name
-            hybrid = run_root / "03_normalized" / "glm_full_dev_cpu_fp64" / "05_hybrid_annot.tsv"
-            if not hybrid.exists():
-                raise SystemExit(f"missing: {hybrid}")
+            rr = Path(run_root)
+            annot_path = _resolve_annot(rr, args.prefer_dir)
+            annot_jobs.append((annot_path, rr.name))
+        for annot_path in args.annot_tsv:
+            apath = Path(annot_path)
+            if not apath.exists():
+                raise SystemExit(f"[ERROR] annot_tsv not found: {apath}")
+            annot_jobs.append((apath, _guess_run_name(apath)))
 
-            params = load_params(run_root)
+        for annot_path, run_name in annot_jobs:
+            params = load_params_from_annot(annot_path)
             sample_cols = sample_columns_from_params(params)
 
-            df = pd.read_csv(hybrid, sep="\t", low_memory=False)
+            df = pd.read_csv(annot_path, sep="\t", low_memory=False)
             summary_rows.append(build_summary(df, run_name))
 
             core = build_core(df, sample_cols)

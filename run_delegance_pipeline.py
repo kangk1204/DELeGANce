@@ -335,12 +335,12 @@ def build_parser():
     p.add_argument('--no-stop-on-error', dest='stop_on_error', action='store_false',
                    help='Do not stop on the first error')
 
-    # REQUIRED: Matrix column names for hit-caller
+    # Matrix column names for hit-caller
     # Accept comma- or space-separated lists for R1/R2; NEG supports 1 or 2 names (R1, optional R2)
-    p.add_argument('--r1', nargs='+', required=True, help='R1 columns (one or more)')
+    p.add_argument('--r1', nargs='+', required=False, help='R1 columns (one or more)')
     p.add_argument('--r2', nargs='+', required=False, help='R2 columns (optional; omit for R1-only)')
-    p.add_argument('--neg', nargs='+', required=True, help='NEG columns: R1 [R2 optional]')
-    p.add_argument('--del2', required=True, help='DEL2 column name')
+    p.add_argument('--neg', nargs='+', required=False, help='NEG columns: R1 [R2 optional]')
+    p.add_argument('--del2', required=False, help='DEL2 column name')
 
     # Advanced: pass-through knobs for all-in-one (optional; else defaults apply)
     p.add_argument('--neg-gate-mode', choices=['none', 'soft', 'hard'], default=None)
@@ -448,16 +448,19 @@ def main():
     r1_cols = _split_list(args.r1)
     r2_cols = _split_list(args.r2)
     neg_cols = _split_list(args.neg)
-    if len(r1_cols) == 0:
-        print('[ERROR] --r1 must specify at least one column (R1)')
-        return 2
-    if len(neg_cols) == 0:
-        print('[ERROR] --neg must specify at least one column (NEG for R1; optional second for R2)')
-        return 2
-    del2_col = args.del2.strip()
-    if del2_col == '':
-        print('[ERROR] --del2 must not be empty')
-        return 2
+    del2_col = (args.del2 or "").strip()
+
+    # Only require hit-caller columns if we will run hit stage
+    if args.only in ('all', 'hit'):
+        if len(r1_cols) == 0:
+            print('[ERROR] --r1 must specify at least one column (R1)')
+            return 2
+        if len(neg_cols) == 0:
+            print('[ERROR] --neg must specify at least one column (NEG for R1; optional second for R2)')
+            return 2
+        if del2_col == '':
+            print('[ERROR] --del2 must not be empty')
+            return 2
 
     # Logs
     master_log = os.path.join(run_root_abs, '00_pipeline.log')
@@ -506,6 +509,12 @@ def main():
             print('[ERROR] --skip-fastp requested but no merged FASTQs found under RUN_ROOT/01_fastp_out.')
             print('        Either run fastp (omit --skip-fastp) or provide merged FASTQs in 01_fastp_out first.')
             return 2
+
+    # Hit-only requires decoded outputs to already exist.
+    if args.only == 'hit' and not _has_decoded_outputs(run_root_abs):
+        print('[ERROR] Hit-only requested but decoded outputs are missing (RUN_ROOT/02_decoded/raw_counts_matrix.tsv).')
+        print('        Run --only decode (or full pipeline) first, or point --output-dir to an existing run.')
+        return 2
 
     # 1) Preprocess
     rc = 0

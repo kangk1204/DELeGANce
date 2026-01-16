@@ -32,16 +32,35 @@ while :; do
 done
 
 for run_root in "${runs[@]}"; do
-  norm="${run_root}/03_normalized/glm_full_dev_cpu_fp64"
-  python3 make_display_hybrid_tsv.py --run_root "${run_root}"
+  norm_base="${run_root}/03_normalized"
+  if [[ ! -d "$norm_base" ]]; then
+    echo "[ERROR] Missing: $norm_base" >&2
+    exit 2
+  fi
+  annot="$(python3 - <<'PY' "$norm_base"
+import os, sys
+root = sys.argv[1]
+cands = []
+for dirpath, _, filenames in os.walk(root):
+    if "05_hybrid_annot.tsv" in filenames:
+        p = os.path.join(dirpath, "05_hybrid_annot.tsv")
+        cands.append(p)
+if not cands:
+    sys.exit(2)
+cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+print(cands[0])
+PY
+  )" || { echo "[ERROR] 05_hybrid_annot.tsv not found under $norm_base" >&2; exit 2; }
+  norm="$(dirname "$annot")"
+  python3 make_display_hybrid_tsv.py --in_tsv "$annot"
   python3 export_beginner_qc_report.py \
-    --run_root "${run_root}" \
+    --annot_tsv "$annot" \
     --del2_col "${DEL2_COL}" \
     --out_html "${norm}/report.html" \
     --out_tsv "${norm}/report.tsv"
-  python3 export_final_excel.py --run_root "${run_root}" --out "${run_root}/final_hits.xlsx"
+  python3 export_final_excel.py --annot_tsv "$annot" --out "${run_root}/final_hits.xlsx"
   python3 04_build_interactive_report.py \
-    --master_tsv "${norm}/05_hybrid_annot.tsv" \
+    --master_tsv "$annot" \
     --bbinfo "${run_root}/BB_information_fixed.tsv" \
     --out "${norm}/interactive_hits.html" \
     --top_hitscore "${TOP_HITSCORE}" \

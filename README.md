@@ -214,6 +214,8 @@ python3 export_final_excel.py \
   --top_n 1000
 ```
 
+If multiple `05_hybrid_annot.tsv` exist under a run, add `--prefer_dir <subdir>` or pass the exact `--annot_tsv` path.
+
 ### Run hit calling + postprocess for multiple runs
 ```bash
 bash run_hits_then_postprocess.sh \
@@ -244,6 +246,7 @@ python3 subsample_fastq_pairs.py \
 - **RDKit missing**: only affects molecule thumbnails in the interactive report.
 - **Large matrices**: the runner auto-selects GLM top mode for huge datasets; tune with `--glm_mode` and `--glm_top_*`.
 - **Excel export fails**: install `openpyxl` or `xlsxwriter`.
+- **Multiple 05_hybrid_annot.tsv**: use `--prefer_dir <subdir>` or `--annot_tsv /path/to/05_hybrid_annot.tsv`.
 
 ---
 

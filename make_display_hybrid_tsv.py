@@ -85,6 +85,27 @@ def normalize_display(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _resolve_annot(run_root: Path, prefer_dir: str) -> Path:
+    if prefer_dir:
+        preferred = run_root / prefer_dir / "05_hybrid_annot.tsv"
+        if preferred.exists():
+            return preferred
+    fallback = run_root / "03_normalized" / "05_hybrid_annot.tsv"
+    if fallback.exists():
+        return fallback
+
+    candidates = list(run_root.rglob("05_hybrid_annot.tsv"))
+    if not candidates:
+        raise FileNotFoundError(f"[ERROR] 05_hybrid_annot.tsv not found under {run_root}")
+    if len(candidates) == 1:
+        return candidates[0]
+    msg = "\n".join(str(c) for c in sorted(candidates))
+    raise FileNotFoundError(
+        "[ERROR] Multiple 05_hybrid_annot.tsv files found. "
+        "Specify --in_tsv or --prefer_dir.\n" + msg
+    )
+
+
 def process_one(in_tsv: Path, out_tsv: Path) -> None:
     df = pd.read_csv(in_tsv, sep="\t", low_memory=False)
     df = normalize_display(df)
@@ -96,6 +117,8 @@ def process_one(in_tsv: Path, out_tsv: Path) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Create display-only hybrid TSV with LIB suffix removed")
     p.add_argument("--run_root", action="append", help="DELeGANce_out/<RUN> root (repeatable)")
+    p.add_argument("--prefer_dir", default="",
+                   help="Preferred subdir under run_root for 05_hybrid_annot.tsv")
     p.add_argument("--in_tsv", help="Direct input TSV path (optional)")
     p.add_argument("--out_tsv", help="Direct output TSV path (optional)")
     args = p.parse_args()
@@ -114,9 +137,7 @@ def main() -> None:
 
     for run_root in args.run_root:
         run_root = Path(run_root)
-        in_tsv = run_root / "03_normalized" / "glm_full_dev_cpu_fp64" / "05_hybrid_annot.tsv"
-        if not in_tsv.exists():
-            raise SystemExit(f"[ERROR] missing: {in_tsv}")
+        in_tsv = _resolve_annot(run_root, args.prefer_dir)
         out_tsv = in_tsv.with_name("05_hybrid_annot_display.tsv")
         process_one(in_tsv, out_tsv)
 

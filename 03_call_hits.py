@@ -1295,13 +1295,8 @@ def main():
 
     all_count_cols = r1_cols + r2_cols + r3_cols + ([neg_r1_col] if neg_r1_col else []) + ([neg_r2_col] if neg_r2_col else [])
     sample_cols = [del2_col] + all_count_cols
-    # Build normalization factors on the full matrix to avoid prefilter bias.
-    sfs = build_size_factors(df_sum, sample_cols=sample_cols, method=args.libsize_norm, lib_col="LIB_ID")
-    totals_by_lib = {}
-    for lib, sub in df_sum.groupby("LIB_ID"):
-        totals_by_lib[lib] = sub[sample_cols].sum(axis=0).astype(float).to_dict()
 
-    # Prefilter
+    # Prefilter (raw counts) before normalization, per requested pipeline logic.
     df_sum = prefilter_df_sum(df_sum, del2_col=del2_col, all_count_cols=all_count_cols,
                               q_del2=args.prefilter_del2_q, min_abs_del2=args.prefilter_min_del2,
                               min_total_counts=args.prefilter_min_total)
@@ -1315,6 +1310,12 @@ def main():
             "or ensure decoding produced rows."
         )
 
+    # Build normalization factors on the prefiltered matrix.
+    sfs = build_size_factors(df_sum, sample_cols=sample_cols, method=args.libsize_norm, lib_col="LIB_ID")
+    totals_by_lib = {}
+    for lib, sub in df_sum.groupby("LIB_ID"):
+        totals_by_lib[lib] = sub[sample_cols].sum(axis=0).astype(float).to_dict()
+
     # Save raw_by_id
     raw_out = os.path.join(args.outdir, "01_raw_by_id.tsv")
     df_sum.to_csv(raw_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {raw_out}")
@@ -1326,7 +1327,7 @@ def main():
         parsed[c] = parsed[c].astype(str)
     df_sum = pd.concat([df_sum, parsed], axis=1)
 
-    # CPM (library-aware) using full-matrix totals
+    # CPM (library-aware) using prefiltered totals
     df_cpm = add_cpm_columns(df_sum, sample_cols=sample_cols, totals_by_lib=totals_by_lib, lib_col="LIB_ID")
     cpm_out = os.path.join(args.outdir, "02_cpm_by_id.tsv")
     df_cpm.to_csv(cpm_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {cpm_out}")
