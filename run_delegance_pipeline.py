@@ -401,9 +401,10 @@ def build_parser():
 def main():
     ap = build_parser(); args = ap.parse_args()
 
-    # Resolve paths
-    run_root_abs = os.path.abspath(os.path.join(THIS_DIR, args.output_dir)) if not os.path.isabs(args.output_dir) else args.output_dir
-    run_root_rel = os.path.relpath(run_root_abs, THIS_DIR)
+    # Resolve paths (relative output paths are resolved from the current working directory)
+    base_dir = os.getcwd()
+    run_root_abs = os.path.abspath(os.path.join(base_dir, args.output_dir)) if not os.path.isabs(args.output_dir) else os.path.abspath(args.output_dir)
+    run_root_rel = os.path.relpath(run_root_abs, base_dir)
     ensure_dir(run_root_abs)
     # Default normalized root; the final per-run output directory will be set after auto-opt
     norm_root_abs = os.path.join(run_root_abs, '03_normalized')
@@ -703,7 +704,7 @@ def main():
             tokens.append(pf_part)
         dir_name = "_".join(tokens)
         hit_out = os.path.join(norm_root_abs, dir_name)
-    hit_out_abs = hit_out if os.path.isabs(hit_out) else os.path.join(THIS_DIR, hit_out)
+    hit_out_abs = hit_out if os.path.isabs(hit_out) else os.path.abspath(os.path.join(base_dir, hit_out))
     ensure_dir(hit_out_abs)
 
     # Build current hit parameters payload + hash (used for cache validation)

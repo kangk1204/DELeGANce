@@ -9,6 +9,7 @@ DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing ana
 **Where to run commands**
 - If you are in the repo root (the folder that contains `run_delegance_pipeline.py`), use `python3 run_delegance_pipeline.py`.
 - If you run commands from a parent folder that contains the repo as `DELeGANce/`, add the `DELeGANce/` prefix.
+- `--output-dir` is resolved relative to your current working directory.
 
 ### 1) Create a clean environment
 ```bash
