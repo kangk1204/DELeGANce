@@ -1,23 +1,26 @@
 # DELeGANce Screening Pipeline
 
-DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing analysis: FASTQ preprocessing, barcode decoding, hit calling (GLM-based), and interactive reporting. This repository provides a ready-to-run workflow you can use as a template for new targets. The target is fully user-defined via your input FASTQs and sample columns.
+DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing analysis. It covers FASTQ preprocessing, barcode decoding, hit calling (GLM-based), and reporting (static + interactive). This repository is a ready-to-run workflow you can reuse for new targets.
 
 ---
 
-## Quick Start
+## Quick Start (Beginner)
 
-1) **Create a clean environment**
+**Where to run commands**
+- If you are in the repo root (the folder that contains `run_delegance_pipeline.py`), use `python3 run_delegance_pipeline.py`.
+- If you run commands from a parent folder that contains the repo as `DELeGANce/`, add the `DELeGANce/` prefix.
+
+### 1) Create a clean environment
 ```bash
 conda create -n delegance python=3.10
 conda activate delegance
 conda install -c conda-forge -c bioconda fastp
 conda install -c conda-forge numpy pandas scipy matplotlib bokeh
-# Optional (recommended for speed + structure images)
-conda install -c pytorch pytorch torchvision torchaudio
+# Optional (recommended for structure + speed)
 conda install -c conda-forge rdkit
 ```
 
-2) **Run the pipeline**
+### 2) Run the pipeline
 ```bash
 python3 run_delegance_pipeline.py \
   --fastq-dir 00_input_fastq \
@@ -31,150 +34,132 @@ python3 run_delegance_pipeline.py \
   --del2 DEL2
 ```
 
-3) **Open the results**
+### 3) Open the results
 - `DELeGANce_out/my_run/index.html`
-- `DELeGANce_out/my_run/03_normalized/.../interactive_hits.html`
+- `DELeGANce_out/my_run/03_normalized/<preset>/interactive_hits.html`
 
 ---
 
-## Repository Layout
+## Inputs (What You Need)
 
-- `run_delegance_pipeline.py` - Orchestrator for preprocess -> decode -> hit calling.
-- `01_preprocess_reads.pl` - FASTQ cleaning + barcode table reconciliation (fastp wrapper).
-- `02_decode_reads.pl` - Maps merged reads to tags and builds raw/scaled count matrices.
-- `03_call_hits.py` - GLM hit calling + plots + static HTML report.
-- `04_build_interactive_report.py` - Interactive Bokeh report (Top-N explorer).
-- `export_beginner_qc_report.py` - Beginner-friendly QC HTML/TSV.
-- `export_final_excel.py` - Excel export with a guide tab (for wet-lab review).
-- `run_autopilot.sh` - Optional helper to link fastp outputs and run the pipeline.
-- `run_hits_then_postprocess.sh` - Run hit calling for multiple runs + postprocess.
-- `postprocess_after_hits.sh` - Regenerate QC/Excel/interactive reports after hit calling.
-- `subsample_fastq_pairs.py` - Subsample paired FASTQs for fast testing.
-- `00_*_input_fastq/` - Input FASTQs (expected format: `<SAMPLE>_1.fastq.gz`, `<SAMPLE>_2.fastq.gz`).
-- `00_*_BB_information*.txt` - BB metadata tables.
-- `DELeGANce_out/` - Outputs (TSV/plots/HTML/logs).
-
----
-
-## Running the Pipeline (Step by Step)
-
-### 1) Verify toolchain
-```bash
-fastp --version
-perl -v
-python3 --version
-```
-
-### 2) Make sure your FASTQs are named consistently
+### 1) FASTQ naming
 Each sample should have paired reads:
 ```
 <SAMPLE>_1.fastq.gz
 <SAMPLE>_2.fastq.gz
 ```
-The `<SAMPLE>` names must match the columns you pass to the runner (`--r1`, `--r2`, `--neg`, `--del2`).
-If you do not know the column names yet, run preprocess+decode first and inspect the header of
-`DELeGANce_out/<run_name>/02_decoded/raw_counts_matrix.tsv`, then run hit calling only.
+`<SAMPLE>` becomes your column name in downstream tables.
 
-### 3) Launch a full run
-```bash
-python3 run_delegance_pipeline.py \
-  --fastq-dir 00_input_fastq \
-  --bbinfo 00_BB_information.txt \
-  --output-dir DELeGANce_out/my_run \
-  --threads 6 \
-  --mismatch hp_op_cp \
-  --r1 R1C1 R1C2 R1C3 R1C4 \
-  --r2 R2C1 R2C2 R2C3 R2C4 \
-  --neg NEG_R1 NEG_R2 \
-  --del2 DEL2
+### 2) BB information file (tab-delimited)
+Minimum 7 columns in this exact order (header optional):
 ```
+type    seq     bb_id   cycle   tag_id  lib_id  smiles
+```
+Notes:
+- `type` must include CODON/HP/OP/CP
+- `cycle` is 1/2/3/4 for codons
+- `lib_id` is required if multiple libraries exist
+- BB files are user-provided and are not stored in this repository
+
+### 3) Sample columns for hit calling
+These must match the column names inside:
+```
+DELeGANce_out/<run_name>/02_decoded/raw_counts_matrix.tsv
+```
+Use those exact names in `--r1`, `--r2`, `--neg`, `--del2`.
 
 ---
 
-## Outputs (Where to Look)
+## What the Pipeline Does (High Level)
 
-After a run, open `DELeGANce_out/<run_name>/index.html` for a summary page.
-Key files:
+1) **Preprocess** (fastp)
+   - trims, merges pairs, creates `01_fastp_out/`
+2) **Decode** (HP/OP/Codons/CP)
+   - builds `02_decoded/` with raw/scaled count matrices
+3) **Hit calling + reports**
+   - GLM scoring + static/interactive reports in `03_normalized/`
 
-- `03_normalized/<preset>/05_hybrid_annot.tsv` - main results table
-- `03_normalized/<preset>/report.html` - static summary report
-- `03_normalized/<preset>/interactive_hits.html` - interactive Top-N explorer
-- `Beginner_QC_Report.html` - quick QC overview (includes Tier/PickGroup recommendations)
-- `Beginner_QC_TopHits.tsv` - QC table with Tier/PickGroup columns
-- `DELeGANce_final_results.xlsx` - Excel export for wet-lab review (generated by export_final_excel.py)
+---
+
+## Decoding Logic (Important)
+
+The decoder expects the read layout:
+```
+HP - OP - Codon1 - Codon2 - Codon3 - (Codon4) - CP
+```
+
+Rules enforced by the code:
+- HP/OP/CP allow 1-bp mismatch (substitution, insertion, deletion)
+- Codons are **perfect match only**
+- Order is strict; violations are marked undecoded
+- Small overlap or insertion between blocks is allowed within `ADJ_TOL`
+- revcomp is handled by re-orienting the read and applying the same rules
+
+Key parameters (advanced):
+- `--adj-tol` in `02_decode_reads.pl` (default 3)
+- `--length-tol` in `02_decode_reads.pl` (default 5; fastp auto mode can adjust)
+- `--max-cp-cands` / `--max-anchor-cands` in `02_decode_reads.pl` (0 = no limit; default 0)
+
+---
+
+## Resume and Partial Runs
+
+If a run is interrupted, the pipeline checks completion markers before skipping stages:
+- Preprocess: requires merged FASTQs, `BB_information_fixed.tsv`, and `01_preprocess_reads.log` containing `All done.`
+- Decode: requires `raw_counts_matrix.tsv` and `02_decode_reads.log` containing `All done.`
+
+If these markers are missing, the pipeline reruns the stage.
+
+---
+
+## Understanding Key Results
+
+### 1) Summary page
+Open `DELeGANce_out/<run_name>/index.html` for a top-level overview.
+
+### 2) Main results table
+```
+DELeGANce_out/<run_name>/03_normalized/<preset>/05_hybrid_annot.tsv
+```
+This is the primary hit table used for selection.
+
+### 3) Beginner QC report
+```
+DELeGANce_out/<run_name>/Beginner_QC_Report.html
+```
+Includes Tier and PickGroup recommendations.
+
+### 4) Decode statistics
+```
+DELeGANce_out/<run_name>/02_decoded/sample_stats.tsv
+DELeGANce_out/<run_name>/02_decoded/decoding_summary.tsv
+DELeGANce_out/<run_name>/02_decoded/qc_checks.tsv
+```
+Definitions:
+- `total_reads`: reads processed
+- `length_passed_reads`: reads inside expected length window
+- `decoded_reads`: reads that passed decoding
+- `decode_rate_pct`: decoded_reads / total_reads
+- `order_violation`: HP/OP/Codon/CP order failure
 
 ---
 
 ## How to Pick Hits (Beginner)
 
 The QC export adds two helper fields:
-
 - **Tier**
-  - `A`: Consensus hit and no QC flags (recommended for synthesis)
-  - `B`: Consensus hit but has QC flags (good for controls/risk checks)
+  - `A`: consensus hit without QC flags (recommended)
+  - `B`: consensus hit with QC flags (controls or risk checks)
 - **PickGroup**
-  - `TierA_Top`: Top-scoring Tier A hits
-  - `TierA_Diverse`: Tier A hits chosen to diversify BB combinations
+  - `TierA_Top`: top-scoring Tier A hits
+  - `TierA_Diverse`: Tier A hits selected to diversify BBs
   - `TierB_Control`: Tier B hits for control validation
 
-If you are new, start with `TierA_Top` + a small number of `TierB_Control` as controls.
+Recommended starting set: `TierA_Top` plus a few `TierB_Control`.
 
 ---
 
-## Generic Setup Template (Target-Agnostic)
-
-### 1) Folder layout
-```
-project_root/
-  00_input_fastq/          # paired FASTQs
-    SAMPLE_A_1.fastq.gz
-    SAMPLE_A_2.fastq.gz
-    SAMPLE_B_1.fastq.gz
-    SAMPLE_B_2.fastq.gz
-  00_BB_information.txt     # BB info (tab-delimited)
-  DELeGANce_out/
-```
-
-### 2) BB information file format (tab-delimited)
-Minimum 7 columns in this exact order (header optional):
-```
-type    seq     bb_id   cycle   tag_id  lib_id  smiles
-```
-Notes:
-- `type` includes CODON/HP/OP/CP (CODON rows are used for BB mapping)
-- `cycle` is 1/2/3/4 for each BB
-- `lib_id` is required if multiple libraries are present
-
-### 3) Sample column names
-After decode, column names come from FASTQ sample names.
-Check header of:
-```
-DELeGANce_out/<run_name>/02_decoded/raw_counts_matrix.tsv
-```
-Use those exact names in `--r1`, `--r2`, `--neg`, `--del2`.
-
-### 4) Minimal run command (example template)
-```bash
-python3 run_delegance_pipeline.py \
-  --fastq-dir 00_input_fastq \
-  --bbinfo 00_BB_information.txt \
-  --output-dir DELeGANce_out/my_run \
-  --threads 6 \
-  --mismatch hp_op_cp \
-  --r1 R1C1 R1C2 R1C3 R1C4 \
-  --r2 R2C1 R2C2 R2C3 R2C4 \
-  --neg NEG_R1 NEG_R2 \
-  --del2 DEL2
-```
-
-### 5) Quick validation
-- `02_decoded/raw_counts_matrix.tsv` has `lib_id` and your sample columns
-- `03_normalized/.../05_hybrid_annot.tsv` is produced
-- `Beginner_QC_Report.html` opens without errors
-
----
-
-## Useful Stand-Alone Commands
+## Common Commands
 
 ### Hit calling only (after decode)
 ```bash
@@ -188,7 +173,7 @@ python3 03_call_hits.py \
   --preset balanced
 ```
 
-### Regenerate the interactive report
+### Regenerate interactive report
 ```bash
 python3 04_build_interactive_report.py \
   --master_tsv DELeGANce_out/my_run/03_normalized/<preset>/05_hybrid_annot.tsv \
@@ -201,12 +186,7 @@ python3 04_build_interactive_report.py \
 python3 export_beginner_qc_report.py \
   --run_root DELeGANce_out/my_run \
   --out_html DELeGANce_out/Beginner_QC_Report.html \
-  --out_tsv DELeGANce_out/Beginner_QC_TopHits.tsv \
-  --neg_high_quantile 0.90 \
-  --recommend_a 50 \
-  --recommend_b 20 \
-  --recommend_diverse 50 \
-  --diverse_key BB1_BB2_BB3
+  --out_tsv DELeGANce_out/Beginner_QC_TopHits.tsv
 
 python3 export_final_excel.py \
   --run_root DELeGANce_out/my_run \
@@ -214,20 +194,7 @@ python3 export_final_excel.py \
   --top_n 1000
 ```
 
-If multiple `05_hybrid_annot.tsv` exist under a run, add `--prefer_dir <subdir>` or pass the exact `--annot_tsv` path.
-
-### Run hit calling + postprocess for multiple runs
-```bash
-bash run_hits_then_postprocess.sh \
-  --run-root DELeGANce_out/run_A \
-  --run-root DELeGANce_out/run_B \
-  --r1 "R1C1 R1C2 R1C3 R1C4" \
-  --r2 "R2C1 R2C2 R2C3 R2C4" \
-  --neg "NEG_R1 NEG_R2" \
-  --del2 DEL2
-```
-
-### Subsample paired FASTQs (for fast testing)
+### Subsample paired FASTQs (fast testing)
 ```bash
 python3 subsample_fastq_pairs.py \
   --input-dir 00_input_fastq \
@@ -237,39 +204,36 @@ python3 subsample_fastq_pairs.py \
   --seed 42
 ```
 
+### Quick decode validation (advanced)
+```bash
+python3 run_full_validation.py \
+  --bb DELeGANce_out/my_run/BB_information_fixed.tsv \
+  --run adj3_tol2 DELeGANce_out/my_run 3 \
+  --undecoded-sample 1000 \
+  --out-json DELeGANce_out/decode_validation_summary.json \
+  --out-tsv DELeGANce_out/decode_validation_summary.tsv \
+  --log DELeGANce_out/decode_validation.log
+```
+
 ---
 
 ## Troubleshooting
 
-- **fastp not found**: install it or add `--skip-fastp` (not recommended for fresh data).
-- **Torch/CUDA issues**: the pipeline falls back to CPU automatically. You can force CPU by setting `DELEGANCE_DISABLE_TORCH=1`.
-- **RDKit missing**: only affects molecule thumbnails in the interactive report.
-- **Large matrices**: the runner auto-selects GLM top mode for huge datasets; tune with `--glm_mode` and `--glm_top_*`.
-- **Excel export fails**: install `openpyxl` or `xlsxwriter`.
-- **Multiple 05_hybrid_annot.tsv**: use `--prefer_dir <subdir>` or `--annot_tsv /path/to/05_hybrid_annot.tsv`.
+- **fastp missing**: Install fastp or run with `--skip-fastp` and provide merged FASTQs in `01_fastp_out/`.
+- **skip-fastp decode errors**: Ensure `01_fastp_out/*_merged.fq(.gz)` exists and `BB_information_fixed.tsv` is present under the run root.
+- **Decode rate is low**: Check BB file, `--length-tol`, and `--adj-tol`.
+- **No merged FASTQs found**: Ensure preprocess ran or provide `<SAMPLE>_merged.fq.gz` files in `01_fastp_out/`.
 
 ---
 
-## GitHub Hygiene
+## Repository Layout
 
-- Outputs and FASTQs should not be committed. Keep them locally.
-- A `.gitignore` is included to prevent large data from being tracked.
-
----
-
-## Citation / Notes
-
-If you use this pipeline in a manuscript, cite the DEL screening methodology and note the following:
-- NEG_R2 is preferred for centering and used as the primary NEG control when available.
-- NEG_R1 is still used for additional NEG penalties and QC visualization when provided.
-
----
-
-## License
-
-This project is released under a non-commercial academic research license.
-See `LICENSE.txt` for the full terms.
-
----
-
-If you need a tailored README for another target, tell me the folder names and sample columns and I will generate it.
+- `run_delegance_pipeline.py` - orchestrator (preprocess -> decode -> hit calling)
+- `01_preprocess_reads.pl` - FASTQ preprocessing and fastp integration
+- `02_decode_reads.pl` - barcode decode + count matrices
+- `03_call_hits.py` - GLM hit calling + plots + static report
+- `04_build_interactive_report.py` - interactive Bokeh report
+- `export_beginner_qc_report.py` - beginner QC HTML/TSV
+- `export_final_excel.py` - Excel export with guide tab
+- `subsample_fastq_pairs.py` - FASTQ subsampling helper
+- `DELeGANce_out/` - outputs

@@ -15,6 +15,7 @@ venv/
 
 # Outputs
 DELeGANce_out/
+DELeGANce_out_fin/
 
 # Data exports
 *.tsv
@@ -61,3 +62,6 @@ DELeGANce_out/
 # Local-only mapping files (never commit)
 local_target_map.tsv
 local_target_map.json
+
+# Local KRAS batch script (not tracked)
+01_KRAS_batch_final.sh

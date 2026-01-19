@@ -131,6 +131,9 @@ my %OPT = (
     length_tol         => defined $ENV{LENGTH_TOL} ? $ENV{LENGTH_TOL}+0 : 5,
     scaling_denom      => $ENV{SCALING_DENOM}      // 'sample_decoded',
     max_failed_dump    => defined $ENV{MAX_FAILED_DUMP} ? $ENV{MAX_FAILED_DUMP}+0 : 100000,
+    adj_tol            => defined $ENV{ADJ_TOL} ? $ENV{ADJ_TOL}+0 : 3,
+    max_cp_cands       => defined $ENV{MAX_CP_CANDS} ? $ENV{MAX_CP_CANDS}+0 : 0,
+    max_anchor_cands   => defined $ENV{MAX_ANCHOR_CANDS} ? $ENV{MAX_ANCHOR_CANDS}+0 : 0,
 
     # tag canonical lens (override)
     hp_len             => undef,   # default 8
@@ -165,6 +168,9 @@ GetOptions(
     'length-tol|T=i'         => \$OPT{length_tol},
     'scaling-denom|S=s'      => \$OPT{scaling_denom},
     'max-failed-dump|x=i'    => \$OPT{max_failed_dump},
+    'adj-tol|J=i'            => \$OPT{adj_tol},
+    'max-cp-cands|P=i'       => \$OPT{max_cp_cands},
+    'max-anchor-cands|Y=i'   => \$OPT{max_anchor_cands},
     'hp-len|H=i'             => \$OPT{hp_len},
     'op-len|O=i'             => \$OPT{op_len},
     'codon-len|c=i'          => \$OPT{codon_len},
@@ -198,6 +204,9 @@ die "Invalid --length-filter-mode: $OPT{length_filter_mode}\nAllowed: reject_out
   unless $VALID_LFM{$OPT{length_filter_mode}};
 die "--length-tol must be >=0\n" if defined $OPT{length_tol} && $OPT{length_tol} < 0;
 die "--max-failed-dump must be >=0\n" if defined $OPT{max_failed_dump} && $OPT{max_failed_dump} < 0;
+die "--adj-tol must be >=0\n" if defined $OPT{adj_tol} && $OPT{adj_tol} < 0;
+die "--max-cp-cands must be >=0\n" if defined $OPT{max_cp_cands} && $OPT{max_cp_cands} < 0;
+die "--max-anchor-cands must be >=0\n" if defined $OPT{max_anchor_cands} && $OPT{max_anchor_cands} < 0;
 die "--peak-top-k must be >=1\n" if $OPT{peak_top_k} < 1;
 die "--peak-min-sep must be >=0\n" if $OPT{peak_min_sep} < 0;
 die "--peak-min-frac must be between 0 and 1\n" if $OPT{peak_min_frac} < 0 || $OPT{peak_min_frac} > 1;
@@ -241,6 +250,9 @@ my $HP_CAN_LEN    = defined $OPT{hp_len}    ? $OPT{hp_len}+0    : 8;
 my $OP_CAN_LEN    = defined $OPT{op_len}    ? $OPT{op_len}+0    : 20;
 my $CODON_CAN_LEN = defined $OPT{codon_len} ? $OPT{codon_len}+0 : 9;
 my $CP_CAN_LEN    = defined $OPT{cp_len}    ? $OPT{cp_len}+0    : 28;
+my $ADJ_TOL       = defined $OPT{adj_tol}  ? $OPT{adj_tol}+0   : 3;
+my $MAX_CP_CANDS     = $OPT{max_cp_cands}    // 0;  # 0 = no limit
+my $MAX_ANCHOR_CANDS = $OPT{max_anchor_cands}// 0;  # 0 = no limit
 
 die "--hp-len must be >0\n"    if $HP_CAN_LEN    <= 0;
 die "--op-len must be >0\n"    if $OP_CAN_LEN    <= 0;
@@ -310,6 +322,9 @@ sub dump_effective_config {
         peak_top_k         => $PEAK_TOP_K,
         peak_min_sep       => $PEAK_MIN_SEP,
         peak_min_frac      => $PEAK_MIN_FRAC,
+        adj_tol            => $ADJ_TOL,
+        max_cp_cands       => $MAX_CP_CANDS,
+        max_anchor_cands   => $MAX_ANCHOR_CANDS,
     );
     my @pairs = map { "$_=$conf{$_}" } sort keys %conf;
     log_msg("INFO","Effective config: ".join("; ", @pairs));
@@ -322,7 +337,8 @@ my $OP_TRIE    = LibraryTrie->new(die_on_dup => 1);
 my $CP_TRIE    = LibraryTrie->new(die_on_dup => 1);
 my $CODON_TRIE = LibraryTrie->new(die_on_dup => 1);
 
-# info 포맷: "type,tag_id,bb_id_fixed,smiles,perf|miss[,cycle]"
+my $INFO_SEP = "\x1f";
+# info 포맷: "type<SEP>tag_id<SEP>bb_id_fixed<SEP>smiles<SEP>perf|miss[<SEP>cycle]"
 my %LIB_EXPECTED_CYC;  # {lib_id} = 3 or 4
 my %LIB_IDS;           # 실제 라이브러리 set
 my %CP_VARIANT_OWNER;  # {seq} = lib_id (first seen) to detect CP collisions across libs
@@ -371,7 +387,7 @@ sub load_fixed_bb_and_build_tries {
 
         if ($type =~ /^Codon/i){
             die "Codon row missing lib_id at line $ln (type=Codon)\n" if $lib_norm eq "";
-            my $info = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"perf",$cycle);
+            my $info = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf",$cycle);
             $CODON_TRIE->insert($seq,$info,$lib_norm);
             $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
             if ($lib_norm ne "" && $cycle =~ /^[1-4]$/){
@@ -379,7 +395,7 @@ sub load_fixed_bb_and_build_tries {
             }
         } elsif ($type eq "CP"){
             die "CP row missing lib_id at line $ln (type=CP)\n" if $lib_norm eq "";
-            my $info_p = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"perf");
+            my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
             $CP_TRIE->insert($seq,$info_p,$lib_norm);
             my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
             # Enforce design invariant: CP variants (1bp sub/indel) must never collide across libraries.
@@ -389,20 +405,20 @@ sub load_fixed_bb_and_build_tries {
                 }
                 $CP_VARIANT_OWNER{$s} = $lib_norm;
             }
-            my $info_m = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
             for my $s (@mis){ $CP_TRIE->insert($s,$info_m,$lib_norm); }
             $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
         } elsif ($type eq "HP"){
-            my $info_p = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"perf");
+            my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
             $HP_TRIE->insert($seq,$info_p,$lib_norm);
             my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-            my $info_m = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
             for my $s (@mis){ $HP_TRIE->insert($s,$info_m,$lib_norm); }
         } elsif ($type eq "OP"){
-            my $info_p = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"perf");
+            my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
             $OP_TRIE->insert($seq,$info_p,$lib_norm);
             my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-            my $info_m = join(",", $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
             for my $s (@mis){ $OP_TRIE->insert($s,$info_m,$lib_norm); }
         }
     }
@@ -425,26 +441,28 @@ sub load_fixed_bb_and_build_tries {
 # --------- Decoding helpers ----------
 sub parse_info {
     my ($info)=@_;
-    my @f = split /,/, $info;
+    my @f = split /\Q$INFO_SEP\E/, $info;
     my %h = ( type=>$f[0], tag_id=>$f[1], bb_id=>$f[2], smiles=>$f[3], qual=>$f[4] );
     $h{cycle} = $f[5] if defined $f[5];
     return \%h;
 }
 sub pick_best_cp_candidates {
-    my ($seq_len,$cps_ref,$direction)=@_;
+    my ($cps_ref,$max_n)=@_;
     my @cps=@$cps_ref;
     for my $m (@cps){ $m->{meta}=parse_info($m->{info}); $m->{match_len}=length($m->{sequence}); }
     my @sorted = sort {
         my $qa = ($a->{meta}{qual} eq 'perf') ? 1 : 0;
         my $qb = ($b->{meta}{qual} eq 'perf') ? 1 : 0;
         return $qb <=> $qa if $qa != $qb;
-        return ($direction eq 'forward') ? ($b->{position} <=> $a->{position}) : ($a->{position} <=> $b->{position});
+        return ($b->{position} <=> $a->{position});
     } @cps;
-    splice(@sorted,6) if @sorted>6;
+    if (defined $max_n && $max_n > 0 && @sorted > $max_n){
+        splice(@sorted,$max_n);
+    }
     return \@sorted;
 }
 sub pick_best_anchor_before {
-    my ($matches_ref,$limit_pos)=@_;
+    my ($matches_ref,$limit_pos,$max_n)=@_;
     my @cand = grep { $_->{position} < $limit_pos } @$matches_ref;
     return undef unless @cand;
     for my $m (@cand){ $m->{meta}=parse_info($m->{info}); }
@@ -454,39 +472,78 @@ sub pick_best_anchor_before {
         return $qb <=> $qa if $qa != $qb;
         return $b->{position} <=> $a->{position};
     } @cand;
-    splice(@sorted,5) if @sorted>5;
+    if (defined $max_n && $max_n > 0 && @sorted > $max_n){
+        splice(@sorted,$max_n);
+    }
     return \@sorted;
 }
-sub greedy_pick_codons {
-    my ($lib_id,$seq,$start_pos,$end_pos,$expected_cycles)=@_;
+sub _gap_ok {
+    my ($next_start,$prev_end,$tol)=@_;
+    my $gap = $next_start - ($prev_end + 1);
+    return (abs($gap) <= $tol);
+}
+sub _pick_codons_dfs {
+    my ($by_cycle,$cycle,$expected,$prev_end,$cp_pos,$tol,$memo)=@_;
+    my $key = join(":", $cycle, $prev_end);
+    return $memo->{$key} if exists $memo->{$key};
+    if ($cycle > $expected){
+        return $memo->{$key} = { penalty => 0, sel => {} };
+    }
+
+    my $best;
+    for my $cand (@{ $by_cycle->{$cycle} || [] }){
+        next unless _gap_ok($cand->{position}, $prev_end, $tol);
+        if ($cycle == $expected){
+            my $gap_cp = $cp_pos - ($cand->{end} + 1);
+            next if abs($gap_cp) > $tol;
+            my $pen = abs($cand->{position} - ($prev_end + 1)) + abs($gap_cp);
+            if (!$best || $pen < $best->{penalty}){
+                $best = { penalty => $pen, sel => { $cycle => $cand } };
+            }
+            next;
+        }
+        my $next = _pick_codons_dfs($by_cycle, $cycle+1, $expected, $cand->{end}, $cp_pos, $tol, $memo);
+        next unless $next;
+        my $pen = abs($cand->{position} - ($prev_end + 1)) + $next->{penalty};
+        if (!$best || $pen < $best->{penalty}){
+            my %sel = %{ $next->{sel} };
+            $sel{$cycle} = $cand;
+            $best = { penalty => $pen, sel => \%sel };
+        }
+    }
+    return $memo->{$key} = $best;
+}
+sub pick_codons_by_adjacency {
+    my ($lib_id,$seq,$op_end,$cp_pos,$expected_cycles,$adj_tol)=@_;
     my $codon_hits = $CODON_TRIE->search_substrings_by_lib_id($seq,$lib_id);
     return undef unless @$codon_hits;
-    my @cand;
+
+    my %by_cycle;
     for my $h (@$codon_hits){
         my $pos=$h->{position};
-        next if $pos <= $start_pos || $pos >= $end_pos;
-        $h->{meta}=parse_info($h->{info});
-        next unless defined $h->{meta}{cycle} && $h->{meta}{cycle} =~ /^[1-4]$/;
-        push @cand,$h;
+        my $end=$pos + length($h->{sequence}) - 1;
+        next if $pos < $op_end - $adj_tol;
+        next if $end > $cp_pos + $adj_tol;
+        my $meta = parse_info($h->{info});
+        next unless defined $meta->{cycle} && $meta->{cycle} =~ /^[1-4]$/;
+        my $cycle = $meta->{cycle}+0;
+        $h->{meta} = $meta;
+        $h->{end}  = $end;
+        push @{ $by_cycle{$cycle} }, $h;
     }
-    return undef unless @cand;
-    @cand = sort { $a->{position} <=> $b->{position} } @cand;
-
-    my %chosen; my $cursor=$start_pos;
     for my $cycle (1..$expected_cycles){
-        my $hit;
-        for my $h (@cand){
-            next unless $h->{meta}{cycle}==$cycle;
-            next unless $h->{position} > $cursor;
-            $hit=$h; last;
-        }
-        return undef unless $hit;
-        $chosen{$cycle}=$hit;
-        $cursor = $hit->{position} + length($hit->{sequence}) - 1;
+        return undef unless $by_cycle{$cycle} && @{$by_cycle{$cycle}};
+        @{ $by_cycle{$cycle} } = sort { $a->{position} <=> $b->{position} } @{ $by_cycle{$cycle} };
     }
+
+    my %memo;
+    my $best = _pick_codons_dfs(\%by_cycle, 1, $expected_cycles, $op_end, $cp_pos, $adj_tol, \%memo);
+    return undef unless $best && $best->{sel};
+
     my %out;
     for my $c (1..$expected_cycles){
-        my $h=$chosen{$c};
+        my $h=$best->{sel}{$c};
+        return undef unless $h;
         $out{$c} = { bb_id=>$h->{meta}{bb_id}, pos=>$h->{position}, seq=>$h->{sequence} };
     }
     return \%out;
@@ -495,38 +552,42 @@ sub try_decode_direction {
     my ($seq,$direction)=@_;
     my $cp_hits = $CP_TRIE->search_substrings($seq);
     return undef unless @$cp_hits;
-    my $cp_cands = pick_best_cp_candidates(length($seq),$cp_hits,$direction);
+    my $cp_cands = pick_best_cp_candidates($cp_hits, $MAX_CP_CANDS);
     CP: for my $cp (@$cp_cands){
         my $lib_id = $cp->{lib_id};
         next CP unless exists $LIB_IDS{$lib_id};
         my $cp_pos  = $cp->{position};
 
-        # Prefer lib-specific OP hits; fallback to global if none (for legacy tables without lib_id on anchors)
+        # Use lib-specific OP hits (and allow global anchors if present)
         my $op_hits = $OP_TRIE->search_substrings_by_lib_id($seq, $lib_id);
-        if (!@$op_hits) {
-            my $glob = $OP_TRIE->search_substrings($seq);
-            my @filt = grep { $_->{lib_id} eq $lib_id || $_->{lib_id} eq '' || $lib_id eq '' } @$glob;
-            $op_hits = \@filt if @filt;
+        if ($lib_id ne ''){
+            my $op_glob = $OP_TRIE->search_substrings_by_lib_id($seq, '');
+            push @$op_hits, @$op_glob if $op_glob && @$op_glob;
         }
-        my $op_cands = pick_best_anchor_before($op_hits,$cp_pos);
+        next CP unless @$op_hits;
+        my $op_cands = pick_best_anchor_before($op_hits,$cp_pos,$MAX_ANCHOR_CANDS);
         next CP unless $op_cands && @$op_cands;
 
         OP: for my $op (@$op_cands){
             my $op_pos=$op->{position};
+            my $op_end = $op_pos + length($op->{sequence}) - 1;
+            # Use lib-specific HP hits (and allow global anchors if present)
             my $hp_hits = $HP_TRIE->search_substrings_by_lib_id($seq, $lib_id);
-            if (!@$hp_hits) {
-                my $glob_hp = $HP_TRIE->search_substrings($seq);
-                my @filt_hp = grep { $_->{lib_id} eq $lib_id || $_->{lib_id} eq '' || $lib_id eq '' } @$glob_hp;
-                $hp_hits = \@filt_hp if @filt_hp;
+            if ($lib_id ne ''){
+                my $hp_glob = $HP_TRIE->search_substrings_by_lib_id($seq, '');
+                push @$hp_hits, @$hp_glob if $hp_glob && @$hp_glob;
             }
-            my $hp_cands = pick_best_anchor_before($hp_hits,$op_pos);
+            next OP unless @$hp_hits;
+            my $hp_cands = pick_best_anchor_before($hp_hits,$op_pos,$MAX_ANCHOR_CANDS);
             next OP unless $hp_cands && @$hp_cands;
 
             my $expected_cycles = $LIB_EXPECTED_CYC{$lib_id} // 3;
 
             HP: for my $hp (@$hp_cands){
                 my $hp_pos=$hp->{position};
-                my $codon_sel = greedy_pick_codons($lib_id,$seq,$op_pos,$cp_pos,$expected_cycles);
+                my $hp_end = $hp_pos + length($hp->{sequence}) - 1;
+                next HP unless _gap_ok($op_pos, $hp_end, $ADJ_TOL);
+                my $codon_sel = pick_codons_by_adjacency($lib_id,$seq,$op_end,$cp_pos,$expected_cycles,$ADJ_TOL);
                 next HP unless $codon_sel;
 
                 my @bbs; for my $c (1..$expected_cycles){ push @bbs, $codon_sel->{$c}{bb_id}; }
@@ -934,7 +995,7 @@ sub process_merged_dir {
         my $und_written=0;
         my $IN = open_maybe_gzip($path);
         my ($total_reads,$decoded,$length_passed)=(0,0,0);
-        my %fail=( no_cp=>0, no_op=>0, no_hp=>0, codon_fail=>0, len_out_of_range=>0 );
+        my %fail=( no_cp=>0, no_op=>0, no_hp=>0, codon_fail=>0, len_out_of_range=>0, order_violation=>0 );
 
         while (1){
             my $hdr = <$IN>; last unless defined $hdr;
@@ -965,34 +1026,47 @@ sub process_merged_dir {
 
             my $res = decode_one_read($seq);
             if ($res){
-                add_count_matrix($sample,$res->{lib_id},$res->{cycles},$res->{bb_list});
-                $decoded++;
-                acc_dir($sample,$res->{lib_id},$res->{direction});
-                acc_cycle($sample,$res->{lib_id},$res->{cycles});
-                for my $tag (qw(HP OP CP)){ acc_qual($sample,$res->{lib_id},$tag,$res->{anchors}{$tag}{qual}); }
-
                 my $hp_pos=$res->{anchors}{HP}{pos}; my $hp_len=length($res->{anchors}{HP}{seq});
                 my $op_pos=$res->{anchors}{OP}{pos}; my $op_len=length($res->{anchors}{OP}{seq});
                 my $cp_pos=$res->{anchors}{CP}{pos}; my $cp_len=length($res->{anchors}{CP}{seq});
-                my $prev_end = $hp_pos+$hp_len-1; acc_gap($sample,$res->{lib_id},"gap_HP_OP",$op_pos-($prev_end+1));
-                $prev_end = $op_pos+$op_len-1;
 
                 my (@cpos,@clen);
                 for my $c (1..$res->{cycles}){
                     my $p=$res->{codons}{$c}{pos};
                     my $l=length($res->{codons}{$c}{seq});
                     push @cpos,$p; push @clen,$l;
-                    acc_bb($sample,$res->{lib_id},$c,$res->{codons}{$c}{bb_id});
                 }
 
                 for my $l (@clen){ $QC{$sample}{codon_len_not9}++ if ($l != 9); }
                 my $order_ok = 1;
-                $order_ok &&= ($res->{anchors}{HP}{pos} <= $res->{anchors}{OP}{pos});
-                my $prev = $res->{anchors}{OP}{pos};
+                $order_ok &&= ($hp_pos <= $op_pos);
+                my $prev = $op_pos;
                 for my $p (@cpos){ $order_ok &&= ($prev <= $p); $prev = $p; }
                 $order_ok &&= ($cpos[-1] <= $cp_pos);
                 $QC{$sample}{order_violation}++ unless $order_ok;
                 $QC{$sample}{cp_len_out_of_27_29}++ unless ($cp_len >= 27 && $cp_len <= 29);
+
+                if (!$order_ok){
+                    $fail{order_violation}++;
+                    if ($und_written < $MAX_FAILED_DUMP){
+                        print $FUND join("\t",$read_id,$read_len,$seq,"order_violation",1,1,1), "\n";
+                        $und_written++;
+                    }
+                    next;
+                }
+
+                add_count_matrix($sample,$res->{lib_id},$res->{cycles},$res->{bb_list});
+                $decoded++;
+                acc_dir($sample,$res->{lib_id},$res->{direction});
+                acc_cycle($sample,$res->{lib_id},$res->{cycles});
+                for my $tag (qw(HP OP CP)){ acc_qual($sample,$res->{lib_id},$tag,$res->{anchors}{$tag}{qual}); }
+
+                my $prev_end = $hp_pos+$hp_len-1; acc_gap($sample,$res->{lib_id},"gap_HP_OP",$op_pos-($prev_end+1));
+                $prev_end = $op_pos+$op_len-1;
+
+                for my $c (1..$res->{cycles}){
+                    acc_bb($sample,$res->{lib_id},$c,$res->{codons}{$c}{bb_id});
+                }
 
                 acc_gap($sample,$res->{lib_id},"gap_OP_C1",$cpos[0]-($prev_end+1));
                 for my $i (1..$#cpos){ my $pe=$cpos[$i-1]+$clen[$i-1]-1; acc_gap($sample,$res->{lib_id},"gap_C".$i."_C".($i+1), $cpos[$i]-($pe+1)); }
@@ -1061,9 +1135,10 @@ sub process_merged_dir {
         $SUMMARY{$sample}{no_hp}               = $fail{no_hp};
         $SUMMARY{$sample}{codon_fail}          = $fail{codon_fail};
         $SUMMARY{$sample}{len_out_of_range}    = $fail{len_out_of_range};
+        $SUMMARY{$sample}{order_violation}     = $fail{order_violation};
 
         log_msg("INFO","  $sample done: total=$total_reads, length_passed=$length_passed, decoded=$decoded, ".
-                       "fails(no_cp=$fail{no_cp}, no_op=$fail{no_op}, no_hp=$fail{no_hp}, codon_fail=$fail{codon_fail}, len_out_of_range=$fail{len_out_of_range})");
+                       "fails(no_cp=$fail{no_cp}, no_op=$fail{no_op}, no_hp=$fail{no_hp}, codon_fail=$fail{codon_fail}, len_out_of_range=$fail{len_out_of_range}, order_violation=$fail{order_violation})");
         close($FDEC); close($FUND);
     }
 }
@@ -1144,10 +1219,10 @@ sub write_scaled_matrix {
 }
 sub write_summary_basic {
     my ($f)=@_; open(my $OUT,">",$f) or die "Cannot write $f: $!\n";
-    print $OUT join("\t",qw(sample total_reads decoded_reads no_cp no_op no_hp codon_fail len_out_of_range)), "\n";
+    print $OUT join("\t",qw(sample total_reads decoded_reads no_cp no_op no_hp codon_fail len_out_of_range order_violation)), "\n";
     for my $s (sort keys %SUMMARY){
         my $h=$SUMMARY{$s};
-        print $OUT join("\t",$s, map { $h->{$_}//0 } qw(total_reads decoded_reads no_cp no_op no_hp codon_fail len_out_of_range)), "\n";
+        print $OUT join("\t",$s, map { $h->{$_}//0 } qw(total_reads decoded_reads no_cp no_op no_hp codon_fail len_out_of_range order_violation)), "\n";
     }
     close($OUT); log_msg("INFO","Wrote decoding summary: $f");
 }
@@ -1335,6 +1410,7 @@ Length filter (base)
   -O, --op-len <INT>               Canonical OP length (default: 20)
   -c, --codon-len <INT>            Canonical Codon length (default: 9)
   -Q, --cp-len <INT>               Canonical CP length (default: 28)
+  -J, --adj-tol <INT>              Adjacency tolerance between HP/OP/Codon/CP (default: $OPT{adj_tol})
 
 fastp-based auto adjust
   -A, --auto-insert-detect 0|1     Enable auto detection from fastp JSON (default: 1)
@@ -1349,6 +1425,8 @@ Mixed DEL (Top-K peaks)
 
 General
   -x, --max-failed-dump <INT>      Max undecoded dump lines per sample (default: $OPT{max_failed_dump})
+  -P, --max-cp-cands <INT>         Max CP candidates to consider (0 = no limit; default: $OPT{max_cp_cands})
+  -Y, --max-anchor-cands <INT>     Max HP/OP candidates to consider (0 = no limit; default: $OPT{max_anchor_cands})
   -h, --help                       Show this help and exit
 
 Notes

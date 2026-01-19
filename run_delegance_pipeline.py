@@ -42,9 +42,11 @@ import datetime as _dt
 import json
 import hashlib
 import glob
+import re
 from html import escape as _html_escape
 
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+MERGED_FASTQ_RE = re.compile(r'(?:\\.fpmerged\\.fq(?:\\.gz)?|_merged\\.(?:fq|fastq)(?:\\.gz)?)$', re.IGNORECASE)
 
 
 def _timestamp() -> str:
@@ -82,32 +84,40 @@ def _file_or_gz_exists(path: str) -> bool:
     return os.path.isfile(path) or os.path.isfile(path + ".gz")
 
 
+def _log_has_marker(path: str, marker: str) -> bool:
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if marker in line:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _list_merged_fastqs(dir_path: str):
+    if not os.path.isdir(dir_path):
+        return []
+    try:
+        items = os.listdir(dir_path)
+    except Exception:
+        return []
+    return [s for s in items if MERGED_FASTQ_RE.search(s)]
+
+
 def _has_fastp_outputs(run_root: str) -> bool:
     """Return True when merged FASTQs and fixed BB info already exist."""
     merged_dir = os.path.join(run_root, '01_fastp_out')
     fixed_bb  = os.path.join(run_root, 'BB_information_fixed.tsv')
-    if not os.path.isdir(merged_dir):
-        return False
-    try:
-        items = os.listdir(merged_dir)
-    except Exception:
-        items = []
-    has_fastq = any(
-        s.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')) for s in items
-    )
-    return has_fastq and _file_or_gz_exists(fixed_bb)
+    log_path = os.path.join(run_root, '01_preprocess_reads.log')
+    merged = _list_merged_fastqs(merged_dir)
+    return bool(merged) and _file_or_gz_exists(fixed_bb) and _log_has_marker(log_path, "All done.")
 
 
 def _has_merged_fastqs(run_root: str) -> bool:
     """Return True when merged FASTQs exist (regardless of BB metadata)."""
     merged_dir = os.path.join(run_root, '01_fastp_out')
-    if not os.path.isdir(merged_dir):
-        return False
-    try:
-        items = os.listdir(merged_dir)
-    except Exception:
-        items = []
-    return any(s.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')) for s in items)
+    return bool(_list_merged_fastqs(merged_dir))
 
 
 def _has_decoded_outputs(run_root: str) -> bool:
@@ -116,7 +126,8 @@ def _has_decoded_outputs(run_root: str) -> bool:
     if not os.path.isdir(decoded_dir):
         return False
     raw = os.path.join(decoded_dir, 'raw_counts_matrix.tsv')
-    return _file_or_gz_exists(raw)
+    log_path = os.path.join(decoded_dir, '02_decode_reads.log')
+    return _file_or_gz_exists(raw) and _log_has_marker(log_path, "All done.")
 
 
 def _pick_decoded_matrix(run_root: str) -> str:
@@ -509,6 +520,10 @@ def main():
             print('[ERROR] --skip-fastp requested but no merged FASTQs found under RUN_ROOT/01_fastp_out.')
             print('        Either run fastp (omit --skip-fastp) or provide merged FASTQs in 01_fastp_out first.')
             return 2
+        if not _file_or_gz_exists(fixed_bb):
+            print('[ERROR] --skip-fastp requested but BB_information_fixed.tsv is missing under RUN_ROOT.')
+            print('        Provide RUN_ROOT/BB_information_fixed.tsv or rerun without --skip-fastp.')
+            return 2
 
     # Hit-only requires decoded outputs to already exist.
     if args.only == 'hit' and not _has_decoded_outputs(run_root_abs):
@@ -536,8 +551,9 @@ def main():
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] Preprocess failed; aborting.')
                     return rc
-                _write_json(preproc_params_path, preproc_payload)
-                print(f"[OK] Stored preprocess parameter hash: {preproc_hash[:12]}")
+                if rc == 0:
+                    _write_json(preproc_params_path, preproc_payload)
+                    print(f"[OK] Stored preprocess parameter hash: {preproc_hash[:12]}")
 
     # 2) Decode
     if rc == 0 and args.only in ('all', 'decode'):
@@ -554,8 +570,9 @@ def main():
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] Decode failed; aborting.')
                     return rc
-                _write_json(decode_params_path, decode_payload)
-                print(f"[OK] Stored decode parameter hash: {decode_hash[:12]}")
+                if rc == 0:
+                    _write_json(decode_params_path, decode_payload)
+                    print(f"[OK] Stored decode parameter hash: {decode_hash[:12]}")
 
     # Auto-optimization: choose device/dtype/GLM mode heuristically if not specified
     if int(getattr(args, 'auto_opt', 1)) == 1:
@@ -750,9 +767,10 @@ def main():
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] HitCaller failed; aborting.')
                     return rc
-                used_hit_dir = hit_out_abs
-                _write_hit_params(hit_out_abs, hit_payload)
-                print(f"[OK] Stored hit parameter hash: {current_hash[:12]}")
+                if rc == 0:
+                    used_hit_dir = hit_out_abs
+                    _write_hit_params(hit_out_abs, hit_payload)
+                    print(f"[OK] Stored hit parameter hash: {current_hash[:12]}")
 
     # 4) Interactive hits (Bokeh) + index.html aggregator
     if rc == 0 and args.only in ('all', 'hit'):
