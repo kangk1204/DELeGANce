@@ -1015,6 +1015,8 @@ def build_parser():
     p.add_argument("--device", default="cpu")
     p.add_argument("--dtype", choices=["auto","float32","float64"], default="auto",
                    help="Numeric precision for GLM tensors. auto: float32 on CUDA, float64 on CPU")
+    p.add_argument("--force_gpu_top", type=int, choices=[0,1], default=0,
+                   help="1이면 glm_mode=top에서도 GPU를 강제로 사용합니다(기본은 안정성 위해 CPU).")
 
     p.add_argument("--w1", type=float, default=0.5)
     p.add_argument("--w2", type=float, default=0.4)
@@ -1102,6 +1104,16 @@ def main():
     ap = build_parser(); args = ap.parse_args()
     sep = normalize_sep(args.sep)
     ensure_dir(args.outdir); ensure_dir(os.path.join(args.outdir, "plots"))
+
+    # Default safety: glm_mode=top uses CPU unless explicitly forced.
+    force_gpu_top = int(getattr(args, "force_gpu_top", 0)) == 1
+    if not force_gpu_top:
+        env_force = os.environ.get("DELEGANCE_FORCE_GPU_TOP", "").strip().lower()
+        if env_force in ("1", "true", "yes", "y"):
+            force_gpu_top = True
+    if args.glm_mode == "top" and str(args.device).startswith("cuda") and not force_gpu_top:
+        print("[WARN] glm_mode=top → CPU fallback for stability. Use --force_gpu_top=1 or DELEGANCE_FORCE_GPU_TOP=1 to override.")
+        args.device = "cpu"
 
     # Resolve defaults for inputs
     run_root = args.run_root or "DELeGANce_out"
