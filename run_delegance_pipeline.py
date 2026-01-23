@@ -80,6 +80,15 @@ def run_cmd(cmd, log_file: str, env=None) -> int:
     return rc
 
 
+def _has_interactive_deps() -> bool:
+    try:
+        import bokeh  # noqa: F401
+        import narwhals  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _file_or_gz_exists(path: str) -> bool:
     return os.path.isfile(path) or os.path.isfile(path + ".gz")
 
@@ -820,21 +829,24 @@ def main():
             hybrid_tsv = os.path.join(src_dir, '05_hybrid_annot.tsv')
             bbinfo_fixed = os.path.join(run_root_abs, 'BB_information_fixed.tsv')
             if os.path.isfile(hybrid_tsv):
-                cmd = [
-                    'python3', _pick_script(['04_build_interactive_report.py','04_hit_finder.py','04_hit_finder_250816p2.py']),
-                    '--master_tsv', hybrid_tsv,
-                    '--bbinfo', bbinfo_fixed,
+                if not _has_interactive_deps():
+                    print("[WARN] Interactive HTML skipped: missing bokeh/narwhals.")
+                else:
+                    cmd = [
+                        'python3', _pick_script(['04_build_interactive_report.py','04_hit_finder.py','04_hit_finder_250816p2.py']),
+                        '--master_tsv', hybrid_tsv,
+                        '--bbinfo', bbinfo_fixed,
                     '--out', interactive_html,
                     '--top_hitscore', '10000',
                     '--plot_height', '260',
                 ]
                 print(f"[INFO] Interactive (Bokeh) → {interactive_html}")
-                if args.dry_run:
-                    print('DRY-RUN:', ' '.join(cmd))
-                else:
-                    rc2 = run_cmd(cmd, master_log)
-                    if rc2 != 0:
-                        print('[WARN] Interactive HTML generation failed (continuing).')
+                    if args.dry_run:
+                        print('DRY-RUN:', ' '.join(cmd))
+                    else:
+                        rc2 = run_cmd(cmd, master_log)
+                        if rc2 != 0:
+                            print('[WARN] Interactive HTML generation failed (continuing).')
             else:
                 print(f"[WARN] Skipping interactive HTML; not found: {hybrid_tsv}")
         except Exception as e:
@@ -864,6 +876,26 @@ def main():
                     return _html_escape(str(s), quote=True)
                 except Exception:
                     return str(s)
+            def _interactive_items(rel_path: str, abs_dir: str):
+                items = []
+                iframe = ""
+                ih = os.path.join(abs_dir, 'interactive_hits.html')
+                if os.path.isfile(ih):
+                    items.append(f"<li><a href='{_h(rel_path)}/interactive_hits.html'>Interactive (embedded below)</a></li>")
+                    popouts = []
+                    for fname, label in (
+                        ('interactive_p1.html', 'BB1×BB2'),
+                        ('interactive_p2.html', 'BB1×BB3'),
+                        ('interactive_p3.html', 'BB2×BB3'),
+                        ('interactive_p4.html', 'BB1×BB4'),
+                        ('interactive_table.html', 'Top table'),
+                    ):
+                        if os.path.isfile(os.path.join(abs_dir, fname)):
+                            popouts.append(f"<a href='{_h(rel_path)}/{fname}'>{label}</a>")
+                    if popouts:
+                        items.append(f\"<li>Pop-outs: {' · '.join(popouts)}</li>\")
+                    iframe = f\"<iframe src='{_h(rel_path)}/interactive_hits.html'></iframe>\"
+                return items, iframe
 
             html = [
                 "<!DOCTYPE html>",
@@ -883,22 +915,23 @@ def main():
             # Base section (no preset)
             if include_base:
                 rel_base = os.path.relpath(norm_root_abs, run_root_abs)
+                inter_items, inter_iframe = _interactive_items(rel_base, norm_root_abs)
                 html += [
                     f"<section class='preset'><h2>Preset: (default)</h2>",
                     "<ul>",
                     f"<li><a href='{_h(rel_base)}/report.html'>All-in-one report</a></li>",
                     f"<li><a href='{_h(rel_base)}/05_hybrid_annot.tsv'>05_hybrid_annot.tsv</a></li>",
                     f"<li><a href='{_h(rel_base)}/08_topk_consensus.tsv'>08_topk_consensus.tsv</a></li>",
-                    f"<li><a href='{_h(rel_base)}/interactive_hits.html'>Interactive (embedded below)</a></li>",
-                    f"<li>Pop-outs: <a href='{_h(rel_base)}/interactive_p1.html'>BB1×BB2</a> · <a href='{_h(rel_base)}/interactive_p2.html'>BB1×BB3</a> · <a href='{_h(rel_base)}/interactive_p3.html'>BB2×BB3</a> · <a href='{_h(rel_base)}/interactive_p4.html'>BB1×BB4</a> · <a href='{_h(rel_base)}/interactive_table.html'>Top table</a></li>",
+                    *inter_items,
                     "</ul>",
-                    f"<p>Interactive (if present): <a href='{_h(rel_base)}/interactive_hits.html'>interactive_hits.html</a></p>",
-                    f"<iframe src='{_h(rel_base)}/interactive_hits.html'></iframe>",
+                    f"<p>Interactive: <a href='{_h(rel_base)}/interactive_hits.html'>interactive_hits.html</a></p>" if inter_iframe else "",
+                    inter_iframe,
                     "</section>",
                 ]
             # Each preset subdir
             for name, absdir in presets:
                 rel = os.path.relpath(absdir, run_root_abs)
+                inter_items, inter_iframe = _interactive_items(rel, absdir)
                 # Derive preset and tags from folder name convention
                 if '_' in name:
                     preset_name = name.split('_', 1)[0]
@@ -915,11 +948,10 @@ def main():
                     f"<li><a href='{_h(rel)}/08_topk_consensus.tsv'>08_topk_consensus.tsv</a></li>",
                     f"<li><a href='{_h(rel)}/06_topk_glm.tsv'>06_topk_glm.tsv</a></li>",
                     f"<li><a href='{_h(rel)}/07_topk_rs.tsv'>07_topk_rs.tsv</a></li>",
-                    f"<li><a href='{_h(rel)}/interactive_hits.html'>Interactive (embedded below)</a></li>",
-                    f"<li>Pop-outs: <a href='{_h(rel)}/interactive_p1.html'>BB1×BB2</a> · <a href='{_h(rel)}/interactive_p2.html'>BB1×BB3</a> · <a href='{_h(rel)}/interactive_p3.html'>BB2×BB3</a> · <a href='{_h(rel)}/interactive_p4.html'>BB1×BB4</a> · <a href='{_h(rel)}/interactive_table.html'>Top table</a></li>",
+                    *inter_items,
                     "</ul>",
-                    f"<p>Interactive: <a href='{_h(rel)}/interactive_hits.html'>interactive_hits.html</a></p>",
-                    f"<iframe src='{_h(rel)}/interactive_hits.html'></iframe>",
+                    f"<p>Interactive: <a href='{_h(rel)}/interactive_hits.html'>interactive_hits.html</a></p>" if inter_iframe else "",
+                    inter_iframe,
                     "</section>",
                 ]
             html += ["</body></html>"]

@@ -12,6 +12,13 @@ DELeGANce is an end-to-end pipeline for DNA-encoded library (DEL) sequencing ana
 - `--output-dir` is resolved relative to your current working directory.
 
 ### 1) Create a clean environment
+Option A (recommended, reproducible):
+```bash
+conda env create -f environment.yml
+conda activate delegance
+```
+
+Option B (manual install):
 ```bash
 conda create -n delegance python=3.10
 conda activate delegance
@@ -19,6 +26,11 @@ conda install -c conda-forge -c bioconda fastp
 conda install -c conda-forge numpy pandas scipy matplotlib bokeh narwhals
 # Optional (recommended for structure + speed)
 conda install -c conda-forge rdkit
+```
+
+GPU (optional):
+```bash
+conda install -c pytorch -c nvidia pytorch-cuda=12.1
 ```
 
 ### 2) Run the pipeline
@@ -256,7 +268,7 @@ python3 run_full_validation.py \
 - **Decode rate is low**: Check BB file, `--length-tol`, and `--adj-tol`.
 - **No merged FASTQs found**: Ensure preprocess ran or provide `<SAMPLE>_merged.fq.gz` files in `01_fastp_out/`.
 - **GPU GLM top mode**: `--glm_mode=top` defaults to CPU for stability. Override with `--force_gpu_top=1` or `DELEGANCE_FORCE_GPU_TOP=1`.
-- **Interactive report fails (narwhals)**: Install `narwhals` (required by recent `bokeh`) and re-run `04_build_interactive_report.py`.
+- **Interactive report fails (narwhals)**: Install `narwhals` (required by recent `bokeh`) and re-run `04_build_interactive_report.py`. Missing deps cause the pipeline to skip interactive HTML.
 
 ---
 

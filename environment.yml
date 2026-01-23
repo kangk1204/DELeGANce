@@ -1,0 +1,17 @@
+name: delegance
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+dependencies:
+  - python=3.10
+  - fastp
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - bokeh
+  - narwhals
+  - rdkit
+  - pytorch
+  - pip
