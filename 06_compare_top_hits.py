@@ -178,6 +178,8 @@ def main() -> int:
                     help="Comma/space-separated list of top-N per run (e.g., 100,100,200)")
     ap.add_argument("--recommend-n-list", default=None,
                     help="Comma/space-separated list of recommended-N per run (e.g., 10,10,20)")
+    ap.add_argument("--fill-scores", type=int, choices=[0,1], default=1,
+                    help="1이면 top-N에 없더라도 전체 테이블에서 score를 찾아 채웁니다.")
     ap.add_argument("--score-col", default=None, help="Override score column")
     ap.add_argument("--out-dir", default=".", help="Output directory (default: current dir)")
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: compare_topN)")
@@ -230,6 +232,9 @@ def main() -> int:
         df = pd.read_csv(hybrid, sep="\t", usecols=usecols)
         df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(float("-inf"))
         df["compound_key"] = _make_compound_key(df)
+        score_map = None
+        if int(args.fill_scores) == 1:
+            score_map = df.groupby("compound_key")[score_col].max().to_dict()
         run_top_n = top_n_list[idx] if top_n_list else top_n
         run_rec_n = rec_n_list[idx] if rec_n_list else rec_n
         df_top = df.sort_values(score_col, ascending=False).head(run_top_n).copy()
@@ -237,6 +242,7 @@ def main() -> int:
         df_rec = _apply_recommend_filter(df_top)
         df_rec = df_rec.sort_values(score_col, ascending=False)
         df_rec = df_rec.drop_duplicates("compound_key").head(run_rec_n).copy()
+        top_score_map = df_top.groupby("compound_key")[score_col].max().to_dict()
         run_info.append({
             "label": label,
             "hybrid": hybrid,
@@ -244,6 +250,8 @@ def main() -> int:
             "rec": df_rec,
             "top_n": run_top_n,
             "rec_n": run_rec_n,
+            "score_map": score_map,
+            "top_score_map": top_score_map,
         })
 
     # Save per-run tables
@@ -271,8 +279,10 @@ def main() -> int:
         # Attach per-run scores
         for info in run_info:
             lbl = info["label"]
-            scores = info["top"].loc[info["top"]["compound_key"] == key, score_col]
-            row[f"{lbl}_score"] = float(scores.max()) if not scores.empty else np.nan
+            score = info.get("top_score_map", {}).get(key, np.nan)
+            if (score != score) and int(args.fill_scores) == 1:
+                score = info.get("score_map", {}).get(key, np.nan)
+            row[f"{lbl}_score"] = float(score) if score == score else np.nan
         union_rows.append(row)
         if len(present) >= min_overlap:
             overlap_rows.append(row.copy())
@@ -315,6 +325,11 @@ def main() -> int:
         for info in run_info:
             top_df = info["top"].copy()
             rec_df = info["rec"].copy()
+            for col in ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"]:
+                if col in top_df.columns:
+                    top_df[col] = top_df[col].fillna("NA")
+                if col in rec_df.columns:
+                    rec_df[col] = rec_df[col].fillna("NA")
             cols_top = ["compound_key", score_col, "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"]
             cols_rec = cols_top
             cols_top = [c for c in cols_top if c in top_df.columns]

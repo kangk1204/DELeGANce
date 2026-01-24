@@ -243,6 +243,7 @@ Outputs:
 - `compare_top100_interactive.html`
 Notes:
 - Use `--top-n-list` / `--recommend-n-list` to set per-run counts (comma/space-separated).
+- Use `--fill-scores 1` to populate per-run score columns even when a compound is not in that run's top-N.
 
 ### Export beginner QC + Excel
 ```bash
