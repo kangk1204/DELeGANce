@@ -225,6 +225,25 @@ Notes:
 - HTML requires `bokeh` + `narwhals` (BB hover images also require `rdkit`)
 - BB frequency bars are grouped by `BB_ID` (structure); hover shows contributing `LIB_ID` list
 
+### Compare top hits across runs (interactive)
+```bash
+python3 06_compare_top_hits.py \
+  --runs DELeGANce_out/KRAS_active_run DELeGANce_out/KRAS_inactive_run DELeGANce_out/KRAS_both_run \
+  --preset glm_full_dev_cuda_fp32 \
+  --top-n 100 \
+  --recommend-n 10 \
+  --out-dir DELeGANce_out/compare_runs
+```
+Outputs:
+- `compare_top100_union_top100.tsv`
+- `compare_top100_overlap_top100.tsv`
+- `compare_top100_pattern_counts.tsv`
+- `compare_top100_<run>_top100.tsv`
+- `compare_top100_<run>_recommended10.tsv`
+- `compare_top100_interactive.html`
+Notes:
+- Use `--top-n-list` / `--recommend-n-list` to set per-run counts (comma/space-separated).
+
 ### Export beginner QC + Excel
 ```bash
 python3 export_beginner_qc_report.py \
@@ -280,6 +299,7 @@ python3 run_full_validation.py \
 - `03_call_hits.py` - GLM hit calling + plots + static report
 - `04_build_interactive_report.py` - interactive Bokeh report
 - `05_summarize_top_hits.py` - summarize top N hits and recommend top X compounds
+- `06_compare_top_hits.py` - compare top hits across runs + interactive HTML
 - `export_beginner_qc_report.py` - beginner QC HTML/TSV
 - `export_final_excel.py` - Excel export with guide tab
 - `subsample_fastq_pairs.py` - FASTQ subsampling helper
