@@ -16,6 +16,7 @@ venv/
 # Outputs
 DELeGANce_out/
 DELeGANce_out_fin/
+DELeGANce_out_*/
 
 # Data exports
 *.tsv
