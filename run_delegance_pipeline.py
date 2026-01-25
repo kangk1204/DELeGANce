@@ -299,7 +299,7 @@ def _build_preproc_payload(args, preproc_path: str, fastq_dir: str, bbinfo: str)
     }
 
 
-def _build_decode_payload(decode_path: str, merged_dir: str, fixed_bb: str, preproc_hash: str):
+def _build_decode_payload(decode_path: str, merged_dir: str, fixed_bb: str, preproc_hash: str, mismatch: str):
     return {
         "version": 1,
         "script": os.path.basename(decode_path),
@@ -307,6 +307,7 @@ def _build_decode_payload(decode_path: str, merged_dir: str, fixed_bb: str, prep
         "merged_dir": os.path.abspath(merged_dir),
         "fixed_bb": _file_fingerprint(fixed_bb),
         "preprocess_hash": preproc_hash,
+        "mismatch": mismatch,
     }
 
 
@@ -521,8 +522,8 @@ def main():
     decode_done = _has_decoded_outputs(run_root_abs)
     merged_dir = os.path.join(run_root_abs, '01_fastp_out')
     fixed_bb   = os.path.join(run_root_abs, 'BB_information_fixed.tsv')
-    preproc_hash_for_decode = preproc_hash if preproc_cache_ok else None
-    decode_payload = _build_decode_payload(decode, merged_dir, fixed_bb, preproc_hash_for_decode)
+    preproc_hash_for_decode = preproc_hash
+    decode_payload = _build_decode_payload(decode, merged_dir, fixed_bb, preproc_hash_for_decode, args.mismatch)
     decode_hash = _hash_payload(decode_payload)
     decode_payload["hash"] = decode_hash
     cached_decode = _load_json(decode_params_path)
@@ -586,7 +587,7 @@ def main():
             print(f"[INFO] Decode outputs + cache match (hash={decode_hash[:12]}); skipping decode.")
         else:
             out_dir    = decode_out_dir
-            cmd = ['perl', decode, '--merged-dir', merged_dir, '--fixed-bb-file', fixed_bb, '--out-dir', out_dir]
+            cmd = ['perl', decode, '--merged-dir', merged_dir, '--fixed-bb-file', fixed_bb, '--out-dir', out_dir, '--mismatch', args.mismatch]
             print(f"[INFO] Decode   → MERGED={merged_dir}  FIXED_BB={fixed_bb}  OUT={out_dir}")
             if args.dry_run:
                 print('DRY-RUN:', ' '.join(cmd))
@@ -774,6 +775,7 @@ def main():
             if args.glm_mode: cmd += ['--glm_mode', args.glm_mode]
             if args.glm_top_pct is not None: cmd += ['--glm_top_pct', str(float(args.glm_top_pct))]
             if args.glm_top_k is not None: cmd += ['--glm_top_k', str(int(args.glm_top_k))]
+            if args.force_gpu_top is not None: cmd += ['--force_gpu_top', str(int(args.force_gpu_top))]
             if args.device: cmd += ['--device', args.device]
             if args.dtype: cmd += ['--dtype', args.dtype]
             # Prefilter pass-throughs

@@ -7,7 +7,7 @@
 #   * 로깅(ts/log_msg) + 경고/예외 트랩 공통
 #   * 섹션 레이아웃/주석 규약 통일
 # - 설계 고정:
-#   * Codon은 perfect만, HP/OP/CP는 1-bp mismatch 허용(치환/삽입/삭제; 기존 그대로)
+#   * Codon은 perfect만, HP/OP/CP 1-bp mismatch 허용(치환/삽입/삭제; --mismatch로 제어)
 #   * 길이 윈도우 정책/fastp 기반 Top-K 피크 감지/멀티 윈도우 로직 그대로
 #   * 헤더/출력 컬럼 수(디코딩=35, 언디코딩=7) 검증 그대로
 
@@ -134,6 +134,7 @@ my %OPT = (
     adj_tol            => defined $ENV{ADJ_TOL} ? $ENV{ADJ_TOL}+0 : 3,
     max_cp_cands       => defined $ENV{MAX_CP_CANDS} ? $ENV{MAX_CP_CANDS}+0 : 0,
     max_anchor_cands   => defined $ENV{MAX_ANCHOR_CANDS} ? $ENV{MAX_ANCHOR_CANDS}+0 : 0,
+    mismatch           => $ENV{MISMATCH_MODE} // 'hp_op_cp',
 
     # tag canonical lens (override)
     hp_len             => undef,   # default 8
@@ -171,6 +172,7 @@ GetOptions(
     'adj-tol|J=i'            => \$OPT{adj_tol},
     'max-cp-cands|P=i'       => \$OPT{max_cp_cands},
     'max-anchor-cands|Y=i'   => \$OPT{max_anchor_cands},
+    'mismatch=s'             => \$OPT{mismatch},
     'hp-len|H=i'             => \$OPT{hp_len},
     'op-len|O=i'             => \$OPT{op_len},
     'codon-len|c=i'          => \$OPT{codon_len},
@@ -199,6 +201,8 @@ if ($OPT{help}) { print_usage_and_exit(); }
 my %VALID_DEN = map { $_=>1 } qw(sample_decoded sample_length_passed sample_total_raw library_decoded);
 die "Invalid --scaling-denom: $OPT{scaling_denom}\nAllowed: sample_decoded | sample_length_passed | sample_total_raw | library_decoded\n"
   unless $VALID_DEN{$OPT{scaling_denom}};
+die "Invalid --mismatch: $OPT{mismatch} (use none|hp_op_cp)\n"
+  unless $OPT{mismatch} =~ /^(?:none|hp_op_cp)$/;
 my %VALID_LFM = map { $_=>1 } qw(reject_outside reject_inside);
 die "Invalid --length-filter-mode: $OPT{length_filter_mode}\nAllowed: reject_outside | reject_inside\n"
   unless $VALID_LFM{$OPT{length_filter_mode}};
@@ -325,6 +329,7 @@ sub dump_effective_config {
         adj_tol            => $ADJ_TOL,
         max_cp_cands       => $MAX_CP_CANDS,
         max_anchor_cands   => $MAX_ANCHOR_CANDS,
+        mismatch_mode      => $OPT{mismatch},
     );
     my @pairs = map { "$_=$conf{$_}" } sort keys %conf;
     log_msg("INFO","Effective config: ".join("; ", @pairs));
@@ -361,6 +366,13 @@ sub one_bp_substitution { my ($s)=@_; my @o; my @nuc=qw(A G C T);
 }
 sub remove_dups { my %s; my @u; for my $x(@_){ next if $s{$x}++; push @u,$x } @u }
 sub rc { my ($s)=@_; $s=~tr/ACGT/TGCA/; scalar reverse $s }
+sub mismatch_enabled_for_type {
+    my ($type)=@_;
+    return 0 if $type eq 'CODON';               # hard rule: CODON mismatch disabled
+    return 0 if $OPT{mismatch} eq 'none';
+    return 1 if $OPT{mismatch} eq 'hp_op_cp' && ($type eq 'HP' || $type eq 'OP' || $type eq 'CP');
+    return 0;
+}
 
 # --------- BB 파일 로드 & Trie 구축 ----------
 sub load_fixed_bb_and_build_tries {
@@ -396,30 +408,41 @@ sub load_fixed_bb_and_build_tries {
         } elsif ($type eq "CP"){
             die "CP row missing lib_id at line $ln (type=CP)\n" if $lib_norm eq "";
             my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
-            $CP_TRIE->insert($seq,$info_p,$lib_norm);
-            my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-            # Enforce design invariant: CP variants (1bp sub/indel) must never collide across libraries.
-            for my $s ($seq, @mis) {
-                if (exists $CP_VARIANT_OWNER{$s} && $CP_VARIANT_OWNER{$s} ne $lib_norm) {
-                    die "CP collision across libs (variant=$s): $CP_VARIANT_OWNER{$s} vs $lib_norm\n";
-                }
-                $CP_VARIANT_OWNER{$s} = $lib_norm;
+            # Enforce design invariant: CP sequences must not collide across libraries.
+            if (exists $CP_VARIANT_OWNER{$seq} && $CP_VARIANT_OWNER{$seq} ne $lib_norm) {
+                die "CP collision across libs (seq=$seq): $CP_VARIANT_OWNER{$seq} vs $lib_norm\n";
             }
-            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-            for my $s (@mis){ $CP_TRIE->insert($s,$info_m,$lib_norm); }
+            $CP_VARIANT_OWNER{$seq} = $lib_norm;
+            $CP_TRIE->insert($seq,$info_p,$lib_norm);
+            if (mismatch_enabled_for_type('CP')){
+                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
+                # Enforce design invariant: CP variants (1bp sub/indel) must never collide across libraries.
+                for my $s (@mis) {
+                    if (exists $CP_VARIANT_OWNER{$s} && $CP_VARIANT_OWNER{$s} ne $lib_norm) {
+                        die "CP collision across libs (variant=$s): $CP_VARIANT_OWNER{$s} vs $lib_norm\n";
+                    }
+                    $CP_VARIANT_OWNER{$s} = $lib_norm;
+                }
+                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+                for my $s (@mis){ $CP_TRIE->insert($s,$info_m,$lib_norm); }
+            }
             $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
         } elsif ($type eq "HP"){
             my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
             $HP_TRIE->insert($seq,$info_p,$lib_norm);
-            my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-            for my $s (@mis){ $HP_TRIE->insert($s,$info_m,$lib_norm); }
+            if (mismatch_enabled_for_type('HP')){
+                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
+                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+                for my $s (@mis){ $HP_TRIE->insert($s,$info_m,$lib_norm); }
+            }
         } elsif ($type eq "OP"){
             my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
             $OP_TRIE->insert($seq,$info_p,$lib_norm);
-            my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-            for my $s (@mis){ $OP_TRIE->insert($s,$info_m,$lib_norm); }
+            if (mismatch_enabled_for_type('OP')){
+                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
+                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+                for my $s (@mis){ $OP_TRIE->insert($s,$info_m,$lib_norm); }
+            }
         }
     }
     close($IN);
@@ -1427,6 +1450,7 @@ General
   -x, --max-failed-dump <INT>      Max undecoded dump lines per sample (default: $OPT{max_failed_dump})
   -P, --max-cp-cands <INT>         Max CP candidates to consider (0 = no limit; default: $OPT{max_cp_cands})
   -Y, --max-anchor-cands <INT>     Max HP/OP candidates to consider (0 = no limit; default: $OPT{max_anchor_cands})
+      --mismatch <MODE>            1-bp mismatch indexing: hp_op_cp (default) | none
   -h, --help                       Show this help and exit
 
 Notes
