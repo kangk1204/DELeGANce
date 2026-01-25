@@ -3,22 +3,18 @@
 """
 03_call_hits.py (formerly 03_all_in_one_hitcaller_250829p3.py)
 
-DELeGANce — All‑in‑one: GLM(Rk vs DEL2) + ReadScaler + NEG penalty/gating + NEG-centering + Annotation + Report
+DELeGANce - All-in-one: GLM (Rk vs DEL2) + ReadScaler + NEG penalty/gating + NEG-centering + Annotation + Report
 
 Highlights
 ----------
-- GLM은 모든 효과를 Rk vs DEL2 일관척도로 산출(논문 보고/재현성 ↑).
-- NEG는 과산포 학습(w_neg & fix_neg_poisson), GLM 벌점(Penalty_NEG), q-게이팅, 선택적 하드게이트로 반영.
-- NEG‑Centering: null subset에서의 중앙값으로 LFC_NEG를 센터링하고(표기상 0 근처),
-  선택적으로 max_neg_centered_lfc 초과 레코드를 하드게이팅.
-- ReadScaler: R1/R2 vs BEAD, paired‑boost, q‑value, MAD 기반 분산패널티.
-- Annotation: type==Codon만 (LIB_ID, BB_ID) 우선 매칭(없으면 BB_ID 폴백).
-- 보고물: TSV 일괄 + PNG 플롯 3종 + HTML 요약 리포트.
-
-References (design rationales)
-- Rk vs DEL2 일관척도 GLM 및 HitScore 구조.  [internal ref]  :contentReference[oaicite:3]{index=3}
-- ReadScaler 지표/필터(q‑value, paired‑boost, MAD penalty).       [internal ref]  :contentReference[oaicite:4]{index=4}
-- BB metadata (type==Codon, CP→Codon·BB 매핑 규칙).               [internal ref]  :contentReference[oaicite:5]{index=5}
+- GLM reports all effects on a consistent Rk vs DEL2 scale.
+- NEG handling includes overdispersion learning (w_neg and fix_neg_poisson), GLM penalty (Penalty_NEG),
+  q-gating, and optional hard gating.
+- NEG-centering: center LFC_NEG by the median of the null subset (near 0), optionally hard-gate records
+  exceeding max_neg_centered_lfc.
+- ReadScaler: R1/R2 vs BEAD, paired-boost, q-values, MAD-based variance penalty.
+- Annotation: for type==Codon, prefer (LIB_ID, BB_ID) matching, fallback to BB_ID.
+- Outputs: TSVs, three PNG plots, and an HTML summary report.
 """
 
 import os, sys, argparse, csv, re, math, json, warnings

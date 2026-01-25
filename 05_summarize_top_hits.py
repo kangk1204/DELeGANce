@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,8 +31,10 @@ except Exception:
 _HAS_RDKIT = True
 _RDKIT_IMPORT_ERR = ""
 try:
-    from rdkit import Chem  # type: ignore
-    from rdkit.Chem import Draw  # type: ignore
+    from rdkit import Chem, DataStructs, RDLogger  # type: ignore
+    from rdkit.Chem import Draw, AllChem  # type: ignore
+    from rdkit.ML.Cluster import Butina  # type: ignore
+    RDLogger.DisableLog("rdApp.warning")
 except Exception as e:
     _HAS_RDKIT = False
     _RDKIT_IMPORT_ERR = str(e)
@@ -143,9 +145,176 @@ def build_bb_smiles_map(df_top: pd.DataFrame) -> Dict[str, Dict[str, str]]:
     return out
 
 
-def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, freq_df: pd.DataFrame,
-                           out_html: str, score_col: str, top_n: int, rec_n: int,
-                           bb_smiles_map: Optional[Dict[str, Dict[str, str]]] = None) -> None:
+def _compound_key_from_row(row: pd.Series) -> str:
+    vals = []
+    for col in ["BB1_x", "BB2_x", "BB3_x", "BB4_x"]:
+        if col in row:
+            vals.append(_strip_lib_suffix(row.get(col, "NA")))
+    if not vals:
+        return "NA"
+    return "|".join(vals)
+
+
+def _fp_from_smiles(smiles: str, radius: int, nbits: int):
+    if not isinstance(smiles, str) or not smiles.strip():
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    if not mol:
+        return None
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
+
+
+def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    scores = pd.to_numeric(df.get(primary_col, np.nan), errors="coerce").fillna(float("-inf")).to_numpy()
+    if "rank_pct" in df.columns:
+        rank_pct = pd.to_numeric(df["rank_pct"], errors="coerce").fillna(0.0).to_numpy()
+    elif "HitScore_pct" in df.columns:
+        rank_pct = pd.to_numeric(df["HitScore_pct"], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        rank_pct = np.zeros(len(df), dtype=float)
+
+    cpm_cols = [c for c in df.columns if c.endswith("_CPM")]
+    raw_cols = [c[:-4] for c in cpm_cols if c[:-4] in df.columns]
+    if cpm_cols:
+        cpm_mean = (
+            df[cpm_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).mean(axis=1).to_numpy()
+        )
+    else:
+        cpm_mean = np.zeros(len(df), dtype=float)
+    if raw_cols:
+        raw_sum = (
+            df[raw_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1).to_numpy()
+        )
+    else:
+        raw_sum = np.zeros(len(df), dtype=float)
+    return scores, rank_pct, cpm_mean, raw_sum
+
+
+def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
+                      radius: int, nbits: int) -> (pd.DataFrame, Optional[pd.DataFrame]):
+    if not _HAS_RDKIT:
+        print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
+        out = df_top.copy()
+        out["cluster_id"] = "NA"
+        out["cluster_size"] = 0
+        out["cluster_rep"] = 0
+        return out, None
+
+    smi_cols = [c for c in ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles"] if c in df_top.columns]
+    if not smi_cols:
+        print("[WARN] No bb*_smiles columns available; clustering skipped.")
+        out = df_top.copy()
+        out["cluster_id"] = "NA"
+        out["cluster_size"] = 0
+        out["cluster_rep"] = 0
+        return out, None
+
+    fps = []
+    valid_pos = []
+    for i, row in df_top.reset_index(drop=True).iterrows():
+        fp = None
+        for col in smi_cols:
+            smi = row.get(col, "")
+            fpi = _fp_from_smiles(smi, radius, nbits)
+            if fpi is None:
+                continue
+            fp = fpi if fp is None else (fp | fpi)
+        if fp is None:
+            fps.append(None)
+        else:
+            fps.append(fp)
+            valid_pos.append(i)
+
+    if not valid_pos:
+        print("[WARN] No valid fingerprints; clustering skipped.")
+        out = df_top.copy()
+        out["cluster_id"] = "NA"
+        out["cluster_size"] = 0
+        out["cluster_rep"] = 0
+        return out, None
+
+    valid_fps = [fps[i] for i in valid_pos]
+    dists = []
+    for i in range(1, len(valid_fps)):
+        sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
+        dists.extend([1.0 - s for s in sims])
+    cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
+    clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
+
+    out = df_top.reset_index(drop=True).copy()
+    out["cluster_id"] = "NA"
+    out["cluster_size"] = 0
+    out["cluster_rep"] = 0
+    out["cluster_medoid"] = 0
+
+    scores, rank_pct, cpm_mean, raw_sum = _tie_break_arrays(out, score_col)
+    cluster_rows = []
+    for cid, members in enumerate(clusters, start=1):
+        members_pos = [valid_pos[i] for i in members]
+        if not members_pos:
+            continue
+        size = len(members_pos)
+        best_pos = max(
+            members_pos,
+            key=lambda idx: (scores[idx], rank_pct[idx], cpm_mean[idx], raw_sum[idx], -idx),
+        )
+        if len(members) == 1:
+            medoid_valid = members[0]
+            medoid_pos = members_pos[0]
+            medoid_avg = 1.0
+        else:
+            medoid_scores: Dict[int, float] = {}
+            for i in members:
+                others = [valid_fps[j] for j in members if j != i]
+                sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
+                medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+            medoid_valid = max(
+                members,
+                key=lambda i: (
+                    medoid_scores.get(i, 0.0),
+                    scores[valid_pos[i]],
+                    rank_pct[valid_pos[i]],
+                    cpm_mean[valid_pos[i]],
+                    raw_sum[valid_pos[i]],
+                    -valid_pos[i],
+                ),
+            )
+            medoid_pos = valid_pos[medoid_valid]
+            medoid_avg = medoid_scores.get(medoid_valid, 0.0)
+        for idx in members_pos:
+            out.at[idx, "cluster_id"] = cid
+            out.at[idx, "cluster_size"] = size
+            out.at[idx, "cluster_rep"] = 1 if idx == best_pos else 0
+            out.at[idx, "cluster_medoid"] = 1 if idx == medoid_pos else 0
+        rep = out.loc[best_pos]
+        medoid = out.loc[medoid_pos]
+        cluster_rows.append({
+            "cluster_id": cid,
+            "cluster_size": size,
+            "rep_index": int(best_pos),
+            "rep_ID_x": rep.get("ID_x", "NA"),
+            "rep_score": float(rep.get(score_col, np.nan)) if pd.notna(rep.get(score_col, np.nan)) else np.nan,
+            "rep_BB1_x": rep.get("BB1_x", "NA"),
+            "rep_BB2_x": rep.get("BB2_x", "NA"),
+            "rep_BB3_x": rep.get("BB3_x", "NA"),
+            "rep_BB4_x": rep.get("BB4_x", "NA"),
+            "rep_CP_x": rep.get("CP_x", "NA"),
+            "rep_compound_key": _compound_key_from_row(rep),
+            "medoid_index": int(medoid_pos),
+            "medoid_ID_x": medoid.get("ID_x", "NA"),
+            "medoid_score": float(medoid.get(score_col, np.nan)) if pd.notna(medoid.get(score_col, np.nan)) else np.nan,
+            "medoid_compound_key": _compound_key_from_row(medoid),
+            "medoid_avg_sim": float(medoid_avg),
+        })
+
+    cluster_df = pd.DataFrame(cluster_rows)
+    return out, cluster_df
+
+
+def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, diverse: pd.DataFrame,
+                           freq_df: pd.DataFrame, out_html: str, score_col: str,
+                           top_n: int, rec_n: int, bb_smiles_map: Optional[Dict[str, Dict[str, str]]] = None,
+                           cluster_summary: Optional[Dict[str, str]] = None) -> None:
     if not _HAS_BOKEH:
         print("[WARN] bokeh is not available; skipping interactive HTML output.")
         return
@@ -156,7 +325,10 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, freq_df: pd.
     y_col = _pick_y_column(cols, score_col)
 
     df_plot = df_top.copy()
-    df_plot["rank"] = np.arange(1, len(df_plot) + 1, dtype=int)
+    if "rank" not in df_plot.columns:
+        df_plot["rank"] = np.arange(1, len(df_plot) + 1, dtype=int)
+    else:
+        df_plot["rank"] = pd.to_numeric(df_plot["rank"], errors="coerce").fillna(0).astype(int)
     if "Consensus_hit" in df_plot.columns:
         df_plot["consensus_label"] = _to_int_series(df_plot["Consensus_hit"]).map({1: "pass"}).fillna("fail")
     else:
@@ -171,9 +343,12 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, freq_df: pd.
     else:
         df_plot["size"] = 8.0
 
-    for col in ["ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "LIB_ID_x"]:
+    for col in ["ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "LIB_ID_x", "cluster_id"]:
         if col not in df_plot.columns:
             df_plot[col] = "NA"
+    for col in ["cluster_size", "cluster_rep", "cluster_medoid"]:
+        if col not in df_plot.columns:
+            df_plot[col] = 0
 
     cds = ColumnDataSource(df_plot)
     hover = HoverTool(tooltips=[
@@ -185,6 +360,8 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, freq_df: pd.
         ("BB3", "@BB3_x"),
         ("BB4", "@BB4_x"),
         ("CP", "@CP_x"),
+        ("cluster", "@cluster_id"),
+        ("cluster_size", "@cluster_size"),
         (score_col, f"@{{{score_col}}}"),
         (y_col, f"@{{{y_col}}}"),
     ])
@@ -248,44 +425,58 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, freq_df: pd.
 """))
             bb_plots.append(p)
 
-    # Recommended hits table
-    table_cols = []
-    table_fields = []
-    for name in ["ID_x", "HitScore_GLM", "HitScore_RS", "BB1_x", "BB2_x", "BB3_x", "BB4_x",
-                 "CP_x", "LFC_R1_vs_DEL2", "LFC_R2_vs_DEL2", "q_BEAD", "q_BEAD_R2", "q_BoostPaired"]:
-        if name in rec.columns:
-            table_fields.append(name)
-    rec_table = rec[table_fields].copy() if table_fields else rec.copy()
-    for col in rec_table.columns:
-        if rec_table[col].dtype.kind in "if":
-            rec_table[col] = rec_table[col].round(4)
-            table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000")))
-        else:
-            table_cols.append(TableColumn(field=col, title=col))
-
-    table = None
-    if not rec_table.empty and table_cols:
-        table = DataTable(
-            source=ColumnDataSource(rec_table),
+    def _make_table(src: pd.DataFrame) -> Optional[DataTable]:
+        if src is None or src.empty:
+            return None
+        table_cols = []
+        table_fields = []
+        for name in ["rank", "ID_x", "HitScore_GLM", "HitScore_RS", "cluster_id", "cluster_size", "cluster_rep", "cluster_medoid",
+                     "BB1_x", "BB2_x", "BB3_x", "BB4_x",
+                     "CP_x", "LFC_R1_vs_DEL2", "LFC_R2_vs_DEL2", "q_BEAD", "q_BEAD_R2", "q_BoostPaired"]:
+            if name in src.columns:
+                table_fields.append(name)
+        table_df = src[table_fields].copy() if table_fields else src.copy()
+        for col in table_df.columns:
+            if table_df[col].dtype.kind in "if":
+                if col in ("rank", "cluster_size", "cluster_rep", "cluster_medoid"):
+                    table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).astype(int)
+                    table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0")))
+                else:
+                    table_df[col] = table_df[col].round(4)
+                    table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000")))
+            else:
+                table_cols.append(TableColumn(field=col, title=col))
+        if not table_cols:
+            return None
+        return DataTable(
+            source=ColumnDataSource(table_df),
             columns=table_cols,
             height=280,
             width=1200,
             index_position=None,
         )
 
+    rec_table = _make_table(rec)
+    div_table = _make_table(diverse)
+
     info = Div(text=(
         f"<h2>Top {top_n} hit summary</h2>"
         f"<ul>"
         f"<li>Score column: <b>{score_col}</b></li>"
         f"<li>Recommended hits: <b>{len(rec)}</b> (target {rec_n})</li>"
+        f"<li>Diverse hits: <b>{len(diverse)}</b> (cluster representatives)</li>"
+        f"{'' if not cluster_summary else cluster_summary.get('html', '')}"
         f"<li>Color: blue=Consensus_hit pass, gray=others</li>"
         f"</ul>"
     ))
 
     items = [info, p_scatter]
-    if table is not None:
+    if rec_table is not None:
         items.append(Div(text="<h3>Recommended hits</h3>"))
-        items.append(table)
+        items.append(rec_table)
+    if div_table is not None:
+        items.append(Div(text="<h3>Diverse hits (cluster reps)</h3>"))
+        items.append(div_table)
     if bb_plots:
         items.append(Div(text="<h3>BB frequency in top hits</h3>"))
         items.extend(bb_plots)
@@ -305,6 +496,16 @@ def main() -> int:
     ap.add_argument("--recommend-n", type=int, default=10, help="Number of recommended hits to return")
     ap.add_argument("--bb-top-k", type=int, default=5, help="Top K BB frequencies per BB column")
     ap.add_argument("--score-col", default=None, help="Override score column (default: HitScore_GLM)")
+    ap.add_argument("--cluster", type=int, choices=[0,1], default=1,
+                    help="Enable clustering from BB SMILES (requires RDKit).")
+    ap.add_argument("--cluster-sim", type=float, default=0.7,
+                    help="Tanimoto similarity cutoff (default: 0.7)")
+    ap.add_argument("--cluster-radius", type=int, default=2,
+                    help="Morgan fingerprint radius (default: 2)")
+    ap.add_argument("--cluster-nbits", type=int, default=2048,
+                    help="Morgan fingerprint nBits (default: 2048)")
+    ap.add_argument("--cluster-rep", choices=["score", "medoid"], default="score",
+                    help="Representative selection for diverse lists (default: score)")
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: derived from input dir)")
     ap.add_argument("--html-out", default=None, help="Write interactive HTML to this path")
     ap.add_argument("--no-html", action="store_true", help="Skip interactive HTML output")
@@ -313,6 +514,7 @@ def main() -> int:
     top_n = max(1, int(args.top_n))
     rec_n = max(1, int(args.recommend_n))
     bb_top_k = max(1, int(args.bb_top_k))
+    rep_col = "cluster_medoid" if args.cluster_rep == "medoid" else "cluster_rep"
 
     hybrid = resolve_hybrid_path(args.output_dir, args.preset)
     out_dir = os.path.dirname(hybrid)
@@ -343,7 +545,29 @@ def main() -> int:
     df = pd.read_csv(hybrid, sep="\t", usecols=usecols)
     df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(float("-inf"))
 
-    df_top = df.sort_values(score_col, ascending=False).head(top_n).copy()
+    df_top = df.sort_values(score_col, ascending=False).head(top_n).copy().reset_index(drop=True)
+    df_top["rank"] = np.arange(1, len(df_top) + 1, dtype=int)
+
+    cluster_df = None
+    cluster_summary = None
+    if int(args.cluster) == 1:
+        df_top, cluster_df = _cluster_top_hits(
+            df_top,
+            score_col=score_col,
+            sim_cutoff=float(args.cluster_sim),
+            radius=int(args.cluster_radius),
+            nbits=int(args.cluster_nbits),
+        )
+        if cluster_df is not None and not cluster_df.empty:
+            cluster_path = f"{prefix}_clusters.tsv"
+            cluster_df.to_csv(cluster_path, sep="\t", index=False)
+            cluster_summary = {
+                "html": (
+                    f"<li>Clusters: <b>{len(cluster_df)}</b> (Tanimoto >= {args.cluster_sim}, "
+                    f"rep={args.cluster_rep})</li>"
+                ),
+                "path": cluster_path,
+            }
 
     # BB frequencies (BB ID based; include LIB_ID list in metadata)
     bb_cols = [c for c in ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"] if c in df_top.columns]
@@ -401,22 +625,33 @@ def main() -> int:
 
     rec = rec.sort_values(score_col, ascending=False).head(rec_n).copy()
 
+    diverse = rec.copy()
+    if rep_col in diverse.columns:
+        diverse = diverse[_to_int_series(diverse[rep_col]) == 1].copy()
+    diverse = diverse.sort_values(score_col, ascending=False).copy()
+
     # Save tables
     top_path = f"{prefix}_hits.tsv"
     rec_path = f"{prefix}_recommended.tsv"
+    diverse_path = f"{prefix}_diverse.tsv"
     df_top.to_csv(top_path, sep="\t", index=False)
     rec.to_csv(rec_path, sep="\t", index=False)
+    diverse.to_csv(diverse_path, sep="\t", index=False)
 
     html_path = args.html_out or f"{prefix}_interactive.html"
     if not args.no_html:
         bb_smiles_map = build_bb_smiles_map(df_top)
-        build_interactive_html(df_top, rec, freq_df, html_path, score_col, top_n, rec_n, bb_smiles_map)
+        build_interactive_html(df_top, rec, diverse, freq_df, html_path, score_col, top_n, rec_n,
+                               bb_smiles_map, cluster_summary)
 
     # Console summary
     print(f"[INFO] input={hybrid}")
     print(f"[INFO] score_col={score_col}")
     print(f"[INFO] top_n={len(df_top)}  recommended={len(rec)}")
-    print(f"[INFO] outputs: {top_path}, {rec_path}, {freq_path}" + ("" if args.no_html else f", {html_path}"))
+    extra = f", {diverse_path}"
+    if cluster_summary and cluster_summary.get("path"):
+        extra += f", {cluster_summary['path']}"
+    print(f"[INFO] outputs: {top_path}, {rec_path}, {freq_path}{extra}" + ("" if args.no_html else f", {html_path}"))
     if bb_cols and not freq_df.empty:
         print("[INFO] most frequent BB per column:")
         for col in bb_cols:

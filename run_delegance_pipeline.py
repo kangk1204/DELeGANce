@@ -46,7 +46,7 @@ import re
 from html import escape as _html_escape
 
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
-MERGED_FASTQ_RE = re.compile(r'(?:\\.fpmerged\\.fq(?:\\.gz)?|_merged\\.(?:fq|fastq)(?:\\.gz)?)$', re.IGNORECASE)
+MERGED_FASTQ_RE = re.compile(r'(?:\.fpmerged\.fq(?:\.gz)?|_merged\.(?:fq|fastq)(?:\.gz)?)$', re.IGNORECASE)
 
 
 def _timestamp() -> str:
@@ -83,7 +83,6 @@ def run_cmd(cmd, log_file: str, env=None) -> int:
 def _has_interactive_deps() -> bool:
     try:
         import bokeh  # noqa: F401
-        import narwhals  # noqa: F401
         return True
     except Exception:
         return False
@@ -155,6 +154,16 @@ def _estimate_rows(path: str) -> int:
     """Heuristically estimate row count for (possibly gzipped) TSV, ignoring header."""
     try:
         import subprocess, gzip, shlex
+        if path.endswith('.gz') and os.path.isfile(path):
+            if shutil.which('gzip') and shutil.which('wc'):
+                cmd = f"gzip -cd {shlex.quote(path)} | wc -l"
+                out = subprocess.check_output(['bash', '-lc', cmd], text=True).strip()
+                return max(0, int(out) - 1)
+            cnt = 0
+            with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+                for _ in f:
+                    cnt += 1
+            return max(0, cnt - 1)
         if os.path.isfile(path):
             if shutil.which('wc'):
                 out = subprocess.check_output(['wc', '-l', path], text=True).strip().split()[0]
@@ -379,6 +388,8 @@ def build_parser():
                    help='When --glm-mode=top, percentage of IDs to GLM (e.g., 1=top 1%%)')
     p.add_argument('--glm-top-k', type=int, default=None,
                    help='When --glm-mode=top, cap absolute number of IDs to GLM')
+    p.add_argument('--force-gpu-top', type=int, choices=[0,1], default=None,
+                   help='Force GPU for glm_mode=top via DELEGANCE_FORCE_GPU_TOP (0/1)')
 
     # Device/dtype pass-through for GLM acceleration
     p.add_argument('--device', default=None, help='Device for GLM: cpu, cuda, cuda:0 ...')
@@ -557,7 +568,11 @@ def main():
             if args.dry_run:
                 print('DRY-RUN:', ' '.join(cmd))
             else:
-                rc = run_cmd(cmd, master_log)
+                hit_env = None
+                if args.force_gpu_top is not None:
+                    hit_env = os.environ.copy()
+                    hit_env["DELEGANCE_FORCE_GPU_TOP"] = str(int(args.force_gpu_top))
+                rc = run_cmd(cmd, master_log, env=hit_env)
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] Preprocess failed; aborting.')
                     return rc
@@ -830,17 +845,17 @@ def main():
             bbinfo_fixed = os.path.join(run_root_abs, 'BB_information_fixed.tsv')
             if os.path.isfile(hybrid_tsv):
                 if not _has_interactive_deps():
-                    print("[WARN] Interactive HTML skipped: missing bokeh/narwhals.")
+                    print("[WARN] Interactive HTML skipped: missing bokeh (add narwhals if bokeh requests it).")
                 else:
                     cmd = [
                         'python3', _pick_script(['04_build_interactive_report.py','04_hit_finder.py','04_hit_finder_250816p2.py']),
                         '--master_tsv', hybrid_tsv,
                         '--bbinfo', bbinfo_fixed,
-                    '--out', interactive_html,
-                    '--top_hitscore', '10000',
-                    '--plot_height', '260',
-                ]
-                print(f"[INFO] Interactive (Bokeh) → {interactive_html}")
+                        '--out', interactive_html,
+                        '--top_hitscore', '10000',
+                        '--plot_height', '260',
+                    ]
+                    print(f"[INFO] Interactive (Bokeh) → {interactive_html}")
                     if args.dry_run:
                         print('DRY-RUN:', ' '.join(cmd))
                     else:
@@ -893,8 +908,8 @@ def main():
                         if os.path.isfile(os.path.join(abs_dir, fname)):
                             popouts.append(f"<a href='{_h(rel_path)}/{fname}'>{label}</a>")
                     if popouts:
-                        items.append(f\"<li>Pop-outs: {' · '.join(popouts)}</li>\")
-                    iframe = f\"<iframe src='{_h(rel_path)}/interactive_hits.html'></iframe>\"
+                        items.append(f"<li>Pop-outs: {' · '.join(popouts)}</li>")
+                    iframe = f"<iframe src='{_h(rel_path)}/interactive_hits.html'></iframe>"
                 return items, iframe
 
             html = [

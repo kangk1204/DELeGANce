@@ -491,6 +491,33 @@ def read_single_row_tsv(path):
     return {header[i]: row[i] for i in range(min(len(header), len(row)))}
 
 
+def read_table_by_sample(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, 'r') as f:
+        header = f.readline().rstrip('\n').split('\t')
+        idx = {h: i for i, h in enumerate(header)}
+        s_i = idx.get('sample')
+        if s_i is None:
+            return {}
+        out = {}
+        for line in f:
+            row = line.rstrip('\n').split('\t')
+            if len(row) <= s_i:
+                continue
+            sample = row[s_i]
+            out[sample] = {header[i]: row[i] if i < len(row) else '' for i in range(len(header))}
+        return out
+
+
+def list_samples_from_decoded(decoded_dir):
+    samples = []
+    for fn in os.listdir(decoded_dir):
+        if fn.startswith('decoded_reads_') and fn.endswith('.tsv'):
+            samples.append(fn[len('decoded_reads_'):-4])
+    return sorted(samples)
+
+
 def read_reason_counts(path):
     counts = Counter()
     with open(path, 'r') as f:
@@ -508,12 +535,32 @@ def read_reason_counts(path):
 
 
 def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
-                          lib_expected_cycles, len_conf, progress_every=1000000, log=None):
+                          lib_expected_cycles, len_conf, progress_every=1000000, log=None,
+                          max_lines=0, sample_n=0, sample_seed=2026):
     counts = Counter()
     with open(path, 'r') as f:
         header = f.readline().rstrip('\n').split('\t')
         idx = {h:i for i,h in enumerate(header)}
-        for line_no, line in enumerate(f, 1):
+        line_no = 0
+        if sample_n and sample_n > 0:
+            rng = random.Random(sample_seed)
+            sample_lines = []
+            for i, line in enumerate(f, 1):
+                if len(sample_lines) < sample_n:
+                    sample_lines.append(line)
+                else:
+                    j = rng.randint(0, i - 1)
+                    if j < sample_n:
+                        sample_lines[j] = line
+            if log:
+                log(f"  sampled {len(sample_lines):,} decoded reads (reservoir)")
+            lines_iter = enumerate(sample_lines, 1)
+        else:
+            lines_iter = enumerate(f, 1)
+
+        for line_no, line in lines_iter:
+            if not sample_n and max_lines and line_no > max_lines:
+                break
             row = line.rstrip('\n').split('\t')
             if len(row) != len(header):
                 counts['row_len_mismatch'] += 1
@@ -651,8 +698,13 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
             else:
                 counts['pass'] += 1
 
-            if progress_every and log and line_no % progress_every == 0:
+            if not sample_n and progress_every and log and line_no % progress_every == 0:
                 log(f"  validated {line_no:,} lines")
+
+        if sample_n and sample_n > 0:
+            counts['validated_lines'] = len(sample_lines)
+        else:
+            counts['validated_lines'] = line_no
 
     return counts
 
@@ -673,7 +725,8 @@ def parse_length_conf(row):
         return None
 
 
-def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_sample=0, sample_seed=2026):
+def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_sample=0,
+                sample_seed=2026, decoded_max_lines=0, decoded_sample=0):
     out = {
         'name': run_name,
         'dir': run_dir,
@@ -693,49 +746,86 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
     }
 
     sample_dirs = sorted([d for d in os.listdir(run_dir) if d.startswith('02_decoded_')])
-    for sd in sample_dirs:
-        sample = sd.replace('02_decoded_', '')
-        sdir = os.path.join(run_dir, sd)
+    decoded_root = os.path.join(run_dir, '02_decoded')
+    use_legacy = bool(sample_dirs)
+    if not use_legacy and os.path.isdir(decoded_root):
+        sample_stats_map = read_table_by_sample(os.path.join(decoded_root, 'sample_stats.tsv'))
+        decoding_summary_map = read_table_by_sample(os.path.join(decoded_root, 'decoding_summary.tsv'))
+        qc_map = read_table_by_sample(os.path.join(decoded_root, 'qc_checks.tsv'))
+        length_stats_map = read_table_by_sample(os.path.join(decoded_root, 'length_window_stats.tsv'))
+        samples = list_samples_from_decoded(decoded_root)
+        if not samples:
+            samples = sorted(set(sample_stats_map) | set(decoding_summary_map) | set(qc_map))
+    else:
+        samples = [d.replace('02_decoded_', '') for d in sample_dirs]
+
+    for sample in samples:
+        sdir = os.path.join(run_dir, f'02_decoded_{sample}') if use_legacy else decoded_root
         s = {}
 
         log(f"[{run_name}] sample={sample} start")
 
-        ss_path = os.path.join(sdir, 'sample_stats.tsv')
-        if os.path.exists(ss_path):
-            ss = read_single_row_tsv(ss_path)
+        ss = None
+        if use_legacy:
+            ss_path = os.path.join(sdir, 'sample_stats.tsv')
+            if os.path.exists(ss_path):
+                ss = read_single_row_tsv(ss_path)
+        else:
+            ss = sample_stats_map.get(sample)
+        if ss:
             s['sample_stats'] = ss
             out['totals']['total_reads'] += int(ss['total_reads'])
             out['totals']['length_passed_reads'] += int(ss['length_passed_reads'])
             out['totals']['decoded_reads'] += int(ss['decoded_reads'])
 
-        ds_path = os.path.join(sdir, 'decoding_summary.tsv')
-        if os.path.exists(ds_path):
-            ds = read_single_row_tsv(ds_path)
+        ds = None
+        if use_legacy:
+            ds_path = os.path.join(sdir, 'decoding_summary.tsv')
+            if os.path.exists(ds_path):
+                ds = read_single_row_tsv(ds_path)
+        else:
+            ds = decoding_summary_map.get(sample)
+        if ds:
             s['decoding_summary'] = ds
             for k in ('no_cp', 'no_op', 'no_hp', 'codon_fail', 'len_out_of_range', 'order_violation'):
                 out['decode_fail_totals'][k] += int(ds.get(k, 0))
 
-        qc_path = os.path.join(sdir, 'qc_checks.tsv')
-        if os.path.exists(qc_path):
-            qc = read_single_row_tsv(qc_path)
+        qc = None
+        if use_legacy:
+            qc_path = os.path.join(sdir, 'qc_checks.tsv')
+            if os.path.exists(qc_path):
+                qc = read_single_row_tsv(qc_path)
+        else:
+            qc = qc_map.get(sample)
+        if qc:
             s['qc_checks'] = qc
             for k in ('codon_len_not9', 'order_violation', 'cp_len_out_of_27_29'):
                 out['qc_totals'][k] += int(qc.get(k, 0))
 
         und_path = None
-        for fn in os.listdir(sdir):
-            if fn.startswith('undecoded_reads_') and fn.endswith('.tsv'):
-                und_path = os.path.join(sdir, fn)
-                break
+        und_file = f"undecoded_reads_{sample}.tsv"
+        und_cand = os.path.join(sdir, und_file)
+        if os.path.exists(und_cand):
+            und_path = und_cand
+        else:
+            for fn in os.listdir(sdir):
+                if fn.startswith('undecoded_reads_') and fn.endswith('.tsv'):
+                    und_path = os.path.join(sdir, fn)
+                    break
         if und_path:
             rc = read_reason_counts(und_path)
             s['undecoded_reason_counts'] = dict(rc)
             out['undecoded_reason_totals'].update(rc)
 
         len_conf = None
-        len_path = os.path.join(sdir, 'length_window_stats.tsv')
-        if os.path.exists(len_path):
-            lc = read_single_row_tsv(len_path)
+        lc = None
+        if use_legacy:
+            len_path = os.path.join(sdir, 'length_window_stats.tsv')
+            if os.path.exists(len_path):
+                lc = read_single_row_tsv(len_path)
+        else:
+            lc = length_stats_map.get(sample)
+        if lc:
             len_conf = parse_length_conf(lc)
             s['length_window_stats'] = lc
             s['length_conf'] = len_conf
@@ -744,16 +834,22 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
             out['length_conf_missing_samples'] += 1
 
         dec_path = None
-        for fn in os.listdir(sdir):
-            if fn.startswith('decoded_reads_') and fn.endswith('.tsv'):
-                dec_path = os.path.join(sdir, fn)
-                break
+        dec_file = f"decoded_reads_{sample}.tsv"
+        dec_cand = os.path.join(sdir, dec_file)
+        if os.path.exists(dec_cand):
+            dec_path = dec_cand
+        else:
+            for fn in os.listdir(sdir):
+                if fn.startswith('decoded_reads_') and fn.endswith('.tsv'):
+                    dec_path = os.path.join(sdir, fn)
+                    break
         if dec_path:
             vc = validate_decoded_file(
                 dec_path, adj_tol,
                 bb['hp_sets'], bb['op_sets'], bb['cp_sets'], bb['codon_sets'],
                 bb['lib_expected_cycles'], len_conf,
-                progress_every, log
+                progress_every, log, max_lines=decoded_max_lines,
+                sample_n=decoded_sample, sample_seed=sample_seed
             )
             s['validation'] = dict(vc)
             out['validation_totals'].update(vc)
@@ -776,7 +872,7 @@ def write_summary_tsv(out_path, runs):
         'run','sample','total_reads','length_passed_reads','decoded_reads','decode_rate_pct',
         'no_cp','no_op','no_hp','codon_fail','len_out_of_range','order_violation',
         'qc_codon_len_not9','qc_order_violation','qc_cp_len_out_of_27_29',
-        'validation_pass','validation_fail','validation_cycles_mismatch','validation_length_filter_reject','validation_lib_unknown',
+        'validation_sampled','validation_pass','validation_fail','validation_cycles_mismatch','validation_length_filter_reject','validation_lib_unknown',
         'length_conf_missing',
         'undecoded_sampled','undecoded_unexpected_decoded','undecoded_len_reject','undecoded_reason_len_mismatch'
     ]
@@ -805,6 +901,7 @@ def write_summary_tsv(out_path, runs):
                     'qc_codon_len_not9': qc.get('codon_len_not9', '0'),
                     'qc_order_violation': qc.get('order_violation', '0'),
                     'qc_cp_len_out_of_27_29': qc.get('cp_len_out_of_27_29', '0'),
+                    'validation_sampled': str(vc.get('validated_lines', 0)),
                     'validation_pass': str(vc.get('pass', 0)),
                     'validation_fail': str(vc.get('fail', 0)),
                     'validation_cycles_mismatch': str(vc.get('cycles_mismatch', 0)),
@@ -827,6 +924,10 @@ def main():
     ap.add_argument('--out-tsv', required=True)
     ap.add_argument('--progress-every', type=int, default=1000000)
     ap.add_argument('--undecoded-sample', type=int, default=0)
+    ap.add_argument('--decoded-max-lines', type=int, default=0,
+                    help="Max decoded lines to validate per sample (0 = all; for quick sampling)")
+    ap.add_argument('--decoded-sample', type=int, default=0,
+                    help="Randomly sample N decoded reads per sample (0 = disabled; uses reservoir sampling)")
     ap.add_argument('--sample-seed', type=int, default=2026)
     ap.add_argument('--log', required=True)
     args = ap.parse_args()
@@ -846,7 +947,8 @@ def main():
         log(f"Start run: {name} dir={rdir} adj_tol={adj_tol}")
         runs.append(collect_run(
             name, rdir, adj_tol, bb, args.progress_every, log,
-            undecoded_sample=args.undecoded_sample, sample_seed=args.sample_seed
+            undecoded_sample=args.undecoded_sample, sample_seed=args.sample_seed,
+            decoded_max_lines=args.decoded_max_lines, decoded_sample=args.decoded_sample
         ))
         log(f"End run: {name}")
 

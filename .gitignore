@@ -63,5 +63,5 @@ DELeGANce_out_fin/
 local_target_map.tsv
 local_target_map.json
 
-# Local KRAS batch script (not tracked)
-01_KRAS_batch_final.sh
+# Local batch scripts (not tracked)
+01_*_batch_final.sh
