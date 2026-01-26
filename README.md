@@ -455,6 +455,7 @@ Notes:
   Picks cluster reps first, then fills from all hits in each group. When any `--final-*-n` is set, it overrides
   `--final-hits` for the HTML Final hits tab.
 - Group ranking default is enrichment-based: per-group median CPM (fallback to raw counts if CPM unavailable).
+  Enrichment excludes NEG samples (`--neg-samples`) and DEL234 by default.
   Use `--rank-by specificity` to revert to specificity-based ranking. Adjust aggregation with `--enrich-agg`
   (`median|mean|max`) and common-group logic with `--common-enrich` (`min|mean|gmean`).
 - HTML pagination: `--table-page-size 50` controls rows per page; the table height expands to show the full page (no vertical scroll). `--max-table` caps total rows loaded per table.

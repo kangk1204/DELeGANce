@@ -236,6 +236,18 @@ def _neg_thresholds_for_run(df_best: pd.DataFrame, sample_cols: List[str], prefi
     return thresholds
 
 
+def _filter_enrich_cols(prefixed_cols: List[str], prefix: str,
+                        exclude_bases: set) -> List[str]:
+    out = []
+    for col in prefixed_cols:
+        base = col[len(prefix):] if prefix and col.startswith(prefix) else col
+        base_no_cpm = base[:-4] if base.endswith("_CPM") else base
+        if base_no_cpm.upper() in exclude_bases:
+            continue
+        out.append(col)
+    return out
+
+
 def _row_agg(df: pd.DataFrame, cols: List[str], agg: str) -> pd.Series:
     if not cols:
         return pd.Series([np.nan] * len(df), index=df.index)
@@ -1373,10 +1385,11 @@ def main() -> int:
                     out.append(tok)
         return out
 
+    neg_samples = _split_tokens(args.neg_samples)
+
     def _neg_filter(df: pd.DataFrame) -> pd.DataFrame:
         if args.neg_max_pct is None:
             return df
-        neg_samples = _split_tokens(args.neg_samples)
         if not neg_samples:
             return df
         thresholds: Dict[str, float] = {}
@@ -1428,8 +1441,13 @@ def main() -> int:
     df_base["inactive_selectivity_score"] = df_base["inactive_rank_pct"] - df_base["active_rank_pct"]
     df_base["both_specific_score"] = (df_base["active_rank_pct"] + df_base["inactive_rank_pct"]) / 2.0
 
-    active_enrich_cols = _pick_enrich_cols([c for c in active_prefixed if c in df_base.columns])
-    inactive_enrich_cols = _pick_enrich_cols([c for c in inactive_prefixed if c in df_base.columns])
+    exclude_bases = {s.upper() for s in neg_samples} | {"DEL234"}
+    active_enrich_cols = _pick_enrich_cols(
+        _filter_enrich_cols([c for c in active_prefixed if c in df_base.columns], f"{active_label}_", exclude_bases)
+    )
+    inactive_enrich_cols = _pick_enrich_cols(
+        _filter_enrich_cols([c for c in inactive_prefixed if c in df_base.columns], f"{inactive_label}_", exclude_bases)
+    )
     df_base["active_enrich"] = _row_agg(df_base, active_enrich_cols, args.enrich_agg)
     df_base["inactive_enrich"] = _row_agg(df_base, inactive_enrich_cols, args.enrich_agg)
     if args.common_enrich == "mean":
