@@ -1170,8 +1170,8 @@ def main() -> int:
                     help="Summary plot X range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--plot-y-range", default="auto",
                     help="Summary plot Y range 'min,max' or 'auto' (default: auto)")
-    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="coalesced",
-                    help="Sample columns in HTML tables: coalesced (default), prefixed, or both")
+    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="both",
+                    help="Sample columns in HTML tables: coalesced, prefixed, or both (default: both)")
     ap.add_argument("--rank-by", choices=["enrichment", "specificity"], default="enrichment",
                     help="Group ranking basis (default: enrichment)")
     ap.add_argument("--enrich-agg", choices=["median", "mean", "max"], default="median",

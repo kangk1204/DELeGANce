@@ -463,7 +463,7 @@ Notes:
 - HTML tables display missing values as `-` (keeps real values intact without implying zeros).
 - Unprefixed sample columns (e.g., `K_R2C1`, `K_R2C1_CPM`) are coalesced from prefixed run columns when available
   (active → inactive → both). If still missing, they remain `-`.
-- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: coalesced).
+- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: both).
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
   Common (SampleA >= 99 and SampleB >= 99; via `--both-spec-min`).
