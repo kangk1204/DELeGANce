@@ -164,6 +164,17 @@ def _fp_from_smiles(smiles: str, radius: int, nbits: int):
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
 
 
+def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object]]) -> float:
+    sims = []
+    for fa, fb in zip(fps_a, fps_b):
+        if fa is None or fb is None:
+            continue
+        sims.append(DataStructs.TanimotoSimilarity(fa, fb))
+    if not sims:
+        return 0.0
+    return float(sum(sims) / len(sims))
+
+
 def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     scores = pd.to_numeric(df.get(primary_col, np.nan), errors="coerce").fillna(float("-inf")).to_numpy()
     if "rank_pct" in df.columns:
@@ -191,7 +202,7 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
 
 
 def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
-                      radius: int, nbits: int) -> (pd.DataFrame, Optional[pd.DataFrame]):
+                      radius: int, nbits: int, mode: str) -> (pd.DataFrame, Optional[pd.DataFrame]):
     if not _HAS_RDKIT:
         print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
         out = df_top.copy()
@@ -212,18 +223,29 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
     fps = []
     valid_pos = []
     for i, row in df_top.reset_index(drop=True).iterrows():
-        fp = None
-        for col in smi_cols:
-            smi = row.get(col, "")
-            fpi = _fp_from_smiles(smi, radius, nbits)
-            if fpi is None:
-                continue
-            fp = fpi if fp is None else (fp | fpi)
-        if fp is None:
-            fps.append(None)
+        if mode == "compound_or":
+            fp = None
+            for col in smi_cols:
+                smi = row.get(col, "")
+                fpi = _fp_from_smiles(smi, radius, nbits)
+                if fpi is None:
+                    continue
+                fp = fpi if fp is None else (fp | fpi)
+            if fp is None:
+                fps.append(None)
+            else:
+                fps.append(fp)
+                valid_pos.append(i)
         else:
-            fps.append(fp)
-            valid_pos.append(i)
+            row_fps = []
+            for col in smi_cols:
+                smi = row.get(col, "")
+                row_fps.append(_fp_from_smiles(smi, radius, nbits))
+            if any(fp is not None for fp in row_fps):
+                fps.append(row_fps)
+                valid_pos.append(i)
+            else:
+                fps.append(None)
 
     if not valid_pos:
         print("[WARN] No valid fingerprints; clustering skipped.")
@@ -235,9 +257,16 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
 
     valid_fps = [fps[i] for i in valid_pos]
     dists = []
-    for i in range(1, len(valid_fps)):
-        sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
-        dists.extend([1.0 - s for s in sims])
+    if mode == "compound_or":
+        for i in range(1, len(valid_fps)):
+            sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
+            dists.extend([1.0 - s for s in sims])
+    else:
+        for i in range(1, len(valid_fps)):
+            fi = valid_fps[i]
+            for j in range(i):
+                sim = _bbavg_similarity(fi, valid_fps[j])
+                dists.append(1.0 - sim)
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
@@ -265,9 +294,17 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
         else:
             medoid_scores: Dict[int, float] = {}
             for i in members:
-                others = [valid_fps[j] for j in members if j != i]
-                sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
-                medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+                if mode == "compound_or":
+                    others = [valid_fps[j] for j in members if j != i]
+                    sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
+                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+                else:
+                    sims = []
+                    for j in members:
+                        if j == i:
+                            continue
+                        sims.append(_bbavg_similarity(valid_fps[i], valid_fps[j]))
+                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
             medoid_valid = max(
                 members,
                 key=lambda i: (
@@ -498,8 +535,10 @@ def main() -> int:
     ap.add_argument("--score-col", default=None, help="Override score column (default: HitScore_GLM)")
     ap.add_argument("--cluster", type=int, choices=[0,1], default=1,
                     help="Enable clustering from BB SMILES (requires RDKit).")
-    ap.add_argument("--cluster-sim", type=float, default=0.7,
-                    help="Tanimoto similarity cutoff (default: 0.7)")
+    ap.add_argument("--cluster-mode", choices=["bbavg", "compound_or"], default="bbavg",
+                    help="Clustering similarity: bbavg (per-BB avg) or compound_or (OR fingerprint)")
+    ap.add_argument("--cluster-sim", type=float, default=0.8,
+                    help="Tanimoto similarity cutoff (default: 0.8)")
     ap.add_argument("--cluster-radius", type=int, default=2,
                     help="Morgan fingerprint radius (default: 2)")
     ap.add_argument("--cluster-nbits", type=int, default=2048,
@@ -557,14 +596,15 @@ def main() -> int:
             sim_cutoff=float(args.cluster_sim),
             radius=int(args.cluster_radius),
             nbits=int(args.cluster_nbits),
+            mode=str(args.cluster_mode),
         )
         if cluster_df is not None and not cluster_df.empty:
             cluster_path = f"{prefix}_clusters.tsv"
             cluster_df.to_csv(cluster_path, sep="\t", index=False)
             cluster_summary = {
                 "html": (
-                    f"<li>Clusters: <b>{len(cluster_df)}</b> (Tanimoto >= {args.cluster_sim}, "
-                    f"rep={args.cluster_rep})</li>"
+                    f"<li>Clusters: <b>{len(cluster_df)}</b> (mode={args.cluster_mode}, "
+                    f"Tanimoto >= {args.cluster_sim}, rep={args.cluster_rep})</li>"
                 ),
                 "path": cluster_path,
             }

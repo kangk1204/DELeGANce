@@ -216,6 +216,86 @@ def _coalesce_unprefixed_samples(df: pd.DataFrame, base_cols: List[str],
     return out
 
 
+def _sort_sample_cols_by_category(cols: List[str], prefixes: List[str]) -> List[str]:
+    def _natural_key(s: str) -> List[object]:
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\\d+)", s)]
+
+    def _sample_id(col: str, prefix: str) -> str:
+        base = col[len(prefix):] if prefix and col.startswith(prefix) else col
+        return base[:-4] if base.endswith("_CPM") else base
+
+    def _order_group(group_cols: List[str], prefix: str) -> List[str]:
+        sample_ids: List[str] = []
+        for col in group_cols:
+            sid = _sample_id(col, prefix)
+            if sid not in sample_ids:
+                sample_ids.append(sid)
+        ordered_ids = sorted(sample_ids, key=_natural_key)
+        raw_cols: List[str] = []
+        cpm_cols: List[str] = []
+        for sid in ordered_ids:
+            raw = f"{prefix}{sid}" if prefix else sid
+            cpm = f"{raw}_CPM"
+            if raw in group_cols and raw not in raw_cols:
+                raw_cols.append(raw)
+            if cpm in group_cols and cpm not in cpm_cols:
+                cpm_cols.append(cpm)
+        extras = [c for c in group_cols if c not in raw_cols and c not in cpm_cols]
+        extras = sorted(extras, key=_natural_key)
+        return raw_cols + cpm_cols + extras
+
+    seen = set()
+    ordered: List[str] = []
+    base_group = [c for c in cols if not any(c.startswith(p) for p in prefixes)]
+    for col in _order_group(base_group, ""):
+        if col in cols and col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    for prefix in prefixes:
+        pref_group = [c for c in cols if c.startswith(prefix)]
+        for col in _order_group(pref_group, prefix):
+            if col in cols and col not in seen:
+                ordered.append(col)
+                seen.add(col)
+    for col in cols:
+        if col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    return ordered
+
+
+def _dedupe_identical_sample_cols(df: pd.DataFrame, cols: List[str], prefixes: List[str]) -> List[str]:
+    if df is None or df.empty or not cols or not prefixes:
+        return cols
+    prefix_order = {p: i for i, p in enumerate(prefixes)}
+    def _col_prefix(col: str) -> str:
+        for p in prefixes:
+            if col.startswith(p):
+                return p
+        return ""
+    base_groups: Dict[str, List[str]] = {}
+    for col in cols:
+        pref = _col_prefix(col)
+        if not pref:
+            continue
+        base = col[len(pref):]
+        base_groups.setdefault(base, []).append(col)
+    drop: set = set()
+    sentinel = "__NA__"
+    for base, group_cols in base_groups.items():
+        if len(group_cols) < 2:
+            continue
+        group_cols.sort(key=lambda c: prefix_order.get(_col_prefix(c), 0))
+        ref = group_cols[0]
+        ref_series = df[ref].fillna(sentinel)
+        for col in group_cols[1:]:
+            if ref_series.equals(df[col].fillna(sentinel)):
+                drop.add(col)
+    if not drop:
+        return cols
+    return [c for c in cols if c not in drop]
+
+
 def _neg_thresholds_for_run(df_best: pd.DataFrame, sample_cols: List[str], prefix: str,
                             neg_samples: List[str], neg_pct: float) -> Dict[str, float]:
     thresholds: Dict[str, float] = {}
@@ -335,6 +415,17 @@ def _fp_from_smiles(smiles: str, radius: int, nbits: int):
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
 
 
+def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object]]) -> float:
+    sims = []
+    for fa, fb in zip(fps_a, fps_b):
+        if fa is None or fb is None:
+            continue
+        sims.append(DataStructs.TanimotoSimilarity(fa, fb))
+    if not sims:
+        return 0.0
+    return float(sum(sims) / len(sims))
+
+
 def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     scores = pd.to_numeric(df.get(primary_col, np.nan), errors="coerce").fillna(float("-inf")).to_numpy()
     if "rank_pct" in df.columns:
@@ -362,7 +453,7 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
 
 
 def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
-                        radius: int, nbits: int) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+                        radius: int, nbits: int, mode: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     if not _HAS_RDKIT:
         print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
         out = df.copy()
@@ -383,18 +474,29 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
     fps = []
     valid_pos = []
     for i, row in df.reset_index(drop=True).iterrows():
-        fp = None
-        for col in smi_cols:
-            smi = row.get(col, "")
-            fpi = _fp_from_smiles(smi, radius, nbits)
-            if fpi is None:
-                continue
-            fp = fpi if fp is None else (fp | fpi)
-        if fp is None:
-            fps.append(None)
+        if mode == "compound_or":
+            fp = None
+            for col in smi_cols:
+                smi = row.get(col, "")
+                fpi = _fp_from_smiles(smi, radius, nbits)
+                if fpi is None:
+                    continue
+                fp = fpi if fp is None else (fp | fpi)
+            if fp is None:
+                fps.append(None)
+            else:
+                fps.append(fp)
+                valid_pos.append(i)
         else:
-            fps.append(fp)
-            valid_pos.append(i)
+            row_fps = []
+            for col in smi_cols:
+                smi = row.get(col, "")
+                row_fps.append(_fp_from_smiles(smi, radius, nbits))
+            if any(fp is not None for fp in row_fps):
+                fps.append(row_fps)
+                valid_pos.append(i)
+            else:
+                fps.append(None)
 
     if not valid_pos:
         print("[WARN] No valid fingerprints; clustering skipped.")
@@ -406,9 +508,16 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
 
     valid_fps = [fps[i] for i in valid_pos]
     dists = []
-    for i in range(1, len(valid_fps)):
-        sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
-        dists.extend([1.0 - s for s in sims])
+    if mode == "compound_or":
+        for i in range(1, len(valid_fps)):
+            sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
+            dists.extend([1.0 - s for s in sims])
+    else:
+        for i in range(1, len(valid_fps)):
+            fi = valid_fps[i]
+            for j in range(i):
+                sim = _bbavg_similarity(fi, valid_fps[j])
+                dists.append(1.0 - sim)
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
@@ -436,9 +545,17 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         else:
             medoid_scores: Dict[int, float] = {}
             for i in members:
-                others = [valid_fps[j] for j in members if j != i]
-                sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
-                medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+                if mode == "compound_or":
+                    others = [valid_fps[j] for j in members if j != i]
+                    sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
+                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+                else:
+                    sims = []
+                    for j in members:
+                        if j == i:
+                            continue
+                        sims.append(_bbavg_similarity(valid_fps[i], valid_fps[j]))
+                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
             medoid_valid = max(
                 members,
                 key=lambda i: (
@@ -1179,8 +1296,8 @@ def main() -> int:
                     help="Summary plot X range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--plot-y-range", default="auto",
                     help="Summary plot Y range 'min,max' or 'auto' (default: auto)")
-    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="both",
-                    help="Sample columns in HTML tables: coalesced, prefixed, or both (default: both)")
+    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="prefixed",
+                    help="Sample columns in HTML tables: coalesced, prefixed, or both (default: prefixed)")
     ap.add_argument("--rank-by", choices=["enrichment", "specificity"], default="enrichment",
                     help="Group ranking basis (default: enrichment)")
     ap.add_argument("--enrich-agg", choices=["median", "mean", "max"], default="median",
@@ -1223,7 +1340,9 @@ def main() -> int:
                     help="Optional final hits TSV to embed as a tab in the HTML report")
 
     ap.add_argument("--cluster", type=int, choices=[0, 1], default=1)
-    ap.add_argument("--cluster-sim", type=float, default=0.7)
+    ap.add_argument("--cluster-mode", choices=["bbavg", "compound_or"], default="bbavg",
+                    help="Clustering similarity: bbavg (per-BB avg) or compound_or (OR fingerprint)")
+    ap.add_argument("--cluster-sim", type=float, default=0.8)
     ap.add_argument("--cluster-radius", type=int, default=2)
     ap.add_argument("--cluster-nbits", type=int, default=2048)
     ap.add_argument("--cluster-rep", choices=["score", "medoid"], default="score",
@@ -1384,6 +1503,9 @@ def main() -> int:
         for col in prefixed_sample_cols:
             if col in df_base.columns and col not in display_sample_cols:
                 display_sample_cols.append(col)
+    if display_sample_cols:
+        display_sample_cols = _sort_sample_cols_by_category(display_sample_cols, prefixes)
+        display_sample_cols = _dedupe_identical_sample_cols(df_base, display_sample_cols, prefixes)
 
     def _split_tokens(items):
         out = []
@@ -1511,6 +1633,7 @@ def main() -> int:
             sim_cutoff=float(args.cluster_sim),
             radius=int(args.cluster_radius),
             nbits=int(args.cluster_nbits),
+            mode=str(args.cluster_mode),
         )
     else:
         cluster_df = None
@@ -1647,10 +1770,8 @@ def main() -> int:
             )
             final_prefix = os.path.join(args.out_dir, "final_hits")
             final_df.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
-            final_df.to_csv(os.path.join(args.out_dir, f"final_hits_{final_total}.tsv"), sep="\t", index=False)
             try:
                 final_df.to_excel(f"{final_prefix}.xlsx", index=False)
-                final_df.to_excel(os.path.join(args.out_dir, f"final_hits_{final_total}.xlsx"), index=False)
             except Exception as exc:
                 print(f"[WARN] Failed to write final hits Excel ({exc})")
             print(f"[INFO] final_hits: {final_prefix}.tsv")
@@ -1661,7 +1782,6 @@ def main() -> int:
         if final_hits_path is None:
             for candidate in [
                 os.path.join(args.out_dir, "final_hits.tsv"),
-                os.path.join(args.out_dir, "final_hits_40.tsv"),
             ]:
                 if os.path.exists(candidate):
                     final_hits_path = candidate

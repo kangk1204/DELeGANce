@@ -406,8 +406,10 @@ Notes:
 - Recommended hits require Consensus_hit=1, GLM_hit=1, RS_pass=1, NEG_hard_fail=0 (if columns exist)
 - HTML requires bokeh (narwhals may be required depending on bokeh version; BB hover images also require rdkit)
 - BB frequency bars are grouped by BB_ID (structure); hover shows contributing LIB_ID list
-- Clustering uses BB SMILES to build a combined fingerprint and Butina clustering (Tanimoto >= 0.7 by default)
-- Clustering options: `--cluster 0`, `--cluster-sim 0.7`, `--cluster-radius 2`, `--cluster-nbits 2048`
+- Clustering uses BB SMILES with per-BB average similarity (bbavg; soft 2-stage) and Butina clustering
+  (Tanimoto >= 0.8 by default). Use `--cluster-mode compound_or` to revert to OR-combined fingerprints.
+- Clustering options: `--cluster 0`, `--cluster-mode bbavg|compound_or`, `--cluster-sim 0.8`,
+  `--cluster-radius 2`, `--cluster-nbits 2048`
 - Representative selection: `--cluster-rep score|medoid` (default: score). `medoid` picks the member with
   highest average Tanimoto similarity within the cluster; ties break by score/percentile/CPM/reads.
 
@@ -427,6 +429,9 @@ Notes:
 - Use `--labels` to set display names; these are used for HTML labels and sample column prefixes.
 - If runs use different presets, pass each run's `05_hybrid_annot.tsv` path to `--runs` instead of `--preset`.
 - Use `--fill-scores 1` to populate per-run score columns even when a compound is not in that run's top N.
+- Clustering defaults to `bbavg` (per-BB average). Use `--cluster-mode compound_or` to revert to OR fingerprints.
+- If two prefixed sample columns are identical across the candidate table (for example shared controls),
+  the HTML deduplicates them to avoid repeated values.
 - For 2 to 3 runs, the HTML includes Venn cell tabs (for example A-only, A+B, A+B+C) with per-cell tables.
 - Use `--include-summary 0` to skip per-run summary plots, and `--include-specificity 0` to skip specificity outputs.
 - Specificity uses `--roles` (active/inactive/both) and supports `--spec-prefix`, `--spec-top-n`, and `--active-spec-*` / `--inactive-spec-*` / `--both-spec-*` cutoffs.
@@ -449,8 +454,8 @@ Notes:
 - Candidate pool is the union of top N from each run, filtered by GLM_hit/RS_pass/Consensus_hit and NEG_hard_fail.
 - Optional NEG filter: `--neg-samples K_R2C5 K_R3C5 --neg-max-pct 99` removes candidates with NEG CPM in the top 1% of any listed NEG sample.
   Percentiles are computed across the full run (all compounds in each run), not just the top-N candidate subset.
-- Optional final list tab: `--final-hits DELeGANce_out/tier_report/final_hits_40.tsv` embeds a "Final hits" tab in the HTML (auto-detects `final_hits_40.tsv` or `final_hits.tsv` in `--out-dir` if not provided).
-- Final hit selection (writes `final_hits.tsv/.xlsx` and `final_hits_<total>.tsv/.xlsx`):
+- Optional final list tab: `--final-hits DELeGANce_out/tier_report/final_hits.tsv` embeds a "Final hits" tab in the HTML (auto-detects `final_hits.tsv` in `--out-dir` if not provided).
+- Final hit selection (writes `final_hits.tsv/.xlsx`):
   `--final-active-n 15 --final-inactive-n 15 --final-common-n 10` (Common = Both-specific).
   Picks cluster reps first, then fills from all hits in each group. When any `--final-*-n` is set, it overrides
   `--final-hits` for the HTML Final hits tab.
@@ -463,11 +468,13 @@ Notes:
 - HTML tables display missing values as `-` (keeps real values intact without implying zeros).
 - Unprefixed sample columns (e.g., `K_R2C1`, `K_R2C1_CPM`) are coalesced from prefixed run columns when available
   (active → inactive → both). If still missing, they remain `-`.
-- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: both).
+- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: prefixed).
+- Identical prefixed sample columns (for example shared controls across runs) are deduplicated in the HTML tables.
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
   Common (SampleA >= 99 and SampleB >= 99; via `--both-spec-min`).
 - Diverse tables are cluster representatives (cluster_rep=1 or cluster_medoid=1).
+- Clustering similarity default is `bbavg` (per-BB average). Use `--cluster-mode compound_or` for OR fingerprints.
 - Plot ranges: `--plot-x-range auto` / `--plot-y-range auto` (default) or fixed ranges like `99,100`.
 
 ### Export beginner QC and Excel
