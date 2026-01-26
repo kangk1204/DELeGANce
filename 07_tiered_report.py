@@ -458,13 +458,24 @@ def _img_formatter(width: int, zoom: int) -> HTMLTemplateFormatter:
 
 
 def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
-                         filename: str, group_col: Optional[str]) -> row:
+                         filename: str, group_col: Optional[str],
+                         page_state: ColumnDataSource, page_size: int) -> row:
     total = 0
     if full.data:
         first_key = next(iter(full.data.keys()))
         total = len(full.data[first_key])
+    page_size = max(1, int(page_size))
+    shown = min(total, page_size) if total else 0
+    pages = (total + page_size - 1) // page_size if total else 0
+    page_label = f"1/{pages}" if pages else "0/0"
     search = TextInput(title="Search", value="", placeholder="compound_key / ID / BB / CP")
-    count_div = Div(text=f"<span class='table-count'>Showing {total} of {total}</span>")
+    if shown:
+        count_text = f"<span class='table-count'>Showing 1-{shown} of {total} (page {page_label})</span>"
+    else:
+        count_text = "<span class='table-count'>Showing 0 of 0 (page 0/0)</span>"
+    count_div = Div(text=count_text)
+    prev_btn = Button(label="Prev", button_type="default", width=60)
+    next_btn = Button(label="Next", button_type="default", width=60)
     reset_btn = Button(label="Reset", button_type="default", width=70)
     download_btn = Button(label="Download CSV", button_type="primary")
 
@@ -503,11 +514,26 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
-source.data = out;
+const total = cols.length ? out[cols[0]].length : 0;
+const pageSize = Math.max(1, page_size);
+const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
+let page = 0;
+page_state.data.page[0] = page;
+page_state.change.emit();
+const start = page * pageSize;
+const end = Math.min(start + pageSize, total);
+const view = {};
+for (const c of cols) { view[c] = out[c].slice(start, end); }
+source.data = view;
 source.change.emit();
-count_div.text = `<span class='table-count'>Showing ${out[cols[0]].length} of ${n}</span>`;
+const shown = total === 0 ? '0' : `${start + 1}-${end}`;
+const pageLabel = total === 0 ? '0/0' : `${page + 1}/${pages}`;
+count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page ${pageLabel})</span>`;
 """
-    args = dict(source=source, full=full, search=search, count_div=count_div, group=group_select, group_col=group_col or "")
+    args = dict(
+        source=source, full=full, search=search, count_div=count_div,
+        group=group_select, group_col=group_col or "", page_state=page_state, page_size=page_size
+    )
     callback = CustomJS(args=args, code=filter_js)
     search.js_on_change("value", callback)
     if group_select is not None:
@@ -515,16 +541,133 @@ count_div.text = `<span class='table-count'>Showing ${out[cols[0]].length} of ${
 
     reset_js = """
 const data = full.data;
-const out = {};
-for (const c in data) { out[c] = data[c].slice(); }
-source.data = out;
-source.change.emit();
 search.value = '';
 if (group !== null) { group.value = group.options; }
-const n = out[Object.keys(out)[0]].length;
-count_div.text = `<span class='table-count'>Showing ${n} of ${n}</span>`;
+const cols = Object.keys(data);
+const out = {};
+for (const c of cols) { out[c] = data[c].slice(); }
+const total = cols.length ? out[cols[0]].length : 0;
+const pageSize = Math.max(1, page_size);
+const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
+let page = 0;
+page_state.data.page[0] = page;
+page_state.change.emit();
+const start = page * pageSize;
+const end = Math.min(start + pageSize, total);
+const view = {};
+for (const c of cols) { view[c] = out[c].slice(start, end); }
+source.data = view;
+source.change.emit();
+const shown = total === 0 ? '0' : `${start + 1}-${end}`;
+const pageLabel = total === 0 ? '0/0' : `${page + 1}/${pages}`;
+count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page ${pageLabel})</span>`;
 """
     reset_btn.js_on_click(CustomJS(args=args, code=reset_js))
+
+    prev_js = """
+const data = full.data;
+const cols = Object.keys(data);
+const out = {};
+for (const c of cols) { out[c] = []; }
+const term = (search.value || '').toLowerCase();
+const hasGroup = group !== null;
+const groups = hasGroup ? new Set(group.value || []) : null;
+const n = cols.length ? data[cols[0]].length : 0;
+for (let i = 0; i < n; i++) {
+  let keep = true;
+  if (hasGroup && groups.size > 0) {
+    const g = data[group_col][i];
+    if (!groups.has(String(g))) {
+      keep = false;
+    }
+  }
+  if (keep && term) {
+    let hit = false;
+    for (const c of cols) {
+      const v = data[c][i];
+      if (v === null || v === undefined) continue;
+      if (String(v).toLowerCase().includes(term)) { hit = true; break; }
+    }
+    keep = hit;
+  }
+  if (keep) {
+    for (const c of cols) { out[c].push(data[c][i]); }
+  }
+}
+const total = cols.length ? out[cols[0]].length : 0;
+const pageSize = Math.max(1, page_size);
+const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
+let page = (page_state.data.page[0] || 0) - 1;
+if (pages > 0) {
+  page = Math.max(0, Math.min(page, pages - 1));
+} else {
+  page = 0;
+}
+page_state.data.page[0] = page;
+page_state.change.emit();
+const start = page * pageSize;
+const end = Math.min(start + pageSize, total);
+const view = {};
+for (const c of cols) { view[c] = out[c].slice(start, end); }
+source.data = view;
+source.change.emit();
+const shown = total === 0 ? '0' : `${start + 1}-${end}`;
+const pageLabel = total === 0 ? '0/0' : `${page + 1}/${pages}`;
+count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page ${pageLabel})</span>`;
+"""
+    next_js = """
+const data = full.data;
+const cols = Object.keys(data);
+const out = {};
+for (const c of cols) { out[c] = []; }
+const term = (search.value || '').toLowerCase();
+const hasGroup = group !== null;
+const groups = hasGroup ? new Set(group.value || []) : null;
+const n = cols.length ? data[cols[0]].length : 0;
+for (let i = 0; i < n; i++) {
+  let keep = true;
+  if (hasGroup && groups.size > 0) {
+    const g = data[group_col][i];
+    if (!groups.has(String(g))) {
+      keep = false;
+    }
+  }
+  if (keep && term) {
+    let hit = false;
+    for (const c of cols) {
+      const v = data[c][i];
+      if (v === null || v === undefined) continue;
+      if (String(v).toLowerCase().includes(term)) { hit = true; break; }
+    }
+    keep = hit;
+  }
+  if (keep) {
+    for (const c of cols) { out[c].push(data[c][i]); }
+  }
+}
+const total = cols.length ? out[cols[0]].length : 0;
+const pageSize = Math.max(1, page_size);
+const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
+let page = (page_state.data.page[0] || 0) + 1;
+if (pages > 0) {
+  page = Math.max(0, Math.min(page, pages - 1));
+} else {
+  page = 0;
+}
+page_state.data.page[0] = page;
+page_state.change.emit();
+const start = page * pageSize;
+const end = Math.min(start + pageSize, total);
+const view = {};
+for (const c of cols) { view[c] = out[c].slice(start, end); }
+source.data = view;
+source.change.emit();
+const shown = total === 0 ? '0' : `${start + 1}-${end}`;
+const pageLabel = total === 0 ? '0/0' : `${page + 1}/${pages}`;
+count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page ${pageLabel})</span>`;
+"""
+    prev_btn.js_on_click(CustomJS(args=args, code=prev_js))
+    next_btn.js_on_click(CustomJS(args=args, code=next_js))
 
     download_js = """
 function csvEscape(value) {
@@ -559,14 +702,15 @@ URL.revokeObjectURL(url);
     controls = [search]
     if group_select is not None:
         controls.append(group_select)
-    controls.extend([reset_btn, download_btn, count_div])
+    controls.extend([prev_btn, next_btn, reset_btn, download_btn, count_div])
     return row(*controls, css_classes=["table-controls"])
 
 def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
-                with_structure: bool, sample_cols: List[str],
+                with_structure: bool, sample_cols: List[str], page_size: int,
                 download_name: str) -> Tuple[Optional[object], Optional[Div]]:
     if df is None or df.empty:
         return None, None
+    page_size = max(1, int(page_size))
     if max_rows and len(df) > max_rows:
         df = df.head(max_rows).copy()
     if with_images or with_structure:
@@ -629,12 +773,12 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
 
     if not table_cols:
         return None, None
-    source = ColumnDataSource(table_df)
+    page_df = table_df.head(page_size).copy()
+    source = ColumnDataSource(page_df)
     full_source = ColumnDataSource(table_df.copy())
+    page_state = ColumnDataSource({"page": [0]})
     row_height = 80 if with_images else 30
-    shown_rows = len(table_df)
-    if max_rows:
-        shown_rows = min(shown_rows, max_rows)
+    shown_rows = min(len(table_df), page_size) if page_size else len(table_df)
     table_height = min(800, 40 + row_height * max(1, shown_rows))
     total_width = sum([c.width or 0 for c in table_cols]) + 40
     table_width = min(5000, max(1200, total_width))
@@ -656,7 +800,7 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         frozen_columns=frozen_columns,
     )
     group_col = "group" if "group" in table_df.columns else None
-    controls = _make_table_controls(source, full_source, download_name, group_col)
+    controls = _make_table_controls(source, full_source, download_name, group_col, page_state, page_size)
     table_layout = column(controls, table, sizing_mode="stretch_width")
     struct_div = None
     if with_structure and "structure_html" in table_df.columns:
@@ -762,6 +906,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                plot_x_range: Optional[str], plot_y_range: Optional[str],
                sample_cols: List[str], group_display: Dict[str, str],
                active_label: str, inactive_label: str,
+               table_page_size: int,
                final_df: Optional[pd.DataFrame] = None,
                final_title: Optional[str] = None) -> None:
     if not _HAS_BOKEH:
@@ -856,7 +1001,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
         display_name = group_display.get(group, group)
         panel_items = [Div(text=f"<h3>{display_name}</h3>")]
         div_table, div_struct = _make_table(
-            df_div, with_images=True, max_rows=max_table, with_structure=True, sample_cols=sample_cols,
+            df_div, with_images=True, max_rows=max_table, with_structure=True,
+            sample_cols=sample_cols, page_size=table_page_size,
             download_name=f"{group.lower().replace(' ', '_')}_diverse.csv"
         )
         if div_table is not None:
@@ -865,7 +1011,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                 panel_items.append(div_struct)
             panel_items.append(div_table)
         all_table, all_struct = _make_table(
-            df_all_tier, with_images=True, max_rows=max_table, with_structure=True, sample_cols=sample_cols,
+            df_all_tier, with_images=True, max_rows=max_table, with_structure=True,
+            sample_cols=sample_cols, page_size=table_page_size,
             download_name=f"{group.lower().replace(' ', '_')}_all.csv"
         )
         if all_table is not None:
@@ -884,7 +1031,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                 final_sample_cols.append(col)
         panel_items = [Div(text=f"<h3>{display_final}</h3>")]
         final_table, final_struct = _make_table(
-            final_df, with_images=True, max_rows=max_table, with_structure=True, sample_cols=final_sample_cols,
+            final_df, with_images=True, max_rows=max_table, with_structure=True,
+            sample_cols=final_sample_cols, page_size=table_page_size,
             download_name="final_hits.csv"
         )
         if final_table is not None:
@@ -912,6 +1060,7 @@ def main() -> int:
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: tier_report)")
     ap.add_argument("--no-html", action="store_true", help="Skip HTML output")
     ap.add_argument("--max-table", type=int, default=200, help="Max rows per HTML table")
+    ap.add_argument("--table-page-size", type=int, default=50, help="Rows per HTML table page")
     ap.add_argument("--plot-x-range", default="auto",
                     help="Summary plot X range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--plot-y-range", default="auto",
@@ -1346,6 +1495,7 @@ def main() -> int:
                    group_display=group_display,
                    active_label=active_label,
                    inactive_label=inactive_label,
+                   table_page_size=int(args.table_page_size),
                    final_df=final_df,
                    final_title=final_title)
 
