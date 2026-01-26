@@ -454,6 +454,7 @@ Notes:
   Picks cluster reps first, then fills from all hits in each group. When any `--final-*-n` is set, it overrides
   `--final-hits` for the HTML Final hits tab.
 - HTML pagination: `--table-page-size 50` controls rows per page. `--max-table` caps total rows loaded per table.
+- HTML tables fill missing numeric values with `0` and missing text with empty strings to avoid blank cells.
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
   Common (SampleA >= 99 and SampleB >= 99; via `--both-spec-min`).

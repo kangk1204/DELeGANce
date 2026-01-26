@@ -766,9 +766,11 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).astype(int)
                 table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0"), width=_col_width(col, table_df[col])))
             else:
-                table_df[col] = table_df[col].round(4)
+                table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).round(4)
                 table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000"), width=_col_width(col, table_df[col])))
         else:
+            series = table_df[col].astype(object)
+            table_df[col] = series.where(series.notna(), "")
             table_cols.append(TableColumn(field=col, title=col, width=_col_width(col, table_df[col])))
 
     if not table_cols:
