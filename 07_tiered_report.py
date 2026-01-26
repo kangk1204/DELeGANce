@@ -898,6 +898,11 @@ def main() -> int:
     ap.add_argument("--both-weight", type=float, default=0.3,
                     help="Weight for both_rank_pct in specificity scores (ignored when using active/inactive-only)")
 
+    ap.add_argument("--neg-samples", nargs="+", default=None,
+                    help="Negative control sample names (base names, e.g. K_R2C5 K_R3C5)")
+    ap.add_argument("--neg-max-pct", type=float, default=None,
+                    help="Exclude candidates if any NEG sample CPM is >= this percentile (e.g. 99)")
+
     ap.add_argument("--cluster", type=int, choices=[0, 1], default=1)
     ap.add_argument("--cluster-sim", type=float, default=0.7)
     ap.add_argument("--cluster-radius", type=int, default=2)
@@ -1043,6 +1048,53 @@ def main() -> int:
     for col in sample_cols:
         if col in df_base.columns:
             df_base[col] = pd.to_numeric(df_base[col], errors="coerce").fillna(0)
+
+    def _split_tokens(items):
+        out = []
+        for item in items or []:
+            for tok in str(item).replace(",", " ").split():
+                tok = tok.strip()
+                if tok:
+                    out.append(tok)
+        return out
+
+    def _neg_filter(df: pd.DataFrame) -> pd.DataFrame:
+        if args.neg_max_pct is None:
+            return df
+        neg_samples = _split_tokens(args.neg_samples)
+        if not neg_samples:
+            return df
+        prefixes = [f"{active_label}_", f"{inactive_label}_"]
+        if both_label and both_label not in (active_label, inactive_label):
+            prefixes.append(f"{both_label}_")
+        neg_cols = []
+        for s in neg_samples:
+            for pre in prefixes:
+                cpm = f"{pre}{s}_CPM"
+                raw = f"{pre}{s}"
+                if cpm in df.columns:
+                    neg_cols.append(cpm)
+                elif raw in df.columns:
+                    neg_cols.append(raw)
+        if not neg_cols:
+            print("[WARN] NEG filter requested but no NEG sample columns found; skipping.")
+            return df
+        thresholds = {}
+        for col in neg_cols:
+            series = pd.to_numeric(df[col], errors="coerce")
+            if series.notna().any():
+                thresholds[col] = float(np.nanpercentile(series, float(args.neg_max_pct)))
+        if not thresholds:
+            print("[WARN] NEG filter requested but no numeric NEG data; skipping.")
+            return df
+        mask = pd.Series(True, index=df.index)
+        for col, thr in thresholds.items():
+            mask &= pd.to_numeric(df[col], errors="coerce").fillna(0.0) < thr
+        kept = int(mask.sum())
+        print(f"[INFO] NEG filter: pct={args.neg_max_pct}, cols={len(thresholds)}, kept={kept}/{len(df)}")
+        return df[mask].copy()
+
+    df_base = _neg_filter(df_base)
 
     df_base = _strip_bb_suffix_cols(df_base, ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"])
     df_base = df_base.sort_values(score_col, ascending=False)
