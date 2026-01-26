@@ -454,6 +454,9 @@ Notes:
   `--final-active-n 15 --final-inactive-n 15 --final-common-n 10` (Common = Both-specific).
   Picks cluster reps first, then fills from all hits in each group. When any `--final-*-n` is set, it overrides
   `--final-hits` for the HTML Final hits tab.
+- Group ranking default is enrichment-based: per-group median CPM (fallback to raw counts if CPM unavailable).
+  Use `--rank-by specificity` to revert to specificity-based ranking. Adjust aggregation with `--enrich-agg`
+  (`median|mean|max`) and common-group logic with `--common-enrich` (`min|mean|gmean`).
 - HTML pagination: `--table-page-size 50` controls rows per page; the table height expands to show the full page (no vertical scroll). `--max-table` caps total rows loaded per table.
 - HTML "Download CSV" exports the full filtered table (not just the current page).
 - HTML tables display missing values as `-` (keeps real values intact without implying zeros).

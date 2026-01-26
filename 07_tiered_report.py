@@ -236,6 +236,29 @@ def _neg_thresholds_for_run(df_best: pd.DataFrame, sample_cols: List[str], prefi
     return thresholds
 
 
+def _row_agg(df: pd.DataFrame, cols: List[str], agg: str) -> pd.Series:
+    if not cols:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    arr = df[use].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    if agg == "mean":
+        vals = np.nanmean(arr, axis=1)
+    elif agg == "max":
+        vals = np.nanmax(arr, axis=1)
+    else:
+        vals = np.nanmedian(arr, axis=1)
+    return pd.Series(vals, index=df.index)
+
+
+def _pick_enrich_cols(prefixed_cols: List[str]) -> List[str]:
+    cpm = [c for c in prefixed_cols if c.endswith("_CPM")]
+    if cpm:
+        return cpm
+    return [c for c in prefixed_cols if not c.endswith("_CPM")]
+
+
 def _rank_maps(df: pd.DataFrame, score_col: str) -> Dict[str, Dict[str, float]]:
     df = df.copy()
     df["compound_key"] = _make_compound_key(df)
@@ -787,14 +810,16 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     df = _add_group_badge(df)
     table_cols = []
     table_fields = [
-        "group_badge", "group_rank", "specificity_score", "selectivity_score",
+        "group_badge", "group_rank", "specificity_score", "group_rank_score",
+        "active_enrich", "inactive_enrich", "both_enrich", "selectivity_score",
         "active_rank_pct", "inactive_rank_pct", "both_rank_pct",
         "rank", "cluster_id", "cluster_size", "cluster_rep", "cluster_medoid", "ID_x", "LIB_ID_x",
         "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x",
     ]
     if with_images:
         table_fields = [
-            "group_badge", "group_rank", "specificity_score", "selectivity_score",
+            "group_badge", "group_rank", "specificity_score", "group_rank_score",
+            "active_enrich", "inactive_enrich", "both_enrich", "selectivity_score",
             "active_rank_pct", "inactive_rank_pct", "both_rank_pct",
             "rank", "cluster_id", "cluster_size", "cluster_rep", "cluster_medoid", "ID_x", "LIB_ID_x",
             "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "compound_img",
@@ -1135,6 +1160,12 @@ def main() -> int:
                     help="Summary plot Y range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="coalesced",
                     help="Sample columns in HTML tables: coalesced (default), prefixed, or both")
+    ap.add_argument("--rank-by", choices=["enrichment", "specificity"], default="enrichment",
+                    help="Group ranking basis (default: enrichment)")
+    ap.add_argument("--enrich-agg", choices=["median", "mean", "max"], default="median",
+                    help="Aggregate per-group enrichment across samples (default: median)")
+    ap.add_argument("--common-enrich", choices=["min", "mean", "gmean"], default="min",
+                    help="Common-group enrichment from active/inactive (default: min)")
 
     ap.add_argument("--active-spec-min", type=float, default=99.0,
                     help="Active-specific: min active rank_pct")
@@ -1397,6 +1428,17 @@ def main() -> int:
     df_base["inactive_selectivity_score"] = df_base["inactive_rank_pct"] - df_base["active_rank_pct"]
     df_base["both_specific_score"] = (df_base["active_rank_pct"] + df_base["inactive_rank_pct"]) / 2.0
 
+    active_enrich_cols = _pick_enrich_cols([c for c in active_prefixed if c in df_base.columns])
+    inactive_enrich_cols = _pick_enrich_cols([c for c in inactive_prefixed if c in df_base.columns])
+    df_base["active_enrich"] = _row_agg(df_base, active_enrich_cols, args.enrich_agg)
+    df_base["inactive_enrich"] = _row_agg(df_base, inactive_enrich_cols, args.enrich_agg)
+    if args.common_enrich == "mean":
+        df_base["both_enrich"] = (df_base["active_enrich"] + df_base["inactive_enrich"]) / 2.0
+    elif args.common_enrich == "gmean":
+        df_base["both_enrich"] = np.sqrt(df_base["active_enrich"] * df_base["inactive_enrich"])
+    else:
+        df_base["both_enrich"] = np.fmin(df_base["active_enrich"], df_base["inactive_enrich"])
+
     def _assign_group(row: pd.Series) -> str:
         a_pass = (
             row["active_rank_pct"] >= float(args.active_spec_min)
@@ -1448,6 +1490,22 @@ def main() -> int:
 
     group_order = ["Active-specific", "Inactive-specific", "Both-specific", "Other"]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
+    group_active_enrich = df_base["active_enrich"].fillna(float("-inf"))
+    group_inactive_enrich = df_base["inactive_enrich"].fillna(float("-inf"))
+    group_both_enrich = df_base["both_enrich"].fillna(float("-inf"))
+    df_base["group_rank_score"] = np.select(
+        [
+            df_base["group_code"] == "Active-specific",
+            df_base["group_code"] == "Inactive-specific",
+            df_base["group_code"] == "Both-specific",
+        ],
+        [
+            group_active_enrich if args.rank_by == "enrichment" else df_base["specificity_score"],
+            group_inactive_enrich if args.rank_by == "enrichment" else df_base["specificity_score"],
+            group_both_enrich if args.rank_by == "enrichment" else df_base["specificity_score"],
+        ],
+        default=df_base["specificity_score"] if args.rank_by == "specificity" else group_active_enrich,
+    )
     df_base["group_tiebreak_score"] = np.select(
         [
             df_base["group_code"] == "Active-specific",
@@ -1461,9 +1519,15 @@ def main() -> int:
         ],
         default=df_base["active_score"],
     )
+    if args.rank_by == "enrichment":
+        sort_cols = ["group_code", "group_rank_score", "specificity_score", "group_tiebreak_score"]
+        sort_asc = [True, False, False, False]
+    else:
+        sort_cols = ["group_code", "group_rank_score", "group_tiebreak_score"]
+        sort_asc = [True, False, False]
     df_base = df_base.sort_values(
-        ["group_code", "specificity_score", "group_tiebreak_score"],
-        ascending=[True, False, False],
+        sort_cols,
+        ascending=sort_asc,
     )
     df_base = df_base.drop(columns=["group_tiebreak_score"])
     df_base["group_rank"] = df_base.groupby("group_code", observed=False).cumcount() + 1
