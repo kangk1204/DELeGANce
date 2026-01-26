@@ -745,6 +745,7 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     img_formatter = _img_formatter(70, 220)
     compound_formatter = _img_formatter(55, 220)
     badge_formatter = HTMLTemplateFormatter(template="<%= value %>")
+    nan_fmt = "-"
 
     for col in table_df.columns:
         if col == "group_badge":
@@ -761,16 +762,16 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         if table_df[col].dtype.kind in "if":
             if col in ("rank", "cluster_size", "cluster_rep", "cluster_medoid", "group_rank"):
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).astype(int)
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0"), width=_col_width(col, table_df[col])))
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
             elif col in sample_cols and not col.endswith("_CPM"):
-                table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).astype(int)
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0"), width=_col_width(col, table_df[col])))
+                table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
             else:
-                table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).round(4)
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000"), width=_col_width(col, table_df[col])))
+                table_df[col] = pd.to_numeric(table_df[col], errors="coerce").round(4)
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
         else:
             series = table_df[col].astype(object)
-            table_df[col] = series.where(series.notna(), "")
+            table_df[col] = series.where(series.notna(), nan_fmt)
             table_cols.append(TableColumn(field=col, title=col, width=_col_width(col, table_df[col])))
 
     if not table_cols:
