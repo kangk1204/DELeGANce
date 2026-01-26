@@ -213,6 +213,29 @@ def _coalesce_unprefixed_samples(df: pd.DataFrame, base_cols: List[str],
     return out
 
 
+def _neg_thresholds_for_run(df_best: pd.DataFrame, sample_cols: List[str], prefix: str,
+                            neg_samples: List[str], neg_pct: float) -> Dict[str, float]:
+    thresholds: Dict[str, float] = {}
+    if df_best is None or df_best.empty:
+        return thresholds
+    if not neg_samples:
+        return thresholds
+    for s in neg_samples:
+        cpm = f"{s}_CPM"
+        raw = s
+        if cpm in sample_cols and cpm in df_best.columns:
+            series = pd.to_numeric(df_best[cpm], errors="coerce")
+            col_key = f"{prefix}{cpm}"
+        elif raw in sample_cols and raw in df_best.columns:
+            series = pd.to_numeric(df_best[raw], errors="coerce")
+            col_key = f"{prefix}{raw}"
+        else:
+            continue
+        if series.notna().any():
+            thresholds[col_key] = float(np.nanpercentile(series, neg_pct))
+    return thresholds
+
+
 def _rank_maps(df: pd.DataFrame, score_col: str) -> Dict[str, Dict[str, float]]:
     df = df.copy()
     df["compound_key"] = _make_compound_key(df)
@@ -693,12 +716,39 @@ function csvEscape(value) {
   }
   return s;
 }
-const data = source.data;
+const data = full.data;
 const cols = Object.keys(data);
+const out = {};
+for (const c of cols) { out[c] = []; }
+const term = (search.value || '').toLowerCase();
+const hasGroup = group !== null;
+const groups = hasGroup ? new Set(group.value || []) : null;
 const n = cols.length ? data[cols[0]].length : 0;
-let csv = cols.join(',') + '\\n';
 for (let i = 0; i < n; i++) {
-  const row = cols.map(c => csvEscape(data[c][i]));
+  let keep = true;
+  if (hasGroup && groups.size > 0) {
+    const g = data[group_col][i];
+    if (!groups.has(String(g))) {
+      keep = false;
+    }
+  }
+  if (keep && term) {
+    let hit = false;
+    for (const c of cols) {
+      const v = data[c][i];
+      if (v === null || v === undefined) continue;
+      if (String(v).toLowerCase().includes(term)) { hit = true; break; }
+    }
+    keep = hit;
+  }
+  if (keep) {
+    for (const c of cols) { out[c].push(data[c][i]); }
+  }
+}
+const nout = cols.length ? out[cols[0]].length : 0;
+let csv = cols.join(',') + '\\n';
+for (let i = 0; i < nout; i++) {
+  const row = cols.map(c => csvEscape(out[c][i]));
   csv += row.join(',') + '\\n';
 }
 const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
@@ -712,7 +762,11 @@ a.click();
 document.body.removeChild(a);
 URL.revokeObjectURL(url);
 """
-    download_btn.js_on_click(CustomJS(args=dict(source=source, filename=filename), code=download_js))
+    download_btn.js_on_click(CustomJS(
+        args=dict(source=source, full=full, search=search, group=group_select,
+                  group_col=group_col or "", filename=filename),
+        code=download_js
+    ))
 
     controls = [search]
     if group_select is not None:
@@ -1043,10 +1097,6 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     if final_df is not None and not final_df.empty:
         display_final = final_title or "Final hits"
         final_sample_cols = list(sample_cols)
-        extra_sample_cols = _sample_cols_from_header(final_df.columns.tolist())
-        for col in extra_sample_cols:
-            if col not in final_sample_cols:
-                final_sample_cols.append(col)
         panel_items = [Div(text=f"<h3>{display_final}</h3>")]
         final_table, final_struct = _make_table(
             final_df, with_images=True, max_rows=max_table, with_structure=True,
@@ -1083,6 +1133,8 @@ def main() -> int:
                     help="Summary plot X range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--plot-y-range", default="auto",
                     help="Summary plot Y range 'min,max' or 'auto' (default: auto)")
+    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="coalesced",
+                    help="Sample columns in HTML tables: coalesced (default), prefixed, or both")
 
     ap.add_argument("--active-spec-min", type=float, default=99.0,
                     help="Active-specific: min active rank_pct")
@@ -1178,10 +1230,10 @@ def main() -> int:
     inactive_prefixed, inactive_rename = _prefix_sample_cols(inactive_sample_cols, f"{inactive_label}_")
     both_prefixed, both_rename = _prefix_sample_cols(both_sample_cols, f"{both_label}_")
 
-    sample_cols = []
+    prefixed_sample_cols = []
     for col in active_prefixed + inactive_prefixed + both_prefixed:
-        if col not in sample_cols:
-            sample_cols.append(col)
+        if col not in prefixed_sample_cols:
+            prefixed_sample_cols.append(col)
 
     want_base = [
         "LIB_ID_x", "ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "cycles",
@@ -1260,7 +1312,7 @@ def main() -> int:
     for block in (active_samples, inactive_samples, both_samples):
         if block is not None:
             df_base = df_base.merge(block, on="compound_key", how="left")
-    for col in sample_cols:
+    for col in prefixed_sample_cols:
         if col in df_base.columns:
             df_base[col] = pd.to_numeric(df_base[col], errors="coerce")
     base_sample_cols = []
@@ -1271,6 +1323,15 @@ def main() -> int:
     if both_label and both_label not in (active_label, inactive_label):
         prefixes.append(f"{both_label}_")
     df_base = _coalesce_unprefixed_samples(df_base, base_sample_cols, prefixes)
+    display_sample_cols = []
+    if args.sample_cols_mode in ("coalesced", "both"):
+        for col in base_sample_cols:
+            if col in df_base.columns and col not in display_sample_cols:
+                display_sample_cols.append(col)
+    if args.sample_cols_mode in ("prefixed", "both"):
+        for col in prefixed_sample_cols:
+            if col in df_base.columns and col not in display_sample_cols:
+                display_sample_cols.append(col)
 
     def _split_tokens(items):
         out = []
@@ -1287,31 +1348,24 @@ def main() -> int:
         neg_samples = _split_tokens(args.neg_samples)
         if not neg_samples:
             return df
-        prefixes = [f"{active_label}_", f"{inactive_label}_"]
-        if both_label and both_label not in (active_label, inactive_label):
-            prefixes.append(f"{both_label}_")
-        neg_cols = []
-        for s in neg_samples:
-            for pre in prefixes:
-                cpm = f"{pre}{s}_CPM"
-                raw = f"{pre}{s}"
-                if cpm in df.columns:
-                    neg_cols.append(cpm)
-                elif raw in df.columns:
-                    neg_cols.append(raw)
-        if not neg_cols:
-            print("[WARN] NEG filter requested but no NEG sample columns found; skipping.")
-            return df
-        thresholds = {}
-        for col in neg_cols:
-            series = pd.to_numeric(df[col], errors="coerce")
-            if series.notna().any():
-                thresholds[col] = float(np.nanpercentile(series, float(args.neg_max_pct)))
+        thresholds: Dict[str, float] = {}
+        thresholds.update(_neg_thresholds_for_run(
+            df_active_best, active_sample_cols, f"{active_label}_", neg_samples, float(args.neg_max_pct)
+        ))
+        thresholds.update(_neg_thresholds_for_run(
+            df_inactive_best, inactive_sample_cols, f"{inactive_label}_", neg_samples, float(args.neg_max_pct)
+        ))
+        if df_both_best is not None and both_sample_cols:
+            thresholds.update(_neg_thresholds_for_run(
+                df_both_best, both_sample_cols, f"{both_label}_", neg_samples, float(args.neg_max_pct)
+            ))
         if not thresholds:
-            print("[WARN] NEG filter requested but no numeric NEG data; skipping.")
+            print("[WARN] NEG filter requested but no NEG sample columns found; skipping.")
             return df
         mask = pd.Series(True, index=df.index)
         for col, thr in thresholds.items():
+            if col not in df.columns:
+                continue
             mask &= pd.to_numeric(df[col], errors="coerce").fillna(0.0) < thr
         kept = int(mask.sum())
         print(f"[INFO] NEG filter: pct={args.neg_max_pct}, cols={len(thresholds)}, kept={kept}/{len(df)}")
@@ -1323,7 +1377,7 @@ def main() -> int:
     df_base = df_base.sort_values(score_col, ascending=False)
     df_base["rank"] = np.arange(1, len(df_base) + 1, dtype=int)
 
-    df_base["active_score"] = df_base[score_col]
+    df_base["active_score"] = df_base["compound_key"].map(maps_active["score_map"])
     df_base["active_rank"] = df_base["compound_key"].map(maps_active["rank_map"])
     df_base["active_rank_pct"] = df_base["compound_key"].map(maps_active["rank_pct_map"]).fillna(0.0)
     df_base["active_score_z"] = df_base["compound_key"].map(maps_active["score_z_map"]).fillna(0.0)
@@ -1394,7 +1448,24 @@ def main() -> int:
 
     group_order = ["Active-specific", "Inactive-specific", "Both-specific", "Other"]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
-    df_base = df_base.sort_values(["group_code", "specificity_score", "active_score"], ascending=[True, False, False])
+    df_base["group_tiebreak_score"] = np.select(
+        [
+            df_base["group_code"] == "Active-specific",
+            df_base["group_code"] == "Inactive-specific",
+            df_base["group_code"] == "Both-specific",
+        ],
+        [
+            df_base["active_score"],
+            df_base["inactive_score"],
+            df_base["both_score"].fillna(df_base["both_specific_score"]),
+        ],
+        default=df_base["active_score"],
+    )
+    df_base = df_base.sort_values(
+        ["group_code", "specificity_score", "group_tiebreak_score"],
+        ascending=[True, False, False],
+    )
+    df_base = df_base.drop(columns=["group_tiebreak_score"])
     df_base["group_rank"] = df_base.groupby("group_code", observed=False).cumcount() + 1
     group_code_str = df_base["group_code"].astype(str)
     df_base["group"] = group_code_str.map(group_display).fillna(group_code_str)
@@ -1517,7 +1588,7 @@ def main() -> int:
                    max_table=int(args.max_table),
                    plot_x_range=args.plot_x_range,
                    plot_y_range=args.plot_y_range,
-                   sample_cols=sample_cols,
+                   sample_cols=display_sample_cols,
                    group_display=group_display,
                    active_label=active_label,
                    inactive_label=inactive_label,
