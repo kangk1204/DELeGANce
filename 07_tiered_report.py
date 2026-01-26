@@ -401,6 +401,25 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
     return out, cluster_df
 
 
+def _pick_final_from_group(df_div: pd.DataFrame, df_all: pd.DataFrame, n: int) -> pd.DataFrame:
+    if n <= 0:
+        return df_all.head(0).copy() if df_all is not None else pd.DataFrame()
+    df_div = df_div if df_div is not None else pd.DataFrame()
+    df_all = df_all if df_all is not None else pd.DataFrame()
+    if df_div.empty:
+        return df_all.head(n).copy()
+    picked = df_div.head(n).copy()
+    if len(picked) >= n or df_all.empty:
+        return picked
+    key = "compound_key" if "compound_key" in df_all.columns else None
+    if key and key in picked.columns:
+        remainder = df_all[~df_all[key].isin(picked[key])].copy()
+    else:
+        remainder = df_all.copy()
+    remainder = remainder.head(n - len(picked))
+    return pd.concat([picked, remainder], ignore_index=True)
+
+
 def _make_panel(child, title: str):
     if _HAS_TABPANEL:
         return _BokehTabPanel(child=child, title=title)
@@ -923,6 +942,12 @@ def main() -> int:
                     help="Negative control sample names (base names, e.g. K_R2C5 K_R3C5)")
     ap.add_argument("--neg-max-pct", type=float, default=None,
                     help="Exclude candidates if any NEG sample CPM is >= this percentile (e.g. 99)")
+    ap.add_argument("--final-active-n", type=int, default=0,
+                    help="Final hits: number of active-specific compounds")
+    ap.add_argument("--final-inactive-n", type=int, default=0,
+                    help="Final hits: number of inactive-specific compounds")
+    ap.add_argument("--final-common-n", type=int, default=0,
+                    help="Final hits: number of common (both-specific) compounds")
     ap.add_argument("--final-hits", default=None,
                     help="Optional final hits TSV to embed as a tab in the HTML report")
 
@@ -1251,24 +1276,65 @@ def main() -> int:
 
     final_df = None
     final_title = None
-    final_hits_path = args.final_hits
-    if final_hits_path is None:
-        for candidate in [
-            os.path.join(args.out_dir, "final_hits_40.tsv"),
-            os.path.join(args.out_dir, "final_hits.tsv"),
-        ]:
-            if os.path.exists(candidate):
-                final_hits_path = candidate
-                break
-    if final_hits_path:
-        if os.path.exists(final_hits_path):
+    final_counts = {
+        "Active-specific": max(0, int(args.final_active_n)),
+        "Inactive-specific": max(0, int(args.final_inactive_n)),
+        "Both-specific": max(0, int(args.final_common_n)),
+    }
+    final_total = sum(final_counts.values())
+    if final_total > 0:
+        final_parts = []
+        for group in ["Active-specific", "Inactive-specific", "Both-specific"]:
+            n = final_counts.get(group, 0)
+            if n <= 0:
+                continue
+            df_group = groups.get(group, {}).get("all", pd.DataFrame())
+            df_div = groups.get(group, {}).get("diverse", pd.DataFrame())
+            df_pick = _pick_final_from_group(df_div, df_group, n)
+            if df_pick.empty:
+                continue
+            df_pick = df_pick.copy()
+            df_pick["final_group_code"] = group
+            df_pick["final_group"] = df_pick["final_group_code"].map(group_display).fillna(df_pick["final_group_code"])
+            df_pick["final_group_rank"] = np.arange(1, len(df_pick) + 1, dtype=int)
+            final_parts.append(df_pick)
+        if final_parts:
+            final_df = pd.concat(final_parts, ignore_index=True)
+            final_title = (
+                f"Final hits ({active_label}={final_counts['Active-specific']}, "
+                f"{inactive_label}={final_counts['Inactive-specific']}, "
+                f"Common={final_counts['Both-specific']})"
+            )
+            final_prefix = os.path.join(args.out_dir, "final_hits")
+            final_df.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
+            final_df.to_csv(os.path.join(args.out_dir, f"final_hits_{final_total}.tsv"), sep="\t", index=False)
             try:
-                final_df = pd.read_csv(final_hits_path, sep="\t")
-                final_title = "Final hits"
+                final_df.to_excel(f"{final_prefix}.xlsx", index=False)
+                final_df.to_excel(os.path.join(args.out_dir, f"final_hits_{final_total}.xlsx"), index=False)
             except Exception as exc:
-                print(f"[WARN] Failed to read final hits: {final_hits_path} ({exc})")
+                print(f"[WARN] Failed to write final hits Excel ({exc})")
+            print(f"[INFO] final_hits: {final_prefix}.tsv")
         else:
-            print(f"[WARN] --final-hits not found: {final_hits_path}")
+            print("[WARN] final_hits requested but no rows matched group cutoffs.")
+    else:
+        final_hits_path = args.final_hits
+        if final_hits_path is None:
+            for candidate in [
+                os.path.join(args.out_dir, "final_hits.tsv"),
+                os.path.join(args.out_dir, "final_hits_40.tsv"),
+            ]:
+                if os.path.exists(candidate):
+                    final_hits_path = candidate
+                    break
+        if final_hits_path:
+            if os.path.exists(final_hits_path):
+                try:
+                    final_df = pd.read_csv(final_hits_path, sep="\t")
+                    final_title = "Final hits"
+                except Exception as exc:
+                    print(f"[WARN] Failed to read final hits: {final_hits_path} ({exc})")
+            else:
+                print(f"[WARN] --final-hits not found: {final_hits_path}")
 
     html_path = f"{prefix}_interactive.html"
     if not args.no_html:
