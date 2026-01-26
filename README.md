@@ -455,6 +455,8 @@ Notes:
   `--final-hits` for the HTML Final hits tab.
 - HTML pagination: `--table-page-size 50` controls rows per page; the table height expands to show the full page (no vertical scroll). `--max-table` caps total rows loaded per table.
 - HTML tables display missing values as `-` (keeps real values intact without implying zeros).
+- Unprefixed sample columns (e.g., `K_R2C1`, `K_R2C1_CPM`) are coalesced from prefixed run columns when available
+  (active → inactive → both). If still missing, they remain `-`.
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
   Common (SampleA >= 99 and SampleB >= 99; via `--both-spec-min`).

@@ -198,6 +198,21 @@ def _prefix_sample_cols(cols: List[str], prefix: str) -> Tuple[List[str], Dict[s
     return [renamed[c] for c in cols], renamed
 
 
+def _coalesce_unprefixed_samples(df: pd.DataFrame, base_cols: List[str],
+                                 prefixes: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in base_cols:
+        if col not in out.columns:
+            continue
+        series = pd.to_numeric(out[col], errors="coerce")
+        for pre in prefixes:
+            pref_col = f"{pre}{col}"
+            if pref_col in out.columns:
+                series = series.where(series.notna(), pd.to_numeric(out[pref_col], errors="coerce"))
+        out[col] = series
+    return out
+
+
 def _rank_maps(df: pd.DataFrame, score_col: str) -> Dict[str, Dict[str, float]]:
     df = df.copy()
     df["compound_key"] = _make_compound_key(df)
@@ -1247,7 +1262,15 @@ def main() -> int:
             df_base = df_base.merge(block, on="compound_key", how="left")
     for col in sample_cols:
         if col in df_base.columns:
-            df_base[col] = pd.to_numeric(df_base[col], errors="coerce").fillna(0)
+            df_base[col] = pd.to_numeric(df_base[col], errors="coerce")
+    base_sample_cols = []
+    for col in active_sample_cols + inactive_sample_cols + both_sample_cols:
+        if col not in base_sample_cols:
+            base_sample_cols.append(col)
+    prefixes = [f"{active_label}_", f"{inactive_label}_"]
+    if both_label and both_label not in (active_label, inactive_label):
+        prefixes.append(f"{both_label}_")
+    df_base = _coalesce_unprefixed_samples(df_base, base_sample_cols, prefixes)
 
     def _split_tokens(items):
         out = []
