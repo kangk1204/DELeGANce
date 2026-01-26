@@ -102,7 +102,9 @@ HP - OP - Codon1 - Codon2 - Codon3 - (Codon4) - CP
 ```
 
 Rules enforced by the code:
-- HP/OP/CP allow 1-bp mismatch (substitution, insertion, deletion). Use `--mismatch hp_op_cp|none` to control this in both preprocess and decode.
+- Decode: HP/OP/CP allow 1-bp mismatch (substitution, insertion, deletion) when `--mismatch hp_op_cp` is enabled.
+- Preprocess: mismatch indexing is substitution-only for HP/OP/CP (codons are always perfect match only). This does not remove indel tolerance during decode.
+- Use `--mismatch hp_op_cp|none` to control mismatch handling across preprocess + decode.
 - Codons are perfect match only
 - Order is strict; violations are marked undecoded
 - Small overlap or insertion between blocks is allowed within `ADJ_TOL`
