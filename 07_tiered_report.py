@@ -55,6 +55,9 @@ def _style_block() -> str:
 .summary-card { background:#f7f7fb; border:1px solid #dedee6; border-radius:8px; padding:8px 12px; min-width:160px; }
 .summary-label { font-size:11px; color:#666; letter-spacing:0.2px; text-transform:uppercase; }
 .summary-value { font-size:18px; font-weight:600; }
+.summary-table { border-collapse:collapse; margin:8px 0 12px 0; width:100%; max-width:520px; }
+.summary-table th, .summary-table td { border:1px solid #e0e0e0; padding:6px 8px; font-size:12px; }
+.summary-table th { background:#f5f5f7; text-align:left; }
 .table-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0 8px 0; }
 .table-count { font-size:12px; color:#555; }
 .struct-thumb { position:relative; display:inline-block; }
@@ -1041,6 +1044,12 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     summary_lines = [
         f"<h2>{title}</h2>",
         _summary_cards(cards),
+        "<table class='summary-table'>"
+        "<tr><th>Group</th><th>All hits</th><th>Diverse hits</th></tr>"
+        f"<tr><td>{disp_active}</td><td>{summary.get('n_active', 0)}</td><td>{summary.get('n_active_diverse', 0)}</td></tr>"
+        f"<tr><td>{disp_inactive}</td><td>{summary.get('n_inactive', 0)}</td><td>{summary.get('n_inactive_diverse', 0)}</td></tr>"
+        f"<tr><td>{disp_both}</td><td>{summary.get('n_both', 0)}</td><td>{summary.get('n_both_diverse', 0)}</td></tr>"
+        "</table>",
         "<ul>",
         f"<li>Candidates: <b>{summary.get('n_candidates', 0)}</b></li>",
         f"<li>{disp_active}: <b>{summary.get('n_active', 0)}</b>{a_def}</li>",
@@ -1598,6 +1607,9 @@ def main() -> int:
         "n_both": len(groups.get("Both-specific", {}).get("all", [])),
         "n_other": len(df_other),
         "n_diverse": diverse_total,
+        "n_active_diverse": len(groups.get("Active-specific", {}).get("diverse", [])),
+        "n_inactive_diverse": len(groups.get("Inactive-specific", {}).get("diverse", [])),
+        "n_both_diverse": len(groups.get("Both-specific", {}).get("diverse", [])),
         "group_defs": group_defs,
     }
     group_tables = {"summary": summary, **groups}
