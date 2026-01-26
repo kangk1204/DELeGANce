@@ -448,6 +448,7 @@ Notes:
 - both_specific_score = (active_rank_pct + inactive_rank_pct) / 2
 - Candidate pool is the union of top N from each run, filtered by GLM_hit/RS_pass/Consensus_hit and NEG_hard_fail.
 - Optional NEG filter: `--neg-samples K_R2C5 K_R3C5 --neg-max-pct 99` removes candidates with NEG CPM in the top 1% of any listed NEG sample.
+- Optional final list tab: `--final-hits DELeGANce_out/tier_report/final_hits_40.tsv` embeds a "Final hits" tab in the HTML (auto-detects `final_hits_40.tsv` or `final_hits.tsv` in `--out-dir` if not provided).
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
   Common (SampleA >= 99 and SampleB >= 99; via `--both-spec-min`).

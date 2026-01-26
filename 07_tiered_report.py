@@ -742,7 +742,9 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                out_html: str, title: str, max_table: int,
                plot_x_range: Optional[str], plot_y_range: Optional[str],
                sample_cols: List[str], group_display: Dict[str, str],
-               active_label: str, inactive_label: str) -> None:
+               active_label: str, inactive_label: str,
+               final_df: Optional[pd.DataFrame] = None,
+               final_title: Optional[str] = None) -> None:
     if not _HAS_BOKEH:
         print("[WARN] bokeh is not available; skipping interactive HTML output.")
         return
@@ -854,6 +856,25 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
             panel_items.append(all_table)
         tabs.append(_make_panel(column(*panel_items, sizing_mode="stretch_width"), display_name))
 
+    if final_df is not None and not final_df.empty:
+        display_final = final_title or "Final hits"
+        final_sample_cols = list(sample_cols)
+        extra_sample_cols = _sample_cols_from_header(final_df.columns.tolist())
+        for col in extra_sample_cols:
+            if col not in final_sample_cols:
+                final_sample_cols.append(col)
+        panel_items = [Div(text=f"<h3>{display_final}</h3>")]
+        final_table, final_struct = _make_table(
+            final_df, with_images=True, max_rows=max_table, with_structure=True, sample_cols=final_sample_cols,
+            download_name="final_hits.csv"
+        )
+        if final_table is not None:
+            panel_items.append(Div(text=f"<p>Final hits: {len(final_df)}</p>"))
+            if final_struct is not None:
+                panel_items.append(final_struct)
+            panel_items.append(final_table)
+        tabs.append(_make_panel(column(*panel_items, sizing_mode="stretch_width"), display_final))
+
     output_file(out_html, title=title)
     save(Tabs(tabs=tabs))
 
@@ -902,6 +923,8 @@ def main() -> int:
                     help="Negative control sample names (base names, e.g. K_R2C5 K_R3C5)")
     ap.add_argument("--neg-max-pct", type=float, default=None,
                     help="Exclude candidates if any NEG sample CPM is >= this percentile (e.g. 99)")
+    ap.add_argument("--final-hits", default=None,
+                    help="Optional final hits TSV to embed as a tab in the HTML report")
 
     ap.add_argument("--cluster", type=int, choices=[0, 1], default=1)
     ap.add_argument("--cluster-sim", type=float, default=0.7)
@@ -1226,6 +1249,27 @@ def main() -> int:
     }
     group_tables = {"summary": summary, **groups}
 
+    final_df = None
+    final_title = None
+    final_hits_path = args.final_hits
+    if final_hits_path is None:
+        for candidate in [
+            os.path.join(args.out_dir, "final_hits_40.tsv"),
+            os.path.join(args.out_dir, "final_hits.tsv"),
+        ]:
+            if os.path.exists(candidate):
+                final_hits_path = candidate
+                break
+    if final_hits_path:
+        if os.path.exists(final_hits_path):
+            try:
+                final_df = pd.read_csv(final_hits_path, sep="\t")
+                final_title = "Final hits"
+            except Exception as exc:
+                print(f"[WARN] Failed to read final hits: {final_hits_path} ({exc})")
+        else:
+            print(f"[WARN] --final-hits not found: {final_hits_path}")
+
     html_path = f"{prefix}_interactive.html"
     if not args.no_html:
         build_html(df_base, group_tables, html_path, title="Selectivity & Diversity Report",
@@ -1235,7 +1279,9 @@ def main() -> int:
                    sample_cols=sample_cols,
                    group_display=group_display,
                    active_label=active_label,
-                   inactive_label=inactive_label)
+                   inactive_label=inactive_label,
+                   final_df=final_df,
+                   final_title=final_title)
 
     print(f"[INFO] score_col={score_col}")
     print(
