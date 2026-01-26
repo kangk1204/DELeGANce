@@ -782,7 +782,7 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     page_state = ColumnDataSource({"page": [0]})
     row_height = 80 if with_images else 30
     shown_rows = min(len(table_df), page_size) if page_size else len(table_df)
-    table_height = min(800, 40 + row_height * max(1, shown_rows))
+    table_height = 40 + row_height * max(1, shown_rows)
     total_width = sum([c.width or 0 for c in table_cols]) + 40
     table_width = min(5000, max(1200, total_width))
     freeze_col = None
