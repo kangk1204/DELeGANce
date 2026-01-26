@@ -78,6 +78,9 @@ python3 07_tiered_report.py \
 Outputs:
 - `DELeGANce_out/final_hits_40/final_hits.tsv` and `final_hits.xlsx` (final 40 candidates)
 - `DELeGANce_out/final_hits_40/sample_tier_report_interactive.html` (interactive report)
+Notes:
+- `final_hits.tsv/.xlsx` excludes HTML-only image columns but includes BB SMILES and uses the same sample columns
+  shown in the HTML (deduped/ordered).
 
 ---
 

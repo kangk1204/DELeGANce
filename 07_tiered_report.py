@@ -296,6 +296,39 @@ def _dedupe_identical_sample_cols(df: pd.DataFrame, cols: List[str], prefixes: L
     return [c for c in cols if c not in drop]
 
 
+def _final_hits_column_order(df: pd.DataFrame, sample_cols: List[str]) -> List[str]:
+    ordered: List[str] = []
+    blocks = [
+        [
+            "final_group", "final_group_rank", "final_group_code",
+            "group", "group_code", "group_rank", "group_rank_score",
+            "rank", "compound_key", "LIB_ID_x", "ID_x",
+            "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x",
+        ],
+        ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles", "BB_SMILES_CONCAT"],
+        sample_cols,
+        [
+            "HitScore_GLM", "HitScore_RS", "HitScore_pct", "SynthonScore",
+            "active_rank_pct", "inactive_rank_pct", "both_rank_pct",
+            "active_enrich", "inactive_enrich", "both_enrich",
+            "selectivity_score", "inactive_selectivity_score", "both_specific_score",
+        ],
+        [
+            "cluster_id", "cluster_size", "cluster_rep", "cluster_medoid",
+            "GLM_hit", "RS_pass", "Consensus_hit", "NEG_hard_fail", "NEG_center_fail",
+            "pass_filters", "fail_reasons",
+        ],
+    ]
+    for block in blocks:
+        for col in block:
+            if col in df.columns and col not in ordered:
+                ordered.append(col)
+    for col in df.columns:
+        if col not in ordered:
+            ordered.append(col)
+    return ordered
+
+
 def _neg_thresholds_for_run(df_best: pd.DataFrame, sample_cols: List[str], prefix: str,
                             neg_samples: List[str], neg_pct: float) -> Dict[str, float]:
     thresholds: Dict[str, float] = {}
@@ -1769,9 +1802,13 @@ def main() -> int:
                 f"Common={final_counts['Both-specific']})"
             )
             final_prefix = os.path.join(args.out_dir, "final_hits")
-            final_df.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
+            sample_all = set(base_sample_cols + prefixed_sample_cols)
+            sample_keep = display_sample_cols or []
+            final_export = final_df.drop(columns=[c for c in final_df.columns if c in sample_all and c not in sample_keep])
+            final_export = final_export[_final_hits_column_order(final_export, sample_keep)]
+            final_export.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
             try:
-                final_df.to_excel(f"{final_prefix}.xlsx", index=False)
+                final_export.to_excel(f"{final_prefix}.xlsx", index=False)
             except Exception as exc:
                 print(f"[WARN] Failed to write final hits Excel ({exc})")
             print(f"[INFO] final_hits: {final_prefix}.tsv")
