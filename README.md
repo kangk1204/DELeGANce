@@ -507,6 +507,7 @@ Notes:
 - Diverse tables are cluster representatives (cluster_rep=1 or cluster_medoid=1).
 - Clustering similarity default is `bbavg` (per-BB average). Use `--cluster-mode compound_or` for OR fingerprints.
 - Plot ranges: `--plot-x-range auto` / `--plot-y-range auto` (default) or fixed ranges like `99,100`.
+- Use `--html-mode inline` to embed all JS/CSS for offline sharing (larger file size).
 
 ### Export beginner QC and Excel
 ```bash

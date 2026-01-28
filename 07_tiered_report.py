@@ -1170,7 +1170,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                active_label: str, inactive_label: str,
                table_page_size: int,
                final_df: Optional[pd.DataFrame] = None,
-               final_title: Optional[str] = None) -> None:
+               final_title: Optional[str] = None,
+               html_mode: str = "cdn") -> None:
     if not _HAS_BOKEH:
         print("[WARN] bokeh is not available; skipping interactive HTML output.")
         return
@@ -1306,7 +1307,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
             panel_items.append(final_table)
         tabs.append(_make_panel(column(*panel_items, sizing_mode="stretch_width"), display_final))
 
-    output_file(out_html, title=title)
+    output_file(out_html, title=title, mode=html_mode)
     save(Tabs(tabs=tabs))
 
 
@@ -1323,6 +1324,8 @@ def main() -> int:
     ap.add_argument("--out-dir", required=True, help="Output directory")
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: tier_report)")
     ap.add_argument("--no-html", action="store_true", help="Skip HTML output")
+    ap.add_argument("--html-mode", choices=["cdn", "inline", "relative"], default="cdn",
+                    help="Bokeh resources mode for HTML (default: cdn). Use inline for offline.")
     ap.add_argument("--max-table", type=int, default=200, help="Max rows per HTML table")
     ap.add_argument("--table-page-size", type=int, default=50, help="Rows per HTML table page")
     ap.add_argument("--plot-x-range", default="auto",
@@ -1806,6 +1809,14 @@ def main() -> int:
             sample_keep = display_sample_cols or []
             final_export = final_df.drop(columns=[c for c in final_df.columns if c in sample_all and c not in sample_keep])
             final_export = final_export[_final_hits_column_order(final_export, sample_keep)]
+            if "final_group_code" in final_export.columns and "final_group_rank" in final_export.columns:
+                order = ["Active-specific", "Inactive-specific", "Both-specific"]
+                final_export["final_group_code"] = pd.Categorical(
+                    final_export["final_group_code"], categories=order, ordered=True
+                )
+                final_export = final_export.sort_values(
+                    ["final_group_code", "final_group_rank"], ascending=[True, True]
+                )
             final_export.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
             try:
                 final_export.to_excel(f"{final_prefix}.xlsx", index=False)
@@ -1845,7 +1856,8 @@ def main() -> int:
                    inactive_label=inactive_label,
                    table_page_size=int(args.table_page_size),
                    final_df=final_df,
-                   final_title=final_title)
+                   final_title=final_title,
+                   html_mode=args.html_mode)
 
     print(f"[INFO] score_col={score_col}")
     print(
