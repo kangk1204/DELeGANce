@@ -482,9 +482,12 @@ Notes:
 - Specificity uses only active and inactive rank_pct for group definitions and scoring.
 - selectivity_score = active_rank_pct - inactive_rank_pct
 - both_specific_score = (active_rank_pct + inactive_rank_pct) / 2
-- Candidate pool is the union of top N from each run, filtered by GLM_hit/RS_pass/Consensus_hit and NEG_hard_fail.
+- Candidate pool is the union of top N from each run, filtered by GLM_hit/RS_pass/Consensus_hit and NEG_hard_fail (disable with `--no-hit-filter`).
+- Use `--top-n 0` to include all compounds from each run (still applies hit/QC filters). In this mode, all-candidates Excel files are skipped (TSV only) to avoid huge spreadsheets.
 - Optional NEG filter: `--neg-samples K_R2C5 K_R3C5 --neg-max-pct 99` removes candidates with NEG CPM in the top 1% of any listed NEG sample.
   Percentiles are computed across the full run (all compounds in each run), not just the top-N candidate subset.
+- Use `--group-style plain` to label groups as Active/Inactive/Common (no “specific” wording).
+- Use `--no-hit-filter` to include all compounds regardless of GLM/RS/Consensus/NEG QC flags (use with care; output can be very large).
 - Optional final list tab: `--final-hits DELeGANce_out/tier_report/final_hits.tsv` embeds a "Final hits" tab in the HTML (auto-detects `final_hits.tsv` in `--out-dir` if not provided).
 - Final hit selection (writes `final_hits.tsv/.xlsx`):
   `--final-active-n 15 --final-inactive-n 15 --final-common-n 10` (Common = Both-specific).
@@ -499,7 +502,8 @@ Notes:
 - HTML tables display missing values as `-` (keeps real values intact without implying zeros).
 - Unprefixed sample columns (e.g., `K_R2C1`, `K_R2C1_CPM`) are coalesced from prefixed run columns when available
   (active → inactive → both). If still missing, they remain `-`.
-- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: prefixed).
+- Sample column display mode for HTML tables: `--sample-cols-mode coalesced|prefixed|both` (default: coalesced).
+- Group label style in outputs: `--group-style specific|plain` (default: specific). Use `plain` to avoid the “specific” wording.
 - Identical prefixed sample columns (for example shared controls across runs) are deduplicated in the HTML tables.
 - Group defaults (rank_pct percentiles per run):
   SampleA-specific (SampleA >= 99, SampleB <= 50), SampleB-specific (SampleB >= 99, SampleA <= 50),
@@ -508,6 +512,21 @@ Notes:
 - Clustering similarity default is `bbavg` (per-BB average). Use `--cluster-mode compound_or` for OR fingerprints.
 - Plot ranges: `--plot-x-range auto` / `--plot-y-range auto` (default) or fixed ranges like `99,100`.
 - Use `--html-mode inline` to embed all JS/CSS for offline sharing (larger file size).
+
+### Export full run TSVs (active/inactive/merged)
+If you need the complete run tables (no filters), export full TSVs for each run and a merged table:
+```bash
+python3 export_full_runs.py \
+  --active-run DELeGANce_out/SampleA_run \
+  --inactive-run DELeGANce_out/SampleB_run \
+  --preset glm_full_dev_cuda_fp32 \
+  --out-dir DELeGANce_out/full_runs_export \
+  --active-label SampleA --inactive-label SampleB
+```
+This writes:
+- `SampleA_all.tsv` (full active run)
+- `SampleB_all.tsv` (full inactive run)
+- `merged_all.tsv` (outer-joined by compound_key; shared ID/BB/CP/sample columns are coalesced)
 
 ### Export beginner QC and Excel
 ```bash

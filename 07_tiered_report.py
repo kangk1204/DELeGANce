@@ -18,7 +18,7 @@ try:
     from bokeh.layouts import column, row
     from bokeh.models import (ColumnDataSource, CustomJS, DataTable, Div, HoverTool,
                               HTMLTemplateFormatter, NumberFormatter, Panel, TableColumn,
-                              Tabs, TabPanel, Button, TextInput, MultiSelect)
+                              Tabs, TabPanel, Button, TextInput, MultiSelect, Select)
     from bokeh.plotting import figure
 except Exception:
     _HAS_BOKEH = False
@@ -81,13 +81,27 @@ def _summary_cards(cards: List[Tuple[str, str]]) -> str:
     return "\n".join(parts)
 
 
+GROUP_COLOR_MAP = {
+    "Active-specific": "#1b9e77",
+    "Inactive-specific": "#d95f02",
+    "Both-specific": "#7570b3",
+    "Other": "#9e9e9e",
+}
+EXCEL_MAX_ROWS = 1_048_576
+
+
+def _write_excel_safe(df: pd.DataFrame, path: str, label: str) -> None:
+    try:
+        if len(df) > EXCEL_MAX_ROWS:
+            print(f"[WARN] Skipping Excel for {label}: {len(df)} rows exceeds Excel limit ({EXCEL_MAX_ROWS})")
+            return
+        df.to_excel(path, index=False)
+    except Exception as exc:
+        print(f"[WARN] Failed to write {label} Excel ({exc})")
+
+
 def _group_color(code: str) -> str:
-    return {
-        "Active-specific": "#1b9e77",
-        "Inactive-specific": "#d95f02",
-        "Both-specific": "#7570b3",
-        "Other": "#9e9e9e",
-    }.get(code, "#9e9e9e")
+    return GROUP_COLOR_MAP.get(code, "#9e9e9e")
 
 
 def _add_group_badge(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,6 +183,10 @@ def _apply_recommend_filter(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _passthrough_filter(df: pd.DataFrame) -> pd.DataFrame:
+    return df
+
+
 def _sanitize_label(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "run"
 
@@ -205,9 +223,10 @@ def _coalesce_unprefixed_samples(df: pd.DataFrame, base_cols: List[str],
                                  prefixes: List[str]) -> pd.DataFrame:
     out = df.copy()
     for col in base_cols:
-        if col not in out.columns:
-            continue
-        series = pd.to_numeric(out[col], errors="coerce")
+        if col in out.columns:
+            series = pd.to_numeric(out[col], errors="coerce")
+        else:
+            series = pd.Series([np.nan] * len(out), index=out.index, dtype=float)
         for pre in prefixes:
             pref_col = f"{pre}{col}"
             if pref_col in out.columns:
@@ -695,6 +714,15 @@ def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
     pages = (total + page_size - 1) // page_size if total else 0
     page_label = f"1/{pages}" if pages else "0/0"
     search = TextInput(title="Search", value="", placeholder="compound_key / ID / BB / CP")
+    sort_cols = list(full.data.keys()) if full.data else []
+    sort_default = "__none__"
+    for cand in ["group_rank", "rank", "group_rank_score", "specificity_score", "HitScore_GLM"]:
+        if cand in sort_cols:
+            sort_default = cand
+            break
+    sort_options = ["__none__"] + sort_cols if sort_cols else ["__none__"]
+    sort_select = Select(title="Sort by", value=sort_default, options=sort_options)
+    sort_dir = Select(title="Order", value="desc", options=["desc", "asc"])
     if shown:
         count_text = f"<span class='table-count'>Showing 1-{shown} of {total} (page {page_label})</span>"
     else:
@@ -713,7 +741,7 @@ def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
     filter_js = """
 const data = full.data;
 const cols = Object.keys(data);
-const out = {};
+let out = {};
 for (const c of cols) { out[c] = []; }
 const term = (search.value || '').toLowerCase();
 const hasGroup = group !== null;
@@ -740,6 +768,33 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  idx.sort((a, b) => {
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
+}
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -758,10 +813,13 @@ count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page $
 """
     args = dict(
         source=source, full=full, search=search, count_div=count_div,
-        group=group_select, group_col=group_col or "", page_state=page_state, page_size=page_size
+        group=group_select, group_col=group_col or "", page_state=page_state, page_size=page_size,
+        sort_col=sort_select, sort_dir=sort_dir
     )
     callback = CustomJS(args=args, code=filter_js)
     search.js_on_change("value", callback)
+    sort_select.js_on_change("value", callback)
+    sort_dir.js_on_change("value", callback)
     if group_select is not None:
         group_select.js_on_change("value", callback)
 
@@ -770,8 +828,35 @@ const data = full.data;
 search.value = '';
 if (group !== null) { group.value = group.options; }
 const cols = Object.keys(data);
-const out = {};
+let out = {};
 for (const c of cols) { out[c] = data[c].slice(); }
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  idx.sort((a, b) => {
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
+}
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -793,7 +878,7 @@ count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page $
     prev_js = """
 const data = full.data;
 const cols = Object.keys(data);
-const out = {};
+let out = {};
 for (const c of cols) { out[c] = []; }
 const term = (search.value || '').toLowerCase();
 const hasGroup = group !== null;
@@ -819,6 +904,33 @@ for (let i = 0; i < n; i++) {
   if (keep) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
+}
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  idx.sort((a, b) => {
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
 }
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
@@ -844,7 +956,7 @@ count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page $
     next_js = """
 const data = full.data;
 const cols = Object.keys(data);
-const out = {};
+let out = {};
 for (const c of cols) { out[c] = []; }
 const term = (search.value || '').toLowerCase();
 const hasGroup = group !== null;
@@ -870,6 +982,33 @@ for (let i = 0; i < n; i++) {
   if (keep) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
+}
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  idx.sort((a, b) => {
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
 }
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
@@ -906,7 +1045,7 @@ function csvEscape(value) {
 }
 const data = full.data;
 const cols = Object.keys(data);
-const out = {};
+let out = {};
 for (const c of cols) { out[c] = []; }
 const term = (search.value || '').toLowerCase();
 const hasGroup = group !== null;
@@ -933,6 +1072,33 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  idx.sort((a, b) => {
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
+}
 const nout = cols.length ? out[cols[0]].length : 0;
 let csv = cols.join(',') + '\\n';
 for (let i = 0; i < nout; i++) {
@@ -950,13 +1116,9 @@ a.click();
 document.body.removeChild(a);
 URL.revokeObjectURL(url);
 """
-    download_btn.js_on_click(CustomJS(
-        args=dict(source=source, full=full, search=search, group=group_select,
-                  group_col=group_col or "", filename=filename),
-        code=download_js
-    ))
+    download_btn.js_on_click(CustomJS(args=args, code=download_js))
 
-    controls = [search]
+    controls = [search, sort_select, sort_dir]
     if group_select is not None:
         controls.append(group_select)
     controls.extend([prev_btn, next_btn, reset_btn, download_btn, count_div])
@@ -1005,33 +1167,34 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     compound_formatter = _img_formatter(55, 220)
     badge_formatter = HTMLTemplateFormatter(template="<%= value %>")
     nan_fmt = "-"
+    col_kwargs = dict(sortable=False)
 
     for col in table_df.columns:
         if col == "group_badge":
-            table_cols.append(TableColumn(field=col, title="group", formatter=badge_formatter, width=_col_width(col, table_df[col])))
+            table_cols.append(TableColumn(field=col, title="group", formatter=badge_formatter, width=_col_width(col, table_df[col]), **col_kwargs))
             continue
         if col.startswith("bb") and col.endswith("_img"):
-            table_cols.append(TableColumn(field=col, title=col, formatter=img_formatter, width=_col_width(col, table_df[col])))
+            table_cols.append(TableColumn(field=col, title=col, formatter=img_formatter, width=_col_width(col, table_df[col]), **col_kwargs))
             continue
         if col == "compound_img":
-            table_cols.append(TableColumn(field=col, title="compound_img", formatter=compound_formatter, width=_col_width(col, table_df[col])))
+            table_cols.append(TableColumn(field=col, title="compound_img", formatter=compound_formatter, width=_col_width(col, table_df[col]), **col_kwargs))
             continue
         if col == "structure_html":
             continue
         if table_df[col].dtype.kind in "if":
             if col in ("rank", "cluster_size", "cluster_rep", "cluster_medoid", "group_rank"):
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce").fillna(0).astype(int)
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col]), **col_kwargs))
             elif col in sample_cols and not col.endswith("_CPM"):
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0", nan_format=nan_fmt), width=_col_width(col, table_df[col]), **col_kwargs))
             else:
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce").round(4)
-                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000", nan_format=nan_fmt), width=_col_width(col, table_df[col])))
+                table_cols.append(TableColumn(field=col, title=col, formatter=NumberFormatter(format="0.0000", nan_format=nan_fmt), width=_col_width(col, table_df[col]), **col_kwargs))
         else:
             series = table_df[col].astype(object)
             table_df[col] = series.where(series.notna(), nan_fmt)
-            table_cols.append(TableColumn(field=col, title=col, width=_col_width(col, table_df[col])))
+            table_cols.append(TableColumn(field=col, title=col, width=_col_width(col, table_df[col]), **col_kwargs))
 
     if not table_cols:
         return None, None
@@ -1167,6 +1330,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                out_html: str, title: str, max_table: int,
                plot_x_range: Optional[str], plot_y_range: Optional[str],
                sample_cols: List[str], group_display: Dict[str, str],
+               group_codes: Dict[str, str],
                active_label: str, inactive_label: str,
                table_page_size: int,
                final_df: Optional[pd.DataFrame] = None,
@@ -1179,12 +1343,15 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     items = [Div(text=_style_block())]
     summary = group_tables.get("summary", {})
     group_defs = summary.get("group_defs", {})
-    a_def = group_defs.get("Active-specific", "")
-    i_def = group_defs.get("Inactive-specific", "")
-    b_def = group_defs.get("Both-specific", "")
-    disp_active = group_display.get("Active-specific", "Active-specific")
-    disp_inactive = group_display.get("Inactive-specific", "Inactive-specific")
-    disp_both = group_display.get("Both-specific", "Both-specific")
+    active_code = group_codes.get("active", "Active-specific")
+    inactive_code = group_codes.get("inactive", "Inactive-specific")
+    both_code = group_codes.get("both", "Both-specific")
+    a_def = group_defs.get(active_code, "")
+    i_def = group_defs.get(inactive_code, "")
+    b_def = group_defs.get(both_code, "")
+    disp_active = group_display.get(active_code, active_code)
+    disp_inactive = group_display.get(inactive_code, inactive_code)
+    disp_both = group_display.get(both_code, both_code)
     cards = [
         ("Candidates", str(summary.get("n_candidates", 0))),
         (disp_active, str(summary.get("n_active", 0))),
@@ -1221,10 +1388,10 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     df_plot["selectivity_score"] = pd.to_numeric(df_plot.get("selectivity_score", 0), errors="coerce").fillna(0.0)
 
     colors = {
-        "Active-specific": "#1b9e77",
-        "Inactive-specific": "#d95f02",
-        "Both-specific": "#7570b3",
-        "Other": "#bdbdbd",
+        active_code: "#1b9e77",
+        inactive_code: "#d95f02",
+        both_code: "#7570b3",
+        group_codes.get("other", "Other"): "#bdbdbd",
     }
     df_plot["color"] = df_plot["group_code"].map(colors).fillna("#bdbdbd")
     cds = ColumnDataSource(df_plot)
@@ -1263,7 +1430,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     summary_panel = _make_panel(column(*items, sizing_mode="stretch_width"), "Specific/Common Summary")
 
     tabs = [summary_panel]
-    for group in ["Active-specific", "Inactive-specific", "Both-specific"]:
+    for group in [active_code, inactive_code, both_code]:
         group_info = group_tables.get(group, {})
         df_all_tier = group_info.get("all", pd.DataFrame())
         df_div = group_info.get("diverse", pd.DataFrame())
@@ -1320,7 +1487,7 @@ def main() -> int:
                     help="Optional labels for active/inactive/(both) runs (same order)")
     ap.add_argument("--preset", default=None, help="Optional preset under 03_normalized")
     ap.add_argument("--score-col", default=None, help="Override score column")
-    ap.add_argument("--top-n", type=int, default=1000, help="Top N from active run to consider")
+    ap.add_argument("--top-n", type=int, default=1000, help="Top N from each run to consider (0 = all)")
     ap.add_argument("--out-dir", required=True, help="Output directory")
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: tier_report)")
     ap.add_argument("--no-html", action="store_true", help="Skip HTML output")
@@ -1332,10 +1499,14 @@ def main() -> int:
                     help="Summary plot X range 'min,max' or 'auto' (default: auto)")
     ap.add_argument("--plot-y-range", default="auto",
                     help="Summary plot Y range 'min,max' or 'auto' (default: auto)")
-    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="prefixed",
-                    help="Sample columns in HTML tables: coalesced, prefixed, or both (default: prefixed)")
+    ap.add_argument("--sample-cols-mode", choices=["coalesced", "prefixed", "both"], default="coalesced",
+                    help="Sample columns in HTML tables: coalesced, prefixed, or both (default: coalesced)")
+    ap.add_argument("--group-style", choices=["specific", "plain"], default="specific",
+                    help="Group label style in outputs: specific (Active-specific) or plain (Active/Inactive/Common)")
     ap.add_argument("--rank-by", choices=["enrichment", "specificity"], default="enrichment",
                     help="Group ranking basis (default: enrichment)")
+    ap.add_argument("--no-hit-filter", action="store_true",
+                    help="Disable hit/QC filters (GLM_hit/RS_pass/Consensus_hit/NEG_hard_fail)")
     ap.add_argument("--enrich-agg", choices=["median", "mean", "max"], default="median",
                     help="Aggregate per-group enrichment across samples (default: median)")
     ap.add_argument("--common-enrich", choices=["min", "mean", "gmean"], default="min",
@@ -1406,12 +1577,43 @@ def main() -> int:
     active_label = labels[0] if len(labels) > 0 else "sampleA"
     inactive_label = labels[1] if len(labels) > 1 else "sampleB"
     both_label = labels[2] if len(labels) > 2 else "both"
-    group_display = {
-        "Active-specific": f"{active_label}-specific",
-        "Inactive-specific": f"{inactive_label}-specific",
-        "Both-specific": f"Common ({active_label}&{inactive_label})",
-        "Other": "Other",
+    if args.group_style == "plain":
+        group_codes = {
+            "active": "Active",
+            "inactive": "Inactive",
+            "both": "Common",
+            "other": "Other",
+        }
+        group_display = {
+            group_codes["active"]: active_label,
+            group_codes["inactive"]: inactive_label,
+            group_codes["both"]: f"Common ({active_label}&{inactive_label})",
+            group_codes["other"]: "Other",
+        }
+    else:
+        group_codes = {
+            "active": "Active-specific",
+            "inactive": "Inactive-specific",
+            "both": "Both-specific",
+            "other": "Other",
+        }
+        group_display = {
+            group_codes["active"]: f"{active_label}-specific",
+            group_codes["inactive"]: f"{inactive_label}-specific",
+            group_codes["both"]: f"Common ({active_label}&{inactive_label})",
+            group_codes["other"]: "Other",
+        }
+    global GROUP_COLOR_MAP
+    GROUP_COLOR_MAP = {
+        group_codes["active"]: "#1b9e77",
+        group_codes["inactive"]: "#d95f02",
+        group_codes["both"]: "#7570b3",
+        group_codes["other"]: "#9e9e9e",
     }
+    group_active = group_codes["active"]
+    group_inactive = group_codes["inactive"]
+    group_both = group_codes["both"]
+    group_other = group_codes["other"]
     rep_col = "cluster_medoid" if args.cluster_rep == "medoid" else "cluster_rep"
     score_col = _infer_score_col(run_paths, args.preset, args.score_col)
 
@@ -1504,13 +1706,15 @@ def main() -> int:
     inactive_samples = _sample_block(df_inactive_best, inactive_sample_cols, inactive_rename)
     both_samples = _sample_block(df_both_best, both_sample_cols, both_rename) if df_both_best is not None else None
 
-    top_n = max(1, int(args.top_n))
+    top_n = int(args.top_n)
+    use_all = top_n <= 0
+    apply_filter = _passthrough_filter if args.no_hit_filter else _apply_recommend_filter
     top_frames = []
     for df_best in (df_active_best, df_inactive_best, df_both_best):
         if df_best is None or df_best.empty:
             continue
-        df_top = df_best.head(top_n).copy()
-        df_top = _apply_recommend_filter(df_top)
+        df_top = df_best.copy() if use_all else df_best.head(top_n).copy()
+        df_top = apply_filter(df_top)
         if not df_top.empty:
             top_frames.append(df_top)
     if not top_frames:
@@ -1630,13 +1834,13 @@ def main() -> int:
             and row["inactive_rank_pct"] <= float(args.active_spec_max_inactive)
         )
         if a_pass:
-            return "Active-specific"
+            return group_active
         i_pass = (
             row["inactive_rank_pct"] >= float(args.inactive_spec_min)
             and row["active_rank_pct"] <= float(args.inactive_spec_max_active)
         )
         if i_pass:
-            return "Inactive-specific"
+            return group_inactive
         min_active = max(float(args.both_spec_min), float(args.both_spec_min_active))
         min_inactive = max(float(args.both_spec_min), float(args.both_spec_min_inactive))
         b_pass = (
@@ -1644,15 +1848,15 @@ def main() -> int:
             and row["inactive_rank_pct"] >= min_inactive
         )
         if b_pass:
-            return "Both-specific"
-        return "Other"
+            return group_both
+        return group_other
 
     df_base["group_code"] = df_base.apply(_assign_group, axis=1)
     df_base["specificity_score"] = np.select(
         [
-            df_base["group_code"] == "Active-specific",
-            df_base["group_code"] == "Inactive-specific",
-            df_base["group_code"] == "Both-specific",
+            df_base["group_code"] == group_active,
+            df_base["group_code"] == group_inactive,
+            df_base["group_code"] == group_both,
         ],
         [
             df_base["selectivity_score"],
@@ -1674,16 +1878,16 @@ def main() -> int:
     else:
         cluster_df = None
 
-    group_order = ["Active-specific", "Inactive-specific", "Both-specific", "Other"]
+    group_order = [group_active, group_inactive, group_both, group_other]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
     group_active_enrich = df_base["active_enrich"].fillna(float("-inf"))
     group_inactive_enrich = df_base["inactive_enrich"].fillna(float("-inf"))
     group_both_enrich = df_base["both_enrich"].fillna(float("-inf"))
     df_base["group_rank_score"] = np.select(
         [
-            df_base["group_code"] == "Active-specific",
-            df_base["group_code"] == "Inactive-specific",
-            df_base["group_code"] == "Both-specific",
+            df_base["group_code"] == group_active,
+            df_base["group_code"] == group_inactive,
+            df_base["group_code"] == group_both,
         ],
         [
             group_active_enrich if args.rank_by == "enrichment" else df_base["specificity_score"],
@@ -1694,9 +1898,9 @@ def main() -> int:
     )
     df_base["group_tiebreak_score"] = np.select(
         [
-            df_base["group_code"] == "Active-specific",
-            df_base["group_code"] == "Inactive-specific",
-            df_base["group_code"] == "Both-specific",
+            df_base["group_code"] == group_active,
+            df_base["group_code"] == group_inactive,
+            df_base["group_code"] == group_both,
         ],
         [
             df_base["active_score"],
@@ -1722,14 +1926,55 @@ def main() -> int:
 
     out_all = f"{prefix}_all_candidates.tsv"
     df_base.to_csv(out_all, sep="\t", index=False)
+    out_all_xlsx = f"{prefix}_all_candidates.xlsx"
+    try:
+        if not use_all:
+            sample_all = set(base_sample_cols + prefixed_sample_cols)
+            sample_keep = display_sample_cols or []
+            all_export = df_base.drop(columns=[c for c in df_base.columns if c in sample_all and c not in sample_keep])
+            all_export = all_export[_final_hits_column_order(all_export, sample_keep)]
+            _write_excel_safe(all_export, out_all_xlsx, "all-candidates")
+            def _export_run_candidates(label: str, sample_cols: List[str]):
+                if not sample_cols:
+                    return
+                pref = f"{label}_"
+                view = df_base.copy()
+                for col in sample_cols:
+                    pref_col = f"{pref}{col}"
+                    if pref_col in view.columns:
+                        view[col] = view[pref_col]
+                drop_cols = []
+                for c in view.columns:
+                    if c in prefixed_sample_cols and not c.startswith(pref):
+                        drop_cols.append(c)
+                    if c in base_sample_cols and c not in sample_cols:
+                        drop_cols.append(c)
+                if drop_cols:
+                    view = view.drop(columns=list(set(drop_cols)), errors="ignore")
+                sample_keep_run = [c for c in sample_cols if c in view.columns]
+                view = view[_final_hits_column_order(view, sample_keep_run)]
+                _write_excel_safe(view, f"{prefix}_all_candidates_{label}.xlsx", f"all-candidates-{label}")
+            _export_run_candidates(active_label, active_sample_cols)
+            _export_run_candidates(inactive_label, inactive_sample_cols)
+        else:
+            print("[INFO] all-candidates Excel disabled for full (top-n=0) run; TSV only.")
+    except Exception as exc:
+        print(f"[WARN] Failed to write all-candidates Excel ({exc})")
 
     groups = {}
     diverse_total = 0
-    group_map = {
-        "Active-specific": "active_specific",
-        "Inactive-specific": "inactive_specific",
-        "Both-specific": "both_specific",
-    }
+    if args.group_style == "plain":
+        group_map = {
+            group_active: "active",
+            group_inactive: "inactive",
+            group_both: "common",
+        }
+    else:
+        group_map = {
+            group_active: "active_specific",
+            group_inactive: "inactive_specific",
+            group_both: "both_specific",
+        }
     for group, tag in group_map.items():
         df_group = df_base[df_base["group_code"] == group].copy()
         df_div = df_group.copy()
@@ -1742,7 +1987,7 @@ def main() -> int:
         diverse_total += len(df_div)
         groups[group] = {"all": df_group, "diverse": df_div, "path": df_group_path, "diverse_path": df_div_path}
 
-    df_other = df_base[df_base["group_code"] == "Other"].copy()
+    df_other = df_base[df_base["group_code"] == group_other].copy()
     other_path = None
     if not df_other.empty:
         other_path = f"{prefix}_other.tsv"
@@ -1755,20 +2000,20 @@ def main() -> int:
     min_active = max(float(args.both_spec_min), float(args.both_spec_min_active))
     min_inactive = max(float(args.both_spec_min), float(args.both_spec_min_inactive))
     group_defs = {
-        "Active-specific": f" ({active_label}≥{args.active_spec_min}, {inactive_label}≤{args.active_spec_max_inactive})",
-        "Inactive-specific": f" ({inactive_label}≥{args.inactive_spec_min}, {active_label}≤{args.inactive_spec_max_active})",
-        "Both-specific": f" ({active_label}≥{min_active}, {inactive_label}≥{min_inactive})",
+        group_active: f" ({active_label}≥{args.active_spec_min}, {inactive_label}≤{args.active_spec_max_inactive})",
+        group_inactive: f" ({inactive_label}≥{args.inactive_spec_min}, {active_label}≤{args.inactive_spec_max_active})",
+        group_both: f" ({active_label}≥{min_active}, {inactive_label}≥{min_inactive})",
     }
     summary = {
         "n_candidates": len(df_base),
-        "n_active": len(groups.get("Active-specific", {}).get("all", [])),
-        "n_inactive": len(groups.get("Inactive-specific", {}).get("all", [])),
-        "n_both": len(groups.get("Both-specific", {}).get("all", [])),
+        "n_active": len(groups.get(group_active, {}).get("all", [])),
+        "n_inactive": len(groups.get(group_inactive, {}).get("all", [])),
+        "n_both": len(groups.get(group_both, {}).get("all", [])),
         "n_other": len(df_other),
         "n_diverse": diverse_total,
-        "n_active_diverse": len(groups.get("Active-specific", {}).get("diverse", [])),
-        "n_inactive_diverse": len(groups.get("Inactive-specific", {}).get("diverse", [])),
-        "n_both_diverse": len(groups.get("Both-specific", {}).get("diverse", [])),
+        "n_active_diverse": len(groups.get(group_active, {}).get("diverse", [])),
+        "n_inactive_diverse": len(groups.get(group_inactive, {}).get("diverse", [])),
+        "n_both_diverse": len(groups.get(group_both, {}).get("diverse", [])),
         "group_defs": group_defs,
     }
     group_tables = {"summary": summary, **groups}
@@ -1776,14 +2021,14 @@ def main() -> int:
     final_df = None
     final_title = None
     final_counts = {
-        "Active-specific": max(0, int(args.final_active_n)),
-        "Inactive-specific": max(0, int(args.final_inactive_n)),
-        "Both-specific": max(0, int(args.final_common_n)),
+        group_active: max(0, int(args.final_active_n)),
+        group_inactive: max(0, int(args.final_inactive_n)),
+        group_both: max(0, int(args.final_common_n)),
     }
     final_total = sum(final_counts.values())
     if final_total > 0:
         final_parts = []
-        for group in ["Active-specific", "Inactive-specific", "Both-specific"]:
+        for group in [group_active, group_inactive, group_both]:
             n = final_counts.get(group, 0)
             if n <= 0:
                 continue
@@ -1800,9 +2045,9 @@ def main() -> int:
         if final_parts:
             final_df = pd.concat(final_parts, ignore_index=True)
             final_title = (
-                f"Final hits ({active_label}={final_counts['Active-specific']}, "
-                f"{inactive_label}={final_counts['Inactive-specific']}, "
-                f"Common={final_counts['Both-specific']})"
+                f"Final hits ({active_label}={final_counts[group_active]}, "
+                f"{inactive_label}={final_counts[group_inactive]}, "
+                f"Common={final_counts[group_both]})"
             )
             final_prefix = os.path.join(args.out_dir, "final_hits")
             sample_all = set(base_sample_cols + prefixed_sample_cols)
@@ -1810,7 +2055,7 @@ def main() -> int:
             final_export = final_df.drop(columns=[c for c in final_df.columns if c in sample_all and c not in sample_keep])
             final_export = final_export[_final_hits_column_order(final_export, sample_keep)]
             if "final_group_code" in final_export.columns and "final_group_rank" in final_export.columns:
-                order = ["Active-specific", "Inactive-specific", "Both-specific"]
+                order = [group_active, group_inactive, group_both]
                 final_export["final_group_code"] = pd.Categorical(
                     final_export["final_group_code"], categories=order, ordered=True
                 )
@@ -1818,10 +2063,7 @@ def main() -> int:
                     ["final_group_code", "final_group_rank"], ascending=[True, True]
                 )
             final_export.to_csv(f"{final_prefix}.tsv", sep="\t", index=False)
-            try:
-                final_export.to_excel(f"{final_prefix}.xlsx", index=False)
-            except Exception as exc:
-                print(f"[WARN] Failed to write final hits Excel ({exc})")
+            _write_excel_safe(final_export, f"{final_prefix}.xlsx", "final_hits")
             print(f"[INFO] final_hits: {final_prefix}.tsv")
         else:
             print("[WARN] final_hits requested but no rows matched group cutoffs.")
@@ -1852,6 +2094,7 @@ def main() -> int:
                    plot_y_range=args.plot_y_range,
                    sample_cols=display_sample_cols,
                    group_display=group_display,
+                   group_codes=group_codes,
                    active_label=active_label,
                    inactive_label=inactive_label,
                    table_page_size=int(args.table_page_size),
