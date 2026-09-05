@@ -7,8 +7,11 @@ from typing import List, Optional, Tuple
 import pandas as pd
 
 
-LIB_SUFFIX_RE = re.compile(r"_LIB[\w\.-]+$")
-LIB_ANY_RE = re.compile(r"_LIB[\w\.-]+")
+# Anchored: strip only a trailing "_LIB<lib>" namespace token from a single BB value
+LIB_SUFFIX_RE = re.compile(r"_LIB[^_]+$")
+# Token-anchored variant for full tag IDs (cycles_BB1_BB2_BB3[_BB4]); the old unanchored
+# pattern (\w includes "_") consumed everything after the first "_LIB" and truncated the ID.
+LIB_ANY_RE = re.compile(r"_LIB[^_]+(?=_|$)")
 
 
 def strip_lib_suffix(value) -> str:
@@ -48,7 +51,13 @@ def parse_id_fields(id_str: str) -> Tuple[str, str, str, str]:
     i = 0
     while i < len(raw) and len(parts) < 4:
         t = raw[i]
-        if i + 1 < len(raw) and raw[i + 1].startswith("LIB") and t not in ("NA", ""):
+        # Same guard as 03_call_hits.parse_id_fields: a token that itself starts with "LIB"
+        # is a BB id, not a namespace fragment to be glued onto the previous token.
+        if (
+            i + 1 < len(raw)
+            and raw[i + 1].startswith("LIB")
+            and (t not in ("NA", "") and not t.startswith("LIB"))
+        ):
             parts.append(f"{t}_{raw[i + 1]}")
             i += 2
         else:
@@ -142,8 +151,9 @@ def main() -> None:
     cur_df["_KEY"] = cur_df[cur_lib].astype(str) + "|" + cur_df[cur_id].astype(str)
     prev_df["_KEY"] = prev_df[prev_lib].astype(str) + "|" + prev_df[prev_id].astype(str)
 
-    cur_top = cur_df.sort_values(score, ascending=False).head(args.top_n)
-    prev_top = prev_df.sort_values(score, ascending=False).head(args.top_n)
+    # Stable sort with _KEY tie-breaker so top-N membership/ranks are reproducible for equal scores
+    cur_top = cur_df.sort_values([score, "_KEY"], ascending=[False, True], kind="mergesort").head(args.top_n)
+    prev_top = prev_df.sort_values([score, "_KEY"], ascending=[False, True], kind="mergesort").head(args.top_n)
 
     cur_set = set(cur_top["_KEY"])
     prev_set = set(prev_top["_KEY"])
@@ -156,11 +166,12 @@ def main() -> None:
     ]
     cols = [c for c in cols if c in cur_df.columns and c in prev_df.columns]
 
-    cur_sub = cur_df[["_KEY"] + cols].copy()
-    prev_sub = prev_df[["_KEY"] + cols].copy()
+    # Restrict to the union of the two top-N sets first, then OUTER-merge so a compound that is
+    # absent from one input file is kept (the previous inner merge silently dropped it).
+    cur_sub = cur_df.loc[cur_df["_KEY"].isin(union_keys), ["_KEY", *cols]].drop_duplicates("_KEY").copy()
+    prev_sub = prev_df.loc[prev_df["_KEY"].isin(union_keys), ["_KEY", *cols]].drop_duplicates("_KEY").copy()
 
-    m = cur_sub.merge(prev_sub, on="_KEY", suffixes=("_cur", "_prev"))
-    m = m[m["_KEY"].isin(union_keys)].copy()
+    m = cur_sub.merge(prev_sub, on="_KEY", how="outer", suffixes=("_cur", "_prev"))
 
     # rank info
     cur_rank = {k: i + 1 for i, k in enumerate(cur_top["_KEY"].tolist())}
@@ -170,6 +181,11 @@ def main() -> None:
     m["status"] = "both"
     m.loc[m["rank_cur"].isna(), "status"] = "only_prev"
     m.loc[m["rank_prev"].isna(), "status"] = "only_cur"
+    # Distinguish "not in the other run's top-N" from "absent from the other run's file"
+    in_cur_file = m["_KEY"].isin(set(cur_df["_KEY"]))
+    in_prev_file = m["_KEY"].isin(set(prev_df["_KEY"]))
+    m["in_cur_file"] = in_cur_file
+    m["in_prev_file"] = in_prev_file
 
     # diffs
     for c in cols:
@@ -182,19 +198,21 @@ def main() -> None:
     disp_prev = compute_display_fields(prev_df)
     disp_cur["_KEY"] = cur_df["_KEY"]
     disp_prev["_KEY"] = prev_df["_KEY"]
-    disp = disp_cur.merge(disp_prev, on="_KEY", suffixes=("_cur", "_prev"))
-    # prefer current display values
+    disp_cur = disp_cur[disp_cur["_KEY"].isin(union_keys)].drop_duplicates("_KEY")
+    disp_prev = disp_prev[disp_prev["_KEY"].isin(union_keys)].drop_duplicates("_KEY")
+    disp = disp_cur.merge(disp_prev, on="_KEY", how="outer", suffixes=("_cur", "_prev"))
+    # prefer current display values; fall back to previous when the compound is only in prev
     disp_out = pd.DataFrame({
         "_KEY": disp["_KEY"],
-        "LibID": disp["LibID_cur"],
-        "ID": disp["ID_cur"],
-        "BB1": disp["BB1_cur"],
-        "BB2": disp["BB2_cur"],
-        "BB3": disp["BB3_cur"],
-        "BB4": disp["BB4_cur"],
+        "LibID": disp["LibID_cur"].combine_first(disp["LibID_prev"]),
+        "ID": disp["ID_cur"].combine_first(disp["ID_prev"]),
+        "BB1": disp["BB1_cur"].combine_first(disp["BB1_prev"]),
+        "BB2": disp["BB2_cur"].combine_first(disp["BB2_prev"]),
+        "BB3": disp["BB3_cur"].combine_first(disp["BB3_prev"]),
+        "BB4": disp["BB4_cur"].combine_first(disp["BB4_prev"]),
     })
 
-    out = disp_out.merge(m, on="_KEY", how="inner")
+    out = disp_out.merge(m, on="_KEY", how="left")
     # Add NEG center shift (estimated) for each run when columns exist
     if ("LFC_NEG_vs_DEL2_used_cur" in out.columns) and ("LFC_NEG_centered_cur" in out.columns):
         out["NEG_center_shift_cur"] = pd.to_numeric(out["LFC_NEG_vs_DEL2_used_cur"], errors="coerce") - pd.to_numeric(out["LFC_NEG_centered_cur"], errors="coerce")
@@ -267,7 +285,7 @@ def main() -> None:
                 import xlsxwriter  # noqa: F401
                 engine = "xlsxwriter"
             except Exception:
-                raise SystemExit("openpyxl 또는 xlsxwriter가 필요합니다.")
+                raise SystemExit("openpyxl 또는 xlsxwriter가 필요합니다.") from None
         xlsx_path = Path(args.top_summary_xlsx)
         xlsx_path.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(xlsx_path, engine=engine) as writer:

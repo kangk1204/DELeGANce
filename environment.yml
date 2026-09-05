@@ -5,13 +5,16 @@ channels:
   - pytorch
 dependencies:
   - python=3.10
+  - perl              # 01_preprocess_reads.pl / 02_decode_reads.pl (system perl also works)
   - fastp
   - numpy
-  - pandas
+  - pandas>=2.0
   - scipy
   - matplotlib
-  - bokeh
+  - bokeh>=3.4
   - narwhals
+  - openpyxl          # Excel output: export_final_excel.py, make_top_hit_shift_report.py, 07_tiered_report.py (final_hits.xlsx)
+  - networkx          # optional in 03_call_hits.py
   - rdkit
   - pytorch
   - pip

@@ -12,7 +12,6 @@ import argparse
 import base64
 import os
 import re
-import sys
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
@@ -49,7 +48,34 @@ _TRANSPARENT_PNG = (
 def _pick_latest(paths: List[str]) -> Optional[str]:
     if not paths:
         return None
-    return max(paths, key=lambda p: os.path.getmtime(p))
+    return max(paths, key=os.path.getmtime)
+
+
+# Hybrid-table key columns. 03_call_hits currently emits merge-suffixed names (ID_x, LIB_ID_x, BB1_x, ...);
+# a future release may drop the suffix. Internally we normalise to the *_x names so downstream code and the
+# output TSV column names (rep_ID_x, ...) stay unchanged.
+_KEY_COL_BASES = ["ID", "LIB_ID", "BB1", "BB2", "BB3", "BB4", "CP"]
+
+
+def pick_col(df_or_cols, primary: str, *fallbacks: str) -> Optional[str]:
+    """Return the first present column among primary/fallbacks, e.g. pick_col(df, 'ID_x', 'ID')."""
+    cols = list(df_or_cols.columns) if hasattr(df_or_cols, "columns") else list(df_or_cols)
+    for c in (primary, *fallbacks):
+        if c in cols:
+            return c
+    return None
+
+
+def normalize_key_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure ID_x/LIB_ID_x/BB1_x..BB4_x/CP_x exist, aliasing from un-suffixed names when needed."""
+    for base in _KEY_COL_BASES:
+        want = f"{base}_x"
+        if want in df.columns:
+            continue
+        src_col = pick_col(df, base, f"{base}_y")
+        if src_col is not None:
+            df[want] = df[src_col]
+    return df
 
 
 def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
@@ -155,13 +181,26 @@ def _compound_key_from_row(row: pd.Series) -> str:
     return "|".join(vals)
 
 
+_MORGAN_GEN_CACHE: Dict[Tuple[int, int], object] = {}
+
+
 def _fp_from_smiles(smiles: str, radius: int, nbits: int):
     if not isinstance(smiles, str) or not smiles.strip():
         return None
     mol = Chem.MolFromSmiles(smiles)
     if not mol:
         return None
-    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
+    # AllChem.GetMorganFingerprintAsBitVect is deprecated (RDKit >= 2024.09); use the generator API when available.
+    try:
+        from rdkit.Chem import rdFingerprintGenerator  # type: ignore
+        key = (int(radius), int(nbits))
+        gen = _MORGAN_GEN_CACHE.get(key)
+        if gen is None:
+            gen = rdFingerprintGenerator.GetMorganGenerator(radius=int(radius), fpSize=int(nbits))
+            _MORGAN_GEN_CACHE[key] = gen
+        return gen.GetFingerprint(mol)
+    except Exception:
+        return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
 
 
 def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object]]) -> float:
@@ -202,7 +241,7 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
 
 
 def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
-                      radius: int, nbits: int, mode: str) -> (pd.DataFrame, Optional[pd.DataFrame]):
+                      radius: int, nbits: int, mode: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     if not _HAS_RDKIT:
         print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
         out = df_top.copy()
@@ -387,7 +426,6 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, diverse: pd.
         if col not in df_plot.columns:
             df_plot[col] = 0
 
-    cds = ColumnDataSource(df_plot)
     hover = HoverTool(tooltips=[
         ("rank", "@rank"),
         ("ID", "@ID_x"),
@@ -411,13 +449,11 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, diverse: pd.
         tools="pan,wheel_zoom,box_zoom,reset,save",
     )
     p_scatter.add_tools(hover)
-    if "consensus_label" in df_plot.columns:
-        colors = {"pass": "#2c7fb8", "fail": "#bdbdbd", "na": "#bdbdbd"}
-        df_plot["color"] = df_plot["consensus_label"].map(colors).fillna("#bdbdbd")
-        cds = ColumnDataSource(df_plot)
-        p_scatter.scatter(x=score_col, y=y_col, size="size", marker="circle", color="color", alpha=0.75, source=cds)
-    else:
-        p_scatter.scatter(x=score_col, y=y_col, size="size", marker="circle", color="#2c7fb8", alpha=0.75, source=cds)
+    # consensus_label is always present (set above: pass/fail/na), so a single colour-mapped scatter suffices
+    colors = {"pass": "#2c7fb8", "fail": "#bdbdbd", "na": "#bdbdbd"}
+    df_plot["color"] = df_plot["consensus_label"].map(colors).fillna("#bdbdbd")
+    cds = ColumnDataSource(df_plot)
+    p_scatter.scatter(x=score_col, y=y_col, size="size", marker="circle", color="color", alpha=0.75, source=cds)
 
     # BB frequency bar charts
     bb_plots = []
@@ -429,10 +465,14 @@ def build_interactive_html(df_top: pd.DataFrame, rec: pd.DataFrame, diverse: pd.
                 continue
             smi_map = (bb_smiles_map or {}).get(bb_col, {})
             sub["bb"] = sub["bb"].astype(str)
-            sub["lib_ids"] = sub.get("lib_ids", "").astype(str)
-            sub["lib_counts"] = sub.get("lib_counts", "").astype(str)
-            sub = sub.sort_values("count", ascending=False)
-            sub["smiles"] = sub["bb"].map(lambda bb: smi_map.get(bb, ""))
+            # DataFrame.get(col, "") returns a plain str when the column is absent -> guard before .astype
+            for meta_col in ("lib_ids", "lib_counts"):
+                sub[meta_col] = sub[meta_col].astype(str) if meta_col in sub.columns else ""
+            # stable sort with the same tie-break as the TSV (count desc, bb asc) so chart order matches the file
+            sub = sub.sort_values(["count", "bb"], ascending=[False, True], kind="mergesort")
+            # ruff B023: the lambda/closure below capture loop variables but are consumed by .map() within
+            # this same iteration, so late binding cannot occur (intentional; left as-is).
+            sub["smiles"] = sub["bb"].map(lambda bb: smi_map.get(bb, ""))  # noqa: B023
             def _img_for_smiles(smi: str) -> str:
                 if not smi:
                     return _TRANSPARENT_PNG
@@ -529,7 +569,8 @@ def main() -> int:
                     help="Run root (DELeGANce_out/<run>), 03_normalized/<preset>, or 05_hybrid_annot.tsv")
     ap.add_argument("--preset", default=None,
                     help="Optional subdir under 03_normalized (e.g., glm_full_dev_cuda_fp32)")
-    ap.add_argument("--top-n", type=int, default=100, help="Top N hits to analyze")
+    ap.add_argument("--top-n", type=int, default=100,
+                    help="Top N hits to analyze (0 or negative = all rows, same convention as 06_compare_top_hits)")
     ap.add_argument("--recommend-n", type=int, default=10, help="Number of recommended hits to return")
     ap.add_argument("--bb-top-k", type=int, default=5, help="Top K BB frequencies per BB column")
     ap.add_argument("--score-col", default=None, help="Override score column (default: HitScore_GLM)")
@@ -550,14 +591,13 @@ def main() -> int:
     ap.add_argument("--no-html", action="store_true", help="Skip interactive HTML output")
     args = ap.parse_args()
 
-    top_n = max(1, int(args.top_n))
+    top_n_arg = int(args.top_n)  # <=0 => all rows (resolved after loading); see 06_compare_top_hits --top-n 0
     rec_n = max(1, int(args.recommend_n))
     bb_top_k = max(1, int(args.bb_top_k))
     rep_col = "cluster_medoid" if args.cluster_rep == "medoid" else "cluster_rep"
 
     hybrid = resolve_hybrid_path(args.output_dir, args.preset)
     out_dir = os.path.dirname(hybrid)
-    prefix = args.out_prefix or os.path.join(out_dir, f"top{top_n}")
 
     # Determine columns
     header = pd.read_csv(hybrid, sep="\t", nrows=0).columns.tolist()
@@ -567,10 +607,16 @@ def main() -> int:
     if score_col not in header:
         raise SystemExit(f"[ERROR] score column not found: {score_col}")
 
-    want = [
-        "LIB_ID_x", "ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "cycles",
+    # Key columns: accept suffixed (ID_x ...) or plain (ID ...) names; normalised to *_x after loading.
+    key_cols = []
+    for base in _KEY_COL_BASES:
+        c = pick_col(header, f"{base}_x", base, f"{base}_y")
+        if c is not None:
+            key_cols.append(c)
+    want = key_cols + [
+        "cycles",
         "bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles",
-        "HitScore_GLM", "HitScore_RS", "HitScore_pct", "SynthonScore",
+        "HitScore_GLM", "HitScore_RS", "HitScore_pct", "rank_pct", "SynthonScore",
         "GLM_hit", "RS_pass", "Consensus_hit", "NEG_hard_fail", "NEG_center_fail",
         "pass_filters", "fail_reasons",
         "mean_R1_norm", "mean_R2_norm", "DEL2_norm",
@@ -578,13 +624,44 @@ def main() -> int:
         "LFC_NEG_R1_vs_DEL2", "LFC_NEG_R2_vs_DEL2",
         "q_DEL2", "q_BEAD", "q_BEAD_R2", "q_BoostPaired",
     ]
-    usecols = [c for c in want if c in header] + [score_col]
+    # *_CPM and their raw-count columns feed the cluster tie-breakers (README: score/percentile/CPM/reads);
+    # previously they were never loaded, so those tie-breakers were always 0.
+    cpm_cols_hdr = [c for c in header if c.endswith("_CPM")]
+    raw_cols_hdr = [c[:-4] for c in cpm_cols_hdr if c[:-4] in header]
+    usecols = [c for c in want if c in header] + cpm_cols_hdr + raw_cols_hdr + [score_col]
     usecols = list(dict.fromkeys(usecols))
 
-    df = pd.read_csv(hybrid, sep="\t", usecols=usecols)
-    df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(float("-inf"))
+    df = pd.read_csv(hybrid, sep="\t", usecols=usecols, low_memory=False)
+    df = normalize_key_columns(df)
+    # Drop rows without a usable score instead of ranking them as -inf (they would otherwise enter top-N
+    # and be written as "-inf" when fewer than top_n rows have scores).
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    n_noscore = int(df[score_col].isna().sum())
+    if n_noscore:
+        print(f"[WARN] {n_noscore} rows have no {score_col}; excluded from ranking.")
+        df = df[df[score_col].notna()].copy()
 
-    df_top = df.sort_values(score_col, ascending=False).head(top_n).copy().reset_index(drop=True)
+    top_n = top_n_arg if top_n_arg > 0 else max(1, len(df))
+    # --top-n <=0 -> "topall_*" outputs (size-independent name); otherwise unchanged "top<N>_*"
+    prefix = args.out_prefix or os.path.join(out_dir, "topall" if top_n_arg <= 0 else f"top{top_n}")
+
+    def _rank_sort(frame: pd.DataFrame) -> pd.DataFrame:
+        # Deterministic ordering: score desc, then HitScore_RS desc, then ID asc (stable mergesort).
+        keys = [score_col]
+        asc = [False]
+        if "HitScore_RS" in frame.columns and "HitScore_RS" != score_col:
+            keys.append("HitScore_RS"); asc.append(False)
+        if "ID_x" in frame.columns:
+            keys.append("ID_x"); asc.append(True)
+        tmp = frame.copy()
+        if "HitScore_RS" in keys:
+            tmp["HitScore_RS"] = pd.to_numeric(tmp["HitScore_RS"], errors="coerce")
+        if "ID_x" in keys:
+            tmp["ID_x"] = tmp["ID_x"].astype(str)
+        order = tmp.sort_values(keys, ascending=asc, kind="mergesort").index
+        return frame.loc[order]
+
+    df_top = _rank_sort(df).head(top_n).copy().reset_index(drop=True)
     df_top["rank"] = np.arange(1, len(df_top) + 1, dtype=int)
 
     cluster_df = None
@@ -619,6 +696,11 @@ def main() -> int:
             tmp["lib_id"] = df_top["LIB_ID_x"].fillna("NA").astype(str)
         else:
             tmp["lib_id"] = "NA"
+        # Missing BB (e.g. BB4 of a 3-cycle library, or missing CP) is not a building block: exclude it
+        # so "NA" cannot top the frequency table / bar chart.
+        tmp = tmp[tmp["bb"] != "NA"]
+        if tmp.empty:
+            continue
 
         grp = tmp.groupby("bb", as_index=False).size().rename(columns={"size": "count"})
         grp = grp.sort_values(["count", "bb"], ascending=[False, True]).head(bb_top_k)
@@ -630,8 +712,8 @@ def main() -> int:
             .to_dict()
         )
         lib_counts_map: Dict[str, str] = {}
-        for bb_val, sub in lib_counts.groupby("bb", sort=False):
-            sub = sub.sort_values("lib_count", ascending=False)
+        for bb_val, sub_grp in lib_counts.groupby("bb", sort=False):
+            sub = sub_grp.sort_values(["lib_count", "lib_id"], ascending=[False, True], kind="mergesort")
             pairs = [f"{r.lib_id}:{int(r.lib_count)}" for r in sub.itertuples(index=False)]
             lib_counts_map[str(bb_val)] = ", ".join(pairs)
 
@@ -663,12 +745,27 @@ def main() -> int:
     if "NEG_hard_fail" in rec.columns:
         rec = rec[_to_int_series(rec["NEG_hard_fail"]) == 0]
 
-    rec = rec.sort_values(score_col, ascending=False).head(rec_n).copy()
+    rec_all = _rank_sort(rec).copy()          # all filter-passing rows, ranked
+    rec = rec_all.head(rec_n).copy()
 
-    diverse = rec.copy()
-    if rep_col in diverse.columns:
-        diverse = diverse[_to_int_series(diverse[rep_col]) == 1].copy()
-    diverse = diverse.sort_values(score_col, ascending=False).copy()
+    # Diverse hits: one compound per cluster, chosen from ALL filter-passing rows (not only the top rec_n),
+    # preferring the cluster representative (score or medoid per --cluster-rep) and otherwise the best-ranked
+    # passing member. Previously reps were filtered *after* head(rec_n), so clusters whose rep was outside the
+    # top rec_n or failed QC vanished and the list could collapse to a single compound.
+    diverse = rec_all.copy()
+    if "cluster_id" in diverse.columns and rep_col in diverse.columns:
+        is_rep = (_to_int_series(diverse[rep_col]) == 1).astype(int)
+        diverse = diverse.assign(_is_rep=is_rep)
+        cid = diverse["cluster_id"].astype(str)
+        has_cluster = cid != "NA"
+        clustered = diverse[has_cluster].copy()
+        # within each cluster keep rep first (already score-ordered by _rank_sort), then the first row
+        clustered = clustered.sort_values("_is_rep", ascending=False, kind="mergesort")
+        clustered = clustered.drop_duplicates(subset=["cluster_id"], keep="first")
+        unclustered = diverse[~has_cluster]
+        diverse = pd.concat([clustered, unclustered], axis=0)
+        diverse = diverse.drop(columns=["_is_rep"])
+    diverse = _rank_sort(diverse).head(rec_n).copy()
 
     # Save tables
     top_path = f"{prefix}_hits.tsv"

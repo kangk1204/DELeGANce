@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import html
+import json
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -84,23 +85,58 @@ def _truthy_value(value) -> bool:
     return s in ["true", "1", "yes", "y", "t"]
 
 
+# Derived DEL2 columns produced by 03_call_hits.py (never raw counts)
+_DEL2_DERIVED = {"DEL2_norm", "DEL2_sum"}
+
+
+def _load_del2_from_params(annot_path: Path) -> Optional[str]:
+    """Read normalized_columns.del2 from hit_params.json next to the annot file (written by the orchestrator)."""
+    hp = annot_path.parent / "hit_params.json"
+    if not hp.exists():
+        return None
+    try:
+        params = json.loads(hp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    del2 = (params.get("normalized_columns") or {}).get("del2")
+    return str(del2) if del2 else None
+
+
 def _auto_del2_col(cols: List[str]) -> Optional[str]:
     if "DEL2_OVERRIDE" in cols:
         return "DEL2_OVERRIDE"
-    # Prefer non-CPM DEL columns
+    def _is_derived(c: str) -> bool:
+        return c.endswith("_CPM") or c.endswith("_norm") or c.endswith("_sum") or c in _DEL2_DERIVED
+
+    # 1) raw sample column named DEL* (skip CPM and *_norm/*_sum derived columns from 03_call_hits)
     for c in cols:
-        if c.startswith("DEL") and not c.endswith("_CPM"):
+        if c.startswith("DEL") and not _is_derived(c):
+            return c
+    # 2) raw sample column (has a <c>_CPM counterpart) whose name contains "DEL" (e.g. K_DEL234)
+    colset = set(cols)
+    for c in cols:
+        if "DEL" in c.upper() and not _is_derived(c) and f"{c}_CPM" in colset:
             return c
     return None
 
 
-_LIBDEL_RE = re.compile(r"_LIB[\w\.-]+", re.IGNORECASE)
+# Anchored: strips only a trailing "_LIB<lib>" namespace token from a single BB value.
+_LIBDEL_RE = re.compile(r"_LIB[^_]+$")
+# Token-anchored variant for full tag IDs (cycles_BB1_BB2_BB3[_BB4]): removes each "_LIB<lib>" token
+# without consuming the following "_BB" tokens (the old unanchored pattern truncated the whole ID).
+_LIBDEL_TOKEN_RE = re.compile(r"_LIB[^_]+(?=_|$)")
 
 
 def _strip_libdel(value) -> str:
     if pd.isna(value):
         return ""
     return _LIBDEL_RE.sub("", str(value))
+
+
+def _strip_libdel_anywhere(value) -> str:
+    if pd.isna(value):
+        return ""
+    return _LIBDEL_TOKEN_RE.sub("", str(value))
 
 
 def _pick_bb_value(row: pd.Series, base: str) -> str:
@@ -114,7 +150,7 @@ def _make_display_id(lib: str, bb1: str, bb2: str, bb3: str, bb4: str, fallback_
     lib = (lib or "").strip()
     if lib:
         return f"{lib}_{bb1}_{bb2}_{bb3}_{bb4}"
-    return _strip_libdel(fallback_id)
+    return _strip_libdel_anywhere(fallback_id)
 
 
 def _neg_quantile_threshold(series: pd.Series, quantile: float) -> Optional[float]:
@@ -148,8 +184,9 @@ def _qc_flags(row: pd.Series, del2_col: Optional[str],
               neg_r1_high_thr: Optional[float]) -> str:
     flags = []
 
-    if del2_col and pd.notna(row.get(del2_col)):
-        if float(row.get(del2_col, 0)) < 10:
+    if del2_col:
+        del2_val = pd.to_numeric(pd.Series([row.get(del2_col)]), errors="coerce").iloc[0]
+        if pd.notna(del2_val) and float(del2_val) < 10:
             flags.append("LOW_DEL2")
 
     lfc_neg = row.get("LFC_NEG_centered")
@@ -189,7 +226,11 @@ def _build_top_table(df: pd.DataFrame, top_n: int, neg_high_quantile: float,
     neg_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered"), neg_high_quantile)
     neg_r1_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered_R1"), neg_high_quantile)
 
-    df = df_all.sort_values("HitScore", ascending=False).head(top_n).copy()
+    # Stable sort with a deterministic tie-breaker so Rank/PickGroup are reproducible across runs
+    tie_col = _pick_col(list(df_all.columns), ["ID", "id", "ID_x", "id_x", "ID_y", "id_y"])
+    sort_keys = ["HitScore"] + ([tie_col] if tie_col else [])
+    df = df_all.sort_values(sort_keys, ascending=[False] + [True] * (len(sort_keys) - 1),
+                            kind="mergesort").head(top_n).copy()
     df = df.reset_index(drop=True)
 
     cols = list(df.columns)
@@ -362,58 +403,25 @@ def main() -> None:
     top_tables = []
     per_run_html = []
 
+    # Resolve (annot_path, run_name) jobs once; the same processing applies to both input styles
+    annot_jobs: List[Tuple[Path, str]] = []
     for annot_path in annot_paths:
         if not annot_path.exists():
             raise FileNotFoundError(f"[ERROR] annot_tsv not found: {annot_path}")
-        df = pd.read_csv(annot_path, sep="\t", low_memory=False)
-        run_name = _guess_run_name(annot_path)
-        summary = _summary_counts(df)
-        summary["run"] = run_name
-        summaries.append(summary)
-
-        if args.del2_col and args.del2_col in df.columns:
-            df = df.rename(columns={args.del2_col: "DEL2_OVERRIDE"})
-        top_table, del2_col, th, rec = _build_top_table(
-            df, args.top_n, args.neg_high_quantile,
-            args.recommend_a, args.recommend_b, args.recommend_diverse, args.diverse_key
-        )
-        top_table.insert(1, "Run", run_name)
-        top_tables.append(top_table)
-
-        thr_note = (
-            f"<p class='small'>QC thresholds: NEG_HIGH ≥ {th['neg_high_thr']:.3f}, "
-            f"NEG_R1_HIGH ≥ {th['neg_r1_high_thr']:.3f} "
-            f"(quantile={th['neg_high_quantile']:.2f}, min=0)</p>"
-            if th["neg_high_thr"] is not None and th["neg_r1_high_thr"] is not None
-            else f"<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
-        )
-        rec_html = (
-            f"<h3>Recommended Tier A (Top {args.recommend_a})</h3>"
-            f"{_html_table(rec['tier_a_top'])}"
-            f"<h3>Recommended Tier A Diversity (Top {args.recommend_diverse}, key={args.diverse_key})</h3>"
-            f"{_html_table(rec['tier_a_diverse'])}"
-            f"<h3>Recommended Tier B Controls (Top {args.recommend_b})</h3>"
-            f"{_html_table(rec['tier_b_control'])}"
-        )
-        per_run_html.append(
-            f"<h2>{html.escape(run_name)}</h2>"
-            f"<p>Top {args.top_n} by HitScore (HitScore_GLM/HitScore_RS fallback).</p>"
-            f"{thr_note}"
-            f"{_html_table(top_table)}"
-            f"{rec_html}"
-        )
-
+        annot_jobs.append((annot_path, _guess_run_name(annot_path)))
     for run_root in run_roots:
-        annot_path = _resolve_annot(run_root, args.prefer_dir)
-        df = pd.read_csv(annot_path, sep="\t", low_memory=False)
+        annot_jobs.append((_resolve_annot(run_root, args.prefer_dir), run_root.name))
 
-        run_name = run_root.name
+    for annot_path, run_name in annot_jobs:
+        df = pd.read_csv(annot_path, sep="\t", low_memory=False)
         summary = _summary_counts(df)
         summary["run"] = run_name
         summaries.append(summary)
 
-        if args.del2_col and args.del2_col in df.columns:
-            df = df.rename(columns={args.del2_col: "DEL2_OVERRIDE"})
+        # DEL2 column: explicit --del2_col > hit_params.json (orchestrator) > name heuristic
+        del2_override = args.del2_col or _load_del2_from_params(annot_path) or ""
+        if del2_override and del2_override in df.columns:
+            df = df.rename(columns={del2_override: "DEL2_OVERRIDE"})
         top_table, del2_col, th, rec = _build_top_table(
             df, args.top_n, args.neg_high_quantile,
             args.recommend_a, args.recommend_b, args.recommend_diverse, args.diverse_key
@@ -426,7 +434,7 @@ def main() -> None:
             f"NEG_R1_HIGH ≥ {th['neg_r1_high_thr']:.3f} "
             f"(quantile={th['neg_high_quantile']:.2f}, min=0)</p>"
             if th["neg_high_thr"] is not None and th["neg_r1_high_thr"] is not None
-            else f"<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
+            else "<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
         )
         rec_html = (
             f"<h3>Recommended Tier A (Top {args.recommend_a})</h3>"
@@ -445,7 +453,8 @@ def main() -> None:
         )
 
     # Summary table
-    summary_df = pd.DataFrame(summaries)[["run", "rows", "GLM_hit", "RS_pass", "NEG_hard_fail", "Consensus_hit"]]
+    # reindex (not []) so runs lacking some flag columns do not raise KeyError
+    summary_df = pd.DataFrame(summaries).reindex(columns=["run", "rows", "GLM_hit", "RS_pass", "NEG_hard_fail", "Consensus_hit"])
     summary_html = _html_table(summary_df.fillna(""))
 
     # TSV output
@@ -485,7 +494,7 @@ def main() -> None:
     <li><b>LFC_NEG_centered</b>: NEG 대비 특이성 지표 (0 이상이면 NEG가 높을 가능성)</li>
     <li><b>GLM_hit / RS_pass / Consensus_hit</b>: 통계/규칙 기반 필터 통과 여부</li>
     <li><b>NEG_hard_fail</b>: NEG가 너무 높아 탈락한 항목</li>
-    <li><b>Tier</b>: A=합성 우선(Consensus_hit + QC 플래그 없음), B=컨트롤 후보(Consensus_hit + QC 플래그 존재)</li>
+    <li><b>Tier</b>: A=합성 우선(Consensus_hit + QC 플래그 없음), B=컨트롤 후보(Consensus_hit + QC 플래그 존재, NEG_hard_fail 제외 → Other)</li>
     <li><b>PickGroup</b>: TierA_Top, TierA_Diverse, TierB_Control (아래 추천 리스트와 동일)</li>
   </ul>
 

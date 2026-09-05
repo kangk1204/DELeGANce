@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve sibling scripts relative to this file so the script works from any cwd.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export PYTHONUNBUFFERED=1
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
@@ -57,10 +60,16 @@ IFS=' ' read -r -a NEG_COLS <<< "$NEG_COLS_STR"
 
 run_one() {
   local run_root="$1"
+  # The fixed folder label promises "GLM full / CPU / float64"; pin those knobs so auto-opt
+  # cannot silently switch to glm top / CUDA for large matrices while keeping this name.
   local outdir="${run_root}/03_normalized/glm_full_dev_cpu_fp64"
-  local cmd=(python3 run_delegance_pipeline.py
+  local cmd=(python3 "$ROOT_DIR/run_delegance_pipeline.py"
     --only hit
     --force-hit
+    --auto-opt 0
+    --glm-mode full
+    --device cpu
+    --dtype float64
     --output-dir "${run_root}"
     --hit-out "${outdir}"
     --r1 "${R1_COLS[@]}"
@@ -77,4 +86,5 @@ for run_root in "${RUN_ROOTS[@]}"; do
   run_one "${run_root}"
 done
 
-bash postprocess_after_hits.sh "${RUN_ROOTS[@]}"
+# DEL2_COL must reach the child via the environment: postprocess_after_hits.sh reads it from env only.
+DEL2_COL="${DEL2_COL}" bash "$ROOT_DIR/postprocess_after_hits.sh" "${RUN_ROOTS[@]}"

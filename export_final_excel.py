@@ -21,7 +21,8 @@ def strip_lib_suffix(bb: str) -> str:
     s = str(bb)
     if s in ("", "NA", "nan", "None"):
         return "NA"
-    return re.sub(r"_LIB[\w\.-]+$", "", s)
+    # Anchored token: strip only a trailing "_LIB<lib>" namespace suffix
+    return re.sub(r"_LIB[^_]+$", "", s)
 
 
 def _resolve_annot(run_root: Path, prefer_dir: str) -> Path:
@@ -72,9 +73,14 @@ def sample_columns_from_params(params: Dict) -> List[str]:
     return cols
 
 
+def sample_columns_from_header(columns: List[str]) -> List[str]:
+    """Fallback when hit_params.json is absent (03_call_hits.py run standalone):
+    a sample column is any <name> that also has a <name>_CPM counterpart."""
+    return [c[:-4] for c in columns if c.endswith("_CPM") and c[:-4] in columns]
+
+
 def build_core(df: pd.DataFrame, sample_cols: List[str]) -> pd.DataFrame:
     lib_col = pick_col(df, ["LIB_ID", "LIB_ID_x", "LIB_ID_y"])
-    id_col = pick_col(df, ["ID", "ID_x", "ID_y"])
     bb1_col = pick_col(df, ["BB1", "BB1_x", "BB1_y"])
     bb2_col = pick_col(df, ["BB2", "BB2_x", "BB2_y"])
     bb3_col = pick_col(df, ["BB3", "BB3_x", "BB3_y"])
@@ -85,14 +91,19 @@ def build_core(df: pd.DataFrame, sample_cols: List[str]) -> pd.DataFrame:
     sm3 = pick_col(df, ["bb3_smiles", "BB3_smiles", "SMILES3"])
     sm4 = pick_col(df, ["bb4_smiles", "BB4_smiles", "SMILES4"])
 
-    out = pd.DataFrame()
+    # Keep df's index so scalar/Series assignments stay aligned even when LIB_ID is missing
+    out = pd.DataFrame(index=df.index)
     out["LibID"] = df[lib_col] if lib_col else ""
     out["cycles"] = df["cycles"] if "cycles" in df.columns else pd.NA
 
-    bb1_raw = df[bb1_col] if bb1_col else "NA"
-    bb2_raw = df[bb2_col] if bb2_col else "NA"
-    bb3_raw = df[bb3_col] if bb3_col else "NA"
-    bb4_raw = df[bb4_col] if bb4_col else "NA"
+    def _bb_series(col: Optional[str]) -> pd.Series:
+        # Missing BB column -> Series of "NA" (a bare str has no .map)
+        return df[col] if col else pd.Series(["NA"] * len(df), index=df.index)
+
+    bb1_raw = _bb_series(bb1_col)
+    bb2_raw = _bb_series(bb2_col)
+    bb3_raw = _bb_series(bb3_col)
+    bb4_raw = _bb_series(bb4_col)
 
     out["BB1"] = bb1_raw.map(strip_lib_suffix)
     out["BB2"] = bb2_raw.map(strip_lib_suffix)
@@ -157,7 +168,7 @@ def build_summary(df: pd.DataFrame, run_name: str) -> pd.DataFrame:
         s = df[col]
         if s.dtype == bool:
             return int(s.sum())
-        return int((s.astype(str).str.lower().isin(["true", "1", "yes", "y"]).sum()))
+        return int((s.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y", "t"]).sum()))
 
     summary = {
         "run": run_name,
@@ -233,6 +244,24 @@ def normalize_bool_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_SHEET_BAD_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+def sheet_name(run_name: str, suffix: str, used: set) -> str:
+    """Excel sheet names are limited to 31 chars and must be unique.
+    Keep the suffix intact, truncate the run part, and add ~N when a collision remains
+    (plain [:31] truncation made All_Core/TopN/Consensus/Params identical for long run names)."""
+    run = _SHEET_BAD_CHARS.sub("_", str(run_name))
+    base = run[: max(1, 31 - len(suffix))] + suffix
+    name, k = base, 1
+    while name in used:
+        tag = f"~{k}"
+        name = base[: 31 - len(tag)] + tag
+        k += 1
+    used.add(name)
+    return name
+
+
 def truthy_mask(series: pd.Series, length: int) -> pd.Series:
     if series is None:
         return pd.Series([False] * length)
@@ -265,8 +294,10 @@ def main():
             import xlsxwriter  # noqa: F401
             engine = "xlsxwriter"
         except Exception:
-            raise SystemExit("openpyxl 또는 xlsxwriter가 필요합니다.")
+            raise SystemExit("openpyxl 또는 xlsxwriter가 필요합니다.") from None
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    used_sheets: set = set()
     with pd.ExcelWriter(out_path, engine=engine) as writer:
         guide = build_guide()
         guide.to_excel(writer, sheet_name="Guide", index=False)
@@ -289,12 +320,17 @@ def main():
             sample_cols = sample_columns_from_params(params)
 
             df = pd.read_csv(annot_path, sep="\t", low_memory=False)
+            if not sample_cols:
+                sample_cols = sample_columns_from_header(list(df.columns))
+                print(f"[WARN] hit_params.json not found next to {annot_path}; "
+                      f"sample columns inferred from header ({len(sample_cols)} found)")
             summary_rows.append(build_summary(df, run_name))
 
             core = build_core(df, sample_cols)
 
             if "HitScore_GLM" in core.columns:
-                core = core.sort_values("HitScore_GLM", ascending=False)
+                # stable sort + ID tie-breaker so Rank_GLM is reproducible for equal scores
+                core = core.sort_values(["HitScore_GLM", "ID"], ascending=[False, True], kind="mergesort")
 
             core.insert(0, "Rank_GLM", range(1, len(core) + 1))
 
@@ -308,21 +344,21 @@ def main():
             top = normalize_bool_cols(top)
             consensus = normalize_bool_cols(consensus)
 
-            core_sheet = f"{run_name}_All_Core"
-            top_sheet = f"{run_name}_Top{top_n}"
-            cons_sheet = f"{run_name}_Consensus"
-            param_sheet = f"{run_name}_Params"
+            core_sheet = sheet_name(run_name, "_All_Core", used_sheets)
+            top_sheet = sheet_name(run_name, f"_Top{top_n}", used_sheets)
+            cons_sheet = sheet_name(run_name, "_Consensus", used_sheets)
+            param_sheet = sheet_name(run_name, "_Params", used_sheets)
 
-            core.to_excel(writer, sheet_name=core_sheet[:31], index=False)
-            top.to_excel(writer, sheet_name=top_sheet[:31], index=False)
-            consensus.to_excel(writer, sheet_name=cons_sheet[:31], index=False)
+            core.to_excel(writer, sheet_name=core_sheet, index=False)
+            top.to_excel(writer, sheet_name=top_sheet, index=False)
+            consensus.to_excel(writer, sheet_name=cons_sheet, index=False)
 
             if params:
                 flat = []
                 for k, v in params.get("args", {}).items():
                     flat.append((k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v))
                 p_df = pd.DataFrame(flat, columns=["param", "value"])
-                p_df.to_excel(writer, sheet_name=param_sheet[:31], index=False)
+                p_df.to_excel(writer, sheet_name=param_sheet, index=False)
 
         summary = pd.concat(summary_rows, ignore_index=True)
         summary.to_excel(writer, sheet_name="Summary", index=False)

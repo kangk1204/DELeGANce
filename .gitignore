@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 .env/
+.env
 .conda/
 
 # Logs
@@ -18,7 +19,7 @@ DELeGANce_out/
 DELeGANce_out_fin/
 DELeGANce_out_*/
 
-# Data exports
+# Data exports (small test fixtures may be re-included with a negation rule, e.g. !tests/fixtures/*.tsv)
 *.tsv
 *.csv
 *.xlsx

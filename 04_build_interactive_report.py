@@ -34,17 +34,17 @@ except Exception as _e:
     _RDKIT_IMPORT_ERR = str(_e)
 
 # -------- Bokeh --------
-from bokeh.plotting import figure, output_file, show, save
+from bokeh.plotting import figure, output_file
+from bokeh.io import save  # write HTML only; never open a browser (batch-safe)
 from bokeh.models import (
     ColumnDataSource, CDSView, BooleanFilter, HoverTool, TapTool,
     Select, Div, DataTable, TableColumn, NumberFormatter, CustomJS,
     ColorBar, LinearColorMapper, CustomAction, Spacer, Button
 )
-from bokeh.transform import linear_cmap
 from bokeh.palettes import Blues9
 from bokeh.layouts import gridplot
 from bokeh.layouts import row as bk_row, column as bk_column
-from bokeh.events import Tap, DocumentReady, SelectionGeometry
+from bokeh.events import Tap, DocumentReady
 
 # Hard cap for performance
 TOP_CAP = 10000
@@ -74,8 +74,9 @@ def parse_args():
     p.add_argument("--debug", type=int, choices=[0,1], default=0,
                    help="1이면 디버그 패널/콘솔 로깅 활성화")
     # HTTP fallback for images when RDKit is unavailable
-    p.add_argument("--img_fallback", choices=["auto","none","http"], default="auto",
-                   help="RDKit 미설치 시 이미지 대체 방식을 선택(auto→http 사용, none→이미지 생략)")
+    p.add_argument("--img_fallback", choices=["auto","none","http"], default="none",
+                   help="RDKit 미설치 시 이미지 대체 방식(기본 none→이미지 생략). "
+                        "http/auto 선택 시 BB SMILES가 외부 서버(cactus.nci.nih.gov)로 전송됨 — 명시적 opt-in 필요")
     p.add_argument("--img_http_cap", type=int, default=400,
                    help="HTTP 대체 이미지 최대 개수(유니크 BB 기준, 기본 400)")
     p.add_argument("--min_dot", type=float, default=4, help="포인트 최소 크기")
@@ -109,10 +110,43 @@ def resolve_path(primary: str, candidates: List[str]) -> str:
         gz = _with_gz(p)
         if gz:
             return gz
-    return pool[-1] if pool else primary
+    # Nothing found: report the path the user actually asked for (not the last fallback candidate)
+    return primary if primary else (pool[-1] if pool else "")
 
 
 # ------------------------- 공용 유틸 -------------------------
+# Missing-value markers: 03_call_hits writes NA as the literal "NA" (na_rep="NA"); pandas may
+# also read them as NaN which becomes "nan" after astype(str).
+_MISSING_MARKERS = {"", "NA", "N/A", "nan", "None"}
+
+def _is_missing(s: pd.Series) -> pd.Series:
+    """Boolean mask of missing cells (NaN or any textual NA marker)."""
+    return s.isna() | s.astype(str).str.strip().isin(_MISSING_MARKERS)
+
+def _clean_str(v: object) -> str:
+    """Return '' for NaN/None/NA-marker values, else the stripped string."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return "" if s in _MISSING_MARKERS else s
+
+def pick_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    """Return the first candidate column present in df (e.g. pick_col(df, 'ID_x', 'ID')).
+
+    Backward/forward compatible accessor for hybrid tables whose merge suffixes (_x/_y)
+    may be removed in a future 03_call_hits release.
+    """
+    for c in candidates:
+        if c and c in df.columns:
+            return c
+    return None
+
+
 def sanitize_field_name(s: str) -> str:
     s2 = re.sub(r"\W+", "_", s)
     if re.match(r"^\d", s2):
@@ -341,8 +375,9 @@ def load_bbinfo(path_bbinfo: str, needed_bbs: Set[str]) -> Tuple[Dict[str, str],
 
     for _, r in sub.iterrows():
         bb = str(r[col_id])
-        smi = "" if (col_smiles is None or pd.isna(r[col_smiles])) else str(r[col_smiles])
-        lib = "" if (col_lib is None or pd.isna(r[col_lib])) else str(r[col_lib])
+        # NOTE: _strip_series() above turned NaN into the string "nan"; pd.isna() would never fire.
+        smi = "" if col_smiles is None else _clean_str(r[col_smiles])
+        lib = "" if col_lib is None else _clean_str(r[col_lib])
         bb_to_smiles.setdefault(bb, smi)
         bb_to_lib.setdefault(bb, lib)
 
@@ -374,34 +409,49 @@ def load_master(path_master: str) -> pd.DataFrame:
             f"[master] 파일을 찾을 수 없습니다: {path_master}\n"
             f"  해결: --master_tsv /절대/또는/상대/경로.tsv[.gz] 로 지정해 주세요."
         )
-    df = pd.read_csv(path_master, sep="\t", dtype=str, compression="infer")
-    # Normalize common column variants produced by 03_call_hits (legacy names still supported)
-    if "id" not in df.columns:
-        for k in ("ID", "ID_x", "ID_y", "id_x", "id_y"):
-            if k in df.columns:
-                df["id"] = df[k].astype(str)
-                break
-    # HitScore: prefer HitScore, else fallback to HitScore_GLM or HitScore_RS
-    if "HitScore" not in df.columns:
-        if "HitScore_GLM" in df.columns:
-            df["HitScore"] = df["HitScore_GLM"]
-        elif "HitScore_RS" in df.columns:
-            df["HitScore"] = df["HitScore_RS"]
-    if "id" not in df.columns or "HitScore" not in df.columns:
-        raise ValueError("[master] 'id'와 'HitScore' 컬럼이 필요합니다. (또는 'ID'와 'HitScore_GLM'/'HitScore_RS')")
-
-    # 문자열로 유지해야 하는 열
+    # 문자열로 유지해야 하는 열 (ID/LIB/BB/CP 계열은 숫자형으로 보여도 float 변환 금지)
     keep_str = {
-        "id", "primary_lib_id_used",
+        "id", "ID", "ID_x", "ID_y", "id_x", "id_y",
+        "primary_lib_id_used", "LIB_ID", "LIB_ID_x", "LIB_ID_y", "lib_id", "lib_id_x", "lib_id_y",
+        "BB1", "BB2", "BB3", "BB4", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP", "CP_x",
         "bb1_id","bb2_id","bb3_id","bb4_id",
         "bb1_smiles","bb2_smiles","bb3_smiles","bb4_smiles",
-        "fail_reasons"
+        "fail_reasons", "pass_filters",
     }
-    # 선택적 수치 변환(해당 열의 90% 이상이 숫자로 변환될 수 있는 경우에만)
+    # Memory: only force str on the columns we must keep textual; let pandas infer the rest
+    # (hybrid tables have ~100 columns; dtype=str on all of them costs GBs at 10^6-10^7 rows).
+    header = pd.read_csv(path_master, sep="\t", nrows=0, compression="infer").columns.tolist()
+    dtype_map = {c: str for c in header if c in keep_str}
+    df = pd.read_csv(path_master, sep="\t", dtype=dtype_map, compression="infer", low_memory=False)
+    # Preserve the previous all-string semantics for boolean-like columns (e.g. GLM_hit "True"/"False")
     for c in df.columns:
         if c in keep_str:
             continue
+        if pd.api.types.is_bool_dtype(df[c]):
+            df[c] = df[c].astype(str)
+        elif df[c].dtype == object:
+            df[c] = df[c].where(df[c].isna(), df[c].astype(str))
+
+    # Normalize common column variants produced by 03_call_hits (legacy names still supported)
+    if "id" not in df.columns:
+        k = pick_col(df, "ID_x", "ID", "ID_y", "id_x", "id_y")
+        if k is not None:
+            df["id"] = df[k].astype(str)
+    # HitScore: prefer HitScore, else fallback to HitScore_GLM or HitScore_RS
+    if "HitScore" not in df.columns:
+        k = pick_col(df, "HitScore_GLM", "HitScore_RS")
+        if k is not None:
+            df["HitScore"] = df[k]
+    if "id" not in df.columns or "HitScore" not in df.columns:
+        raise ValueError("[master] 'id'와 'HitScore' 컬럼이 필요합니다. (또는 'ID'/'ID_x'와 'HitScore_GLM'/'HitScore_RS')")
+
+    # 선택적 수치 변환(해당 열의 90% 이상이 숫자로 변환될 수 있는 경우에만) — 문자열(object) 열만 대상
+    for c in df.columns:
+        if c in keep_str or c == "id":
+            continue
         s = df[c]
+        if s.dtype != object:
+            continue  # already numeric by inference
         try:
             conv = pd.to_numeric(s, errors="coerce")
         except Exception:
@@ -424,27 +474,28 @@ def build_records_from_master(df_master: pd.DataFrame,
             df["pass_filters"] = df["pass_filters"].astype(str).str.lower().isin(["true", "1", "t", "yes", "y"])
         df = df[df["pass_filters"]]
 
-    # HitScore 정렬 & 상위 N
+    # HitScore 정렬 & 상위 N (deterministic: stable sort + secondary keys, matching 03's top-K ordering)
     df["HitScore"] = pd.to_numeric(df["HitScore"], errors="coerce")
-    df = df[np.isfinite(df["HitScore"])].sort_values("HitScore", ascending=False)
+    df = df[np.isfinite(df["HitScore"])].copy()
+    sort_keys = ["HitScore"]
+    sort_asc = [False]
+    if "HitScore_RS" in df.columns and pd.api.types.is_numeric_dtype(df["HitScore_RS"]):
+        sort_keys.append("HitScore_RS"); sort_asc.append(False)
+    sort_keys.append("id"); sort_asc.append(True)
+    df = df.sort_values(sort_keys, ascending=sort_asc, kind="mergesort")
     if top_hitscore is not None and top_hitscore > 0:
         df = df.head(top_hitscore).copy()
 
-    # cycles & BB1..BB4
-    has_bb_lower = all([(c in df.columns) for c in ("bb1_id","bb2_id","bb3_id","bb4_id")])
-    has_bb_upper = all([(c in df.columns) for c in ("BB1","BB2","BB3","BB4")])
-    if has_bb_lower or has_bb_upper:
-        if has_bb_lower:
-            for k in ("bb1_id","bb2_id","bb3_id","bb4_id"):
-                df[k] = df[k].astype(str).replace({"nan":"NA","None":"NA"})
-            df["BB1"] = df["bb1_id"]
-            df["BB2"] = df["bb2_id"]
-            df["BB3"] = df["bb3_id"]
-            df["BB4"] = df["bb4_id"]
-        else:
-            # Already provided as BB1..BB4
-            for k in ("BB1","BB2","BB3","BB4"):
-                df[k] = df[k].astype(str).replace({"nan":"NA","None":"NA","":"NA"})
+    # cycles & BB1..BB4 — accept bb1_id.. (03 annotation), BB1.. or BB1_x.. (hybrid merge suffix)
+    bb_src = {}
+    for i in (1, 2, 3, 4):
+        bb_src[i] = pick_col(df, f"bb{i}_id", f"BB{i}", f"BB{i}_x")
+    has_bb_cols = all(bb_src[i] is not None for i in (1, 2, 3, 4))
+    if has_bb_cols:
+        for i in (1, 2, 3, 4):
+            s = df[bb_src[i]]
+            s = s.where(~_is_missing(s), "NA").astype(str)
+            df[f"BB{i}"] = s
         cyc = []
         for s, b4 in zip(df["id"].astype(str).tolist(), df["BB4"].astype(str).tolist()):
             m = re.match(r"^\s*(\d+)[_\|:,;/\s]", s)
@@ -465,21 +516,16 @@ def build_records_from_master(df_master: pd.DataFrame,
             BB1.append(b1); BB2.append(b2); BB3.append(b3); BB4.append(b4)
         df["BB1"],df["BB2"],df["BB3"],df["BB4"],df["cycles"] = BB1,BB2,BB3,BB4,cycles
 
-    # LibID (1) primary_lib_id_used 우선, (2) LIB_ID (또는 LIB_ID_x/y) 보조
-    if "primary_lib_id_used" in df.columns:
-        df["LibID"] = df["primary_lib_id_used"].astype(str).replace({"nan":"", "None":"", "": np.nan})
+    # LibID (1) primary_lib_id_used 우선, (2) LIB_ID_x / LIB_ID (또는 _y, lib_id*) 보조
+    # NOTE: Series.replace(dict) is NOT chained ("nan"->"" would never reach np.nan); mask explicitly.
+    def _lib_series(s: pd.Series) -> pd.Series:
+        s2 = s.astype(str).str.strip()
+        return s2.where(~_is_missing(s), np.nan)
+    lib_src = pick_col(df, "primary_lib_id_used", "LIB_ID_x", "LIB_ID", "LIB_ID_y", "lib_id", "lib_id_x", "lib_id_y")
+    if lib_src is not None:
+        df["LibID"] = _lib_series(df[lib_src])
     else:
-        lib_src = None
-        if "LIB_ID" in df.columns:
-            lib_src = "LIB_ID"
-        else:
-            for k in ("LIB_ID_x","LIB_ID_y","lib_id","lib_id_x","lib_id_y"):
-                if k in df.columns:
-                    lib_src = k; break
-        if lib_src is not None:
-            df["LibID"] = df[lib_src].astype(str).replace({"nan":"", "None":"", "": np.nan})
-        else:
-            df["LibID"] = np.nan
+        df["LibID"] = np.nan
 
     # 반환
     return df
@@ -524,19 +570,22 @@ def main():
     print(f"  - 옵션: only_passed={args.only_passed}, top_hitscore={top_n} (capped)")
     df = build_records_from_master(master, top_n, args.only_passed)
     print(f"  - 사용 행 수: {len(df)}")
+    if df.empty:
+        raise SystemExit("[master] 선택된 행이 0개입니다 (only_passed / top_hitscore / HitScore 결측 여부를 확인하세요).")
 
     # 3) LibID 보완 및 SMILES 보완 (bbinfo)
+    # Missing SMILES arrive as "NA" (03 na_rep) or NaN, never as "" — use _is_missing on the selected rows.
     need_bb_map = False
     if df["LibID"].isna().any():
         need_bb_map = True
     for k in ("bb1_smiles","bb2_smiles","bb3_smiles","bb4_smiles"):
-        if k in master.columns and master[k].astype(str).str.strip().eq("").any():
+        if k in df.columns and _is_missing(df[k]).any():
             need_bb_map = True
 
     # 필요 BB 집합 수집
     needed_bbs: Set[str] = set()
     for bcol in ("BB1","BB2","BB3","BB4"):
-        needed_bbs |= set([b for b in df[bcol].astype(str).tolist() if b and b != "NA"])
+        needed_bbs |= {b for b in df[bcol].astype(str).tolist() if b and b != "NA"}
 
     bb_to_smiles: Dict[str, str] = {}
     bb_to_lib: Dict[str, str] = {}
@@ -565,7 +614,14 @@ def main():
     # 4) SMILES/이미지 구성
     # master에 SMILES 있으면 우선 사용, 없으면 보완
     def pick_smiles(i):
-        return master[i] if i in master.columns else pd.Series([""]*len(df))
+        # df keeps master's original index (subset), so align on df.index; NA markers -> ""
+        if i in df.columns:
+            s = df[i]
+        elif i in master.columns:
+            s = master[i].reindex(df.index)
+        else:
+            return pd.Series([""] * len(df), index=df.index)
+        return s.where(~_is_missing(s), "").astype(str)
     df["SMILES1"] = pick_smiles("bb1_smiles")
     df["SMILES2"] = pick_smiles("bb2_smiles")
     df["SMILES3"] = pick_smiles("bb3_smiles")
@@ -573,7 +629,7 @@ def main():
 
     if bb_to_smiles:
         for i, col in enumerate(("SMILES1","SMILES2","SMILES3","SMILES4"), start=1):
-            mask_empty = df[col].astype(str).str.strip().eq("")
+            mask_empty = _is_missing(df[col])
             if mask_empty.any():
                 bbcol = f"BB{i}"
                 df.loc[mask_empty, col] = df.loc[mask_empty, bbcol].map(lambda bb: bb_to_smiles.get(bb, ""))
@@ -597,6 +653,9 @@ def main():
             return f"HTTP Image Error: {e}"
 
     if not _HAS_RDKIT and (args.img_fallback in ("auto","http")):
+        print("[WARN] SMILES will be sent to cactus.nci.nih.gov (--img_fallback=%s). "
+              "Proprietary building-block structures leave this machine; use --img_fallback none to disable."
+              % args.img_fallback)
         print(f"  - [알림] RDKit 미설치: HTTP 대체 이미지 사용 시도({args.img_http_cap}개 제한). ({_RDKIT_IMPORT_ERR})")
     elif not _HAS_RDKIT:
         print(f"  - [알림] RDKit 미설치: 이미지 없이 진행합니다. ({_RDKIT_IMPORT_ERR})")
@@ -622,9 +681,10 @@ def main():
         print(f"  - RDKit 이미지: 성공 {ok}, 실패/결측 {ng}")
     elif args.img_fallback in ("auto","http"):
         cap = max(0, int(args.img_http_cap))
-        sel = sorted(list(unique_bb))[:cap]
+        sel = sorted(unique_bb)[:cap]
         print(f"[{time.strftime('%H:%M:%S')}] HTTP 이미지 페치 (유니크 BB {len(unique_bb)} → {len(sel)} 제한)...")
         ok, ng = 0, 0
+        consecutive_http_err = 0
         for bb in sel:
             smi = ""
             for i in (1,2,3,4):
@@ -635,8 +695,15 @@ def main():
             bb_to_img[bb] = img
             if isinstance(img, str) and img.startswith("data:image"):
                 ok += 1
+                consecutive_http_err = 0
             else:
                 ng += 1
+                if isinstance(img, str) and img.startswith("HTTP Image Error"):
+                    consecutive_http_err += 1
+                    # Offline/blocked network: stop early instead of paying cap x 5s timeouts
+                    if consecutive_http_err >= 3:
+                        print("  - [경고] HTTP 이미지 요청이 연속 실패하여 나머지 요청을 중단합니다 (네트워크 차단?).")
+                        break
         print(f"  - HTTP 이미지: 성공 {ok}, 실패/결측 {ng} (캡 {cap})")
 
     def _img(bb): return bb_to_img.get(bb, "N/A") if (bb and bb != "NA") else "N/A"
@@ -736,8 +803,9 @@ def main():
         "id","LibID","cycles","BB1","BB2","BB3","BB4",
         "BB1_disp","BB2_disp","BB3_disp","BB4_disp",
         "SMILES1","SMILES2","SMILES3","SMILES4",
-        "IMG1","IMG2","IMG3","IMG4","CombinedID","DisplayID"
-    ] + list(metric_field_map.values()) + ["value","size","_rank_default"]
+        "IMG1","IMG2","IMG3","IMG4","CombinedID","DisplayID",
+        *metric_field_map.values(), "value", "size", "_rank_default",
+    ]
     source = ColumnDataSource(data=df_cds[cds_cols].to_dict("list"), name="main_source")
 
     # BooleanFilter & View (deprecation 해결: filter=...)
@@ -817,7 +885,7 @@ def main():
     clear_btn = Button(label="🧹 Clear details", width=130)
     home_btn = Button(label="↻ Home (initial)", width=160)
 
-    libs = ["All"] + sorted(pd.Series(df["LibID"]).astype(str).unique().tolist())
+    libs = ["All", *sorted(pd.Series(df["LibID"]).astype(str).unique().tolist())]
     cycles_opts = ["All", "3", "4"]
     bb1_opts = ["All"] + [x for x in bb1_cats if x != "NA"]
     bb2_opts = ["All"] + [x for x in bb2_cats if x != "NA"]
@@ -850,9 +918,10 @@ def main():
                           selectable='checkbox', editable=False, sortable=True,
                           index_position=None, sizing_mode='stretch_both')
 
-    # Optional debug panel object referenced by callbacks
+    # Optional debug panel (created once here; placed into the layout in step 8 when --debug 1)
     if int(args.debug) == 1:
-        debug_panel = Div(text="<pre style='margin:0'>[debug] init</pre>", height=1)
+        debug_panel = Div(text="<pre style='margin:0'>[debug] ready</pre>", height=120, sizing_mode="stretch_width",
+                          styles={"overflow-y":"auto","border":"1px solid #eee","background":"#fafafa"})
     else:
         debug_panel = None
 
@@ -1068,8 +1137,7 @@ def main():
             select_sort=select_sort, 
             select_metric=select_metric,
             top_source=top_source,
-            detail_init=detail_init,
-            DBG=(debug_panel if int(args.debug)==1 else None)
+            detail_init=detail_init
         ), 
         code=debug_prefix + selection_change_js
     )
@@ -1081,16 +1149,16 @@ def main():
             detail_div=detail_div, 
             select_sort=select_sort, 
             select_metric=select_metric,
-            detail_init=detail_init,
-            DBG=(debug_panel if int(args.debug)==1 else None)
+            detail_init=detail_init
         ), 
         code=debug_prefix + tap_handler_js
     )
 
     # 이벤트 핸들러 등록
     try:
+        # NOTE: a single registration on selected.indices; js_on_change('selected', ...) was a duplicate
+        # that only fires when the Selection object is replaced.
         source.selected.js_on_change('indices', selection_cb)
-        source.js_on_change('selected', selection_cb)
     except Exception as e:
         print(f"Warning: Could not register selection callbacks: {e}")
 
@@ -1285,8 +1353,7 @@ def main():
             detail_div=detail_div, 
             select_metric=select_metric, 
             select_sort=select_sort,
-            detail_init=detail_init,
-            DBG=(debug_panel if int(args.debug)==1 else None)
+            detail_init=detail_init
         ), 
         code=debug_prefix + table_select_js
     )
@@ -1389,12 +1456,9 @@ def main():
     plots_layout = gridplot([[p1, p2], [p3, p4]], sizing_mode="stretch_width", merge_tools=False, toolbar_location="right")
     
     control_bar = bk_row(clear_btn, home_btn, sizing_mode="stretch_width")
-    if int(args.debug) == 1:
-        debug_panel = Div(text="<pre style='margin:0'>[debug] ready</pre>", height=120, sizing_mode="stretch_width",
-                          styles={"overflow-y":"auto","border":"1px solid #eee","background":"#fafafa"})
+    if debug_panel is not None:
         detail_col = bk_column(control_bar, debug_panel, detail_div, sizing_mode="stretch_both")
     else:
-        debug_panel = None
         detail_col = bk_column(control_bar, detail_div, sizing_mode="stretch_both")
     bottom_row = bk_row(detail_col, top_table, sizing_mode="stretch_width")
     final_layout = bk_column(widgets_row, plots_layout, bottom_row, sizing_mode="stretch_both")
@@ -1423,7 +1487,7 @@ def main():
     # 9) 출력
     print(f"[{time.strftime('%H:%M:%S')}] Write HTML: {args.out}")
     output_file(args.out, title="DELeGANce | Master Top-N Explorer (HitScore ranking)")
-    show(final_layout)
+    save(final_layout)  # batch-safe: write only, never spawn a browser (show() could block on headless hosts)
 
     print(f"[{time.strftime('%H:%M:%S')}] Done.")
     print("=" * 90)

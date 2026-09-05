@@ -35,7 +35,13 @@ def parse_id_fields(id_str: str) -> Tuple[int, str, str, str, str]:
         if t == "":
             i += 1
             continue
-        if i + 1 < len(raw) and raw[i + 1].startswith("LIB") and t not in ("NA", ""):
+        # Same guard as 03_call_hits.parse_id_fields: a token starting with "LIB" is a BB id,
+        # not a namespace fragment to glue onto the previous token.
+        if (
+            i + 1 < len(raw)
+            and raw[i + 1].startswith("LIB")
+            and (t not in ("NA", "") and not t.startswith("LIB"))
+        ):
             parts.append(f"{t}_{raw[i + 1]}")
             i += 2
         else:
@@ -165,7 +171,7 @@ def main():
     rngs = {seed: random.Random(seed) for seed in seeds}
     samples = {seed: [] for seed in seeds}
 
-    counts_all = Counter()
+    counts_all = Counter()  # keyed by (lib_id, id) — raw_counts_matrix rows are (lib_id, id) pairs
     total_reads = 0
 
     with open(decoded_path, "r", newline="") as f:
@@ -173,13 +179,19 @@ def main():
         for i, row in enumerate(reader, 1):
             rid = row.get("id", "")
             if rid:
-                counts_all[rid] += 1
+                counts_all[(row.get("lib_id", "") or "", rid)] += 1
             total_reads += 1
             for seed in seeds:
                 reservoir_update(samples[seed], rngs[seed], i, row, args.n_reads)
 
-    df_counts = pd.read_csv(matrix_path, sep="\t", usecols=["id", args.sample])
-    df_counts = df_counts.set_index("id")
+    # raw_counts_matrix.tsv is keyed by (lib_id, id); the same id can occur under several lib_ids,
+    # so a plain id index would return a Series (int() TypeError) and mis-compare counts.
+    df_counts = pd.read_csv(matrix_path, sep="\t", usecols=["lib_id", "id", args.sample],
+                            dtype={"lib_id": str, "id": str}, keep_default_na=False)
+    matrix_counts = {
+        (str(lib), str(rid)): int(v)
+        for lib, rid, v in zip(df_counts["lib_id"], df_counts["id"], df_counts[args.sample])
+    }
 
     print("=== Random Read Verification ===")
     print(f"run_root: {args.run_root}")
@@ -193,20 +205,22 @@ def main():
 
     for seed in seeds:
         stats, mismatch_examples, ids = analyze_samples(samples[seed])
-        uniq_ids = list(dict.fromkeys(ids))
+        # pair each sampled id with its lib_id (analyze_samples preserves row order)
+        keys = [(row.get("lib_id", "") or "", rid) for row, rid in zip(samples[seed], ids)]
+        uniq_ids = list(dict.fromkeys(keys))
         rngc = random.Random(seed + 100003)
         rngc.shuffle(uniq_ids)
         check_ids = uniq_ids[: min(args.n_ids, len(uniq_ids))]
 
         count_mismatch = 0
         count_examples = []
-        for rid in check_ids:
-            expected = int(df_counts.loc[rid, args.sample]) if rid in df_counts.index else None
-            got = int(counts_all.get(rid, 0))
+        for key in check_ids:
+            expected = matrix_counts.get(key)
+            got = int(counts_all.get(key, 0))
             if expected is None or expected != got:
                 count_mismatch += 1
                 if len(count_examples) < 5:
-                    count_examples.append((rid, expected, got))
+                    count_examples.append((key, expected, got))
 
         print(f"\n[seed={seed}] checks:")
         print(f"  cycles_mismatch: {stats.get('cycles_mismatch', 0)}")

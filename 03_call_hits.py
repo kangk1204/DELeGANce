@@ -56,7 +56,7 @@ else:
     except Exception:
         _HAS_TORCH = False
         try:
-            warnings.warn("[INFO] PyTorch not available; using lightweight GLM fallback (reduced accuracy, slower on CPU).", RuntimeWarning)
+            warnings.warn("[INFO] PyTorch not available; using lightweight GLM fallback (reduced accuracy, slower on CPU).", RuntimeWarning, stacklevel=2)
         except Exception:
             pass
 
@@ -104,7 +104,8 @@ def safe_read_table(path: str, sep: str) -> pd.DataFrame:
     # Accept both plain text and gzipped inputs; fall back to a manual CSV parser
     # when pandas bumps into ragged rows so downstream logic always gets a frame.
     def _read_c():
-        return pd.read_csv(path, sep=sep, engine="c", low_memory=False, dtype=str)
+        # keep_default_na=False: literal "NA"/"None"/"nan" tokens in id/lib/bb columns must survive as strings
+        return pd.read_csv(path, sep=sep, engine="c", low_memory=False, dtype=str, keep_default_na=False, na_values=[])
     def _read_custom():
         with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.reader(f, delimiter=sep if len(sep)==1 else "\t", quoting=csv.QUOTE_MINIMAL)
@@ -397,7 +398,7 @@ def load_bbinfo_auto(path: str, needed_bbs: List[str]) -> pd.DataFrame:
         else:
             df[k] = ""
     # Tag sequence uppercase/no spaces
-    df["tag_seq"] = df["seq"].astype(str).replace(" ", "", regex=False).str.upper()
+    df["tag_seq"] = df["seq"].astype(str).str.replace(r"\s+", "", regex=True).str.upper()
     keep = df[["bb_id","lib_id","smiles","tag_uid","tag_seq","cycle"]].drop_duplicates()
     return keep
 
@@ -432,8 +433,11 @@ def validate_smiles_report(df_hits: pd.DataFrame, out_path: str):
 # ReadScaler (with BEAD q-value gating)
 # -------------------------------
 def ttest_onesample_p(mean: float, sd: float, n: int) -> float:
-    if n is None or n < 2 or not np.isfinite(sd) or sd <= 0 or not np.isfinite(mean):
+    if n is None or n < 2 or not np.isfinite(sd) or not np.isfinite(mean):
         return 1.0
+    if sd <= 0:
+        # zero spread across replicates: t = ±inf when mean != 0 (p -> 0), undefined/uninformative when mean == 0
+        return 1.0 if abs(mean) <= 1e-12 else 0.0
     t = mean / (sd / math.sqrt(n))
     if _HAS_SCIPY:
         return float(2.0 * stats.t.sf(abs(t), df=n - 1))
@@ -647,11 +651,17 @@ class ElasticTagGLM:
 
         def nb2_logpmf(y, mu, alpha):
             eps = 1e-12
-            r = 1.0 / (alpha + eps)
+            # alpha -> 0 makes r = 1/alpha huge and lgamma(y+r) - lgamma(r) suffers catastrophic cancellation
+            # (garbage in float32). Blend to the Poisson limit below a small alpha floor.
+            alpha_floor = 1e-4
+            alpha_c = torch.clamp(alpha, min=alpha_floor)
+            r = 1.0 / alpha_c
             log_p = torch.log(r + eps) - torch.log(r + mu + eps)
             log1mp = torch.log(mu + eps) - torch.log(r + mu + eps)
-            return (torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1.0)
-                    + r * log_p + y * log1mp)
+            nb = (torch.lgamma(y + r) - torch.lgamma(r) - torch.lgamma(y + 1.0)
+                  + r * log_p + y * log1mp)
+            pois = y * torch.log(mu + eps) - mu - torch.lgamma(y + 1.0)
+            return torch.where(alpha < alpha_floor, pois, nb)
 
         def nb2_nll(y, mu, alpha): return -nb2_logpmf(y, mu, alpha).mean()
 
@@ -693,12 +703,14 @@ class ElasticTagGLM:
                 nll_nb = nb2_nll(y[cond], mu, a)
                 loss = loss + (1.0 - self.w[cond]) * nll_p + self.w[cond] * nll_nb
                 if self.dispersion_mode == "shared":
-                    a_use = torch.nn.functional.softplus(log_alpha["SHARED"])
-                    loss = loss + self.alpha_l1 * a_use + self.alpha_l2 * (a_use ** 2)
-                    break
+                    # shared alpha penalty is added once, after the condition loop (no early break)
+                    pass
                 else:
                     if not (self._is_neg(cond) and self.fix_neg_poisson):
                         loss = loss + self.alpha_l1 * a + self.alpha_l2 * (a ** 2)
+            if self.dispersion_mode == "shared":
+                a_use = torch.nn.functional.softplus(log_alpha["SHARED"])
+                loss = loss + self.alpha_l1 * a_use + self.alpha_l2 * (a_use ** 2)
             loss.backward()
             opt.step()
             val = float(loss.detach().cpu().numpy())
@@ -818,6 +830,7 @@ def plot_consensus_counts(df, out_png):
 # HTML report
 # -------------------------------
 def write_html_report(outdir: str, plots_dir: str, topk_consensus_path: str, neg_summary: Dict[str, str]):
+    plots_rel = os.path.relpath(plots_dir, outdir).replace(os.sep, '/')  # paths relative to report.html, not cwd
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>DELeGANce — All-in-one Report</title>
 <style>
@@ -853,9 +866,9 @@ img{{max-width:100%;height:auto;border:1px solid #eee;border-radius:6px}}
   </div>
 </div>
 <div class="row">
-  <div class="card"><h2>Rank plot (GLM)</h2><img src="{plots_dir}/01_rankplot_glm.png"/></div>
-  <div class="card"><h2>GLM vs RS</h2><img src="{plots_dir}/02_glm_vs_rs_scatter.png"/></div>
-  <div class="card"><h2>Consensus counts</h2><img src="{plots_dir}/03_consensus_counts.png"/></div>
+  <div class="card"><h2>Rank plot (GLM)</h2><img src="{plots_rel}/01_rankplot_glm.png"/></div>
+  <div class="card"><h2>GLM vs RS</h2><img src="{plots_rel}/02_glm_vs_rs_scatter.png"/></div>
+  <div class="card"><h2>Consensus counts</h2><img src="{plots_rel}/03_consensus_counts.png"/></div>
 </div>
 <h2>Top consensus hits</h2>
 <p class="small">From <code>{os.path.basename(topk_consensus_path)}</code></p>
@@ -1239,6 +1252,20 @@ def main():
     elif getattr(args, 'preset', 'auto') == 'lenient':
         _apply_lenient(args); print("[PRESET] preset=lenient applied")
 
+    # A one-sample t-test on n<4 replicates has essentially no power (BH q<=0.05 is almost never reached), so
+    # q-value gates (RS pass_filters and the NEG hard gate) remove every compound. At n<4 the q gates are disabled
+    # (set to None) with a warning; the effect-size gates (min_log2fc_*, max_neg_centered_lfc) and neg_gate_mode are
+    # kept. Add the parameter name to --auto_lock to keep a q gate anyway.
+    _n_rep_r1 = len(args.r1_cols) if isinstance(args.r1_cols, (list, tuple)) else 0
+    _n_rep_r2 = len(args.r2_cols) if isinstance(args.r2_cols, (list, tuple)) else 0
+    _lock = set(args.auto_lock or [])
+    for _qname, _nrep in (("max_q_bead", _n_rep_r1), ("max_q_bead_r2", _n_rep_r2), ("max_q_paired_boost", min(_n_rep_r1, _n_rep_r2))):
+        _qv = getattr(args, _qname, None)
+        if _qv is not None and float(_qv) < 0.2 and _nrep < 4 and _qname not in _lock:
+            print(f"[WARN] {_qname}={_qv} but only {_nrep} replicates: a q-value gate has no statistical power at n<4 "
+                  f"→ disabling this gate (add '{_qname}' to --auto_lock to keep it)")
+            setattr(args, _qname, None)
+
     # Load & sum-by-ID
     # Load & sum-by-ID
     if not os.path.isfile(args.matrix_tsv):
@@ -1448,19 +1475,29 @@ def main():
         neg_groups.append([neg_r1_col])
     if neg_r2_col:
         neg_groups.append([neg_r2_col])
-    pre = autotune_pre(df_sum, r1_cols, r2_cols, neg_groups, r3_cols, sfs)
-    # NEG 강화 모드
-    if args.neg_strict == 1 and neg_r1_col:
-        pre["w_neg"] = max(pre.get("w_neg", 0.0), 0.6)
-        pre["fix_neg_poisson"] = 0
-        print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
-    args.w_neg = float(pre.get("w_neg", args.w_neg)); args.w_r1 = float(pre.get("w_r1", args.w_r1)); args.w_r2 = float(pre.get("w_r2", args.w_r2)); 
+    auto_lock = set(args.auto_lock or [])
+    if int(args.auto_tune) == 1:
+        pre = autotune_pre(df_sum, r1_cols, r2_cols, neg_groups, r3_cols, sfs)
+        # NEG 강화 모드
+        if args.neg_strict == 1 and neg_r1_col:
+            pre["w_neg"] = max(pre.get("w_neg", 0.0), 0.6)
+            pre["fix_neg_poisson"] = 0
+            print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
+        for k in ["w_neg", "w_r1", "w_r2"]:
+            if k not in auto_lock:
+                setattr(args, k, float(pre.get(k, getattr(args, k))))
+        if has_r3 and "w_r3" not in auto_lock:
+            args.w_r3 = float(pre.get("w_r3", args.w_r3))
+        if "fix_neg_poisson" not in auto_lock:
+            args.fix_neg_poisson = int(pre.get("fix_neg_poisson", args.fix_neg_poisson))
+        print(f"[AUTO] Pre-GLM tuned: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
+    else:
+        if args.neg_strict == 1 and neg_r1_col:
+            args.w_neg = max(float(args.w_neg), 0.6); args.fix_neg_poisson = 0
+            print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
+        print(f"[AUTO] auto_tune=0 → using CLI values: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
     if not has_r2:
         args.w_r2 = 0.0
-    if has_r3:
-        args.w_r3 = float(pre.get("w_r3", args.w_r3))
-    args.fix_neg_poisson = int(pre.get("fix_neg_poisson", args.fix_neg_poisson))
-    print(f"[AUTO] Pre-GLM tuned: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
 
     # Fit GLM per ID with performance modes
     neg_conds = []
@@ -1499,6 +1536,7 @@ def main():
     # A light auto-tune for t0/slope based on current distribution
     try:
         q25 = float(np.nanquantile(log10_mean, 0.25)); q60 = float(np.nanquantile(log10_mean, 0.60)); q75 = float(np.nanquantile(log10_mean, 0.75))
+        # NOTE: 2.772 = Q80-Q20 width of a unit logistic; IQR would be 2.197 (heuristic kept for backward compatibility)
         slope0 = float(np.clip((q75 - q25) / 2.772, 0.2, 1.0)); t0_0 = q60
     except Exception:
         slope0 = float(args.slope); t0_0 = float(args.t0)
@@ -1544,7 +1582,17 @@ def main():
             y_dict["R3"] = row[r3_cols].values.astype(float); offs_dict["R3"] = offs_r3_map.get(lib_val, np.zeros_like(offs_r3_map.get(lib_val, np.array([]))))
         sf_del2 = max(_sfs_lookup(sfs, lib_val, del2_col), 1e-12)
         del2_norm = del2_val / sf_del2
-        off_log = math.log(del2_norm + args.pseudocount_k * max(1.0, del2_norm))
+        epsk = args.pseudocount_k * max(1.0, del2_norm)
+        off_log = math.log(del2_norm + epsk)
+        # Apply the same pseudocount to the observations (on each replicate's own depth scale) so that
+        # a zero-count condition yields LFC = log2(epsk / (DEL2 + epsk)) — the same floor as the baseline LFC —
+        # instead of diverging to -20…-45 depending on backend (numpy vs torch).
+        for _k in list(y_dict.keys()):
+            _y = np.asarray(y_dict[_k], dtype=float)
+            _o = np.asarray(offs_dict.get(_k, np.zeros_like(_y)), dtype=float)
+            if _o.shape != _y.shape:
+                _o = np.zeros_like(_y)
+            y_dict[_k] = _y + epsk * np.exp(_o)
         fit = model.fit_one(y_dict=y_dict, offs_dict=offs_dict, offset_log=off_log)
         fit["ID"] = tag_id; fit["LIB_ID"] = lib_val; fit["DEL2_sum"] = del2_val
         glm_rows.append(fit)
@@ -1677,12 +1725,40 @@ def main():
             denom = max(abs(q95), abs(q05), 1e-6); rho_syn = float(np.clip(0.20 / denom, 0.05, 0.35))
         out.update({"rho_syn": rho_syn})
         return out
-    post = autotune_post(m, has_r3=bool(has_r3), auto_t0_pct=args.auto_t0_pct, syn_target_amp=args.auto_syn_target)
-    for k in ["t0","slope","c1","c2","c3","w1","w2","w3","lambda_alpha","lambda_cv","cv_cap","rho_syn"]:
-        if k in (args.auto_lock or []): continue
-        setattr(args, k, float(post[k]))
+    if int(args.auto_tune) == 1:
+        post = autotune_post(m, has_r3=bool(has_r3), auto_t0_pct=args.auto_t0_pct, syn_target_amp=args.auto_syn_target)
+        for k in ["t0","slope","c1","c2","c3","w1","w2","w3","lambda_alpha","lambda_cv","cv_cap","rho_syn"]:
+            if k in auto_lock: continue
+            setattr(args, k, float(post[k]))
+    else:
+        print("[AUTO] auto_tune=0 → post-GLM scoring parameters taken from CLI")
     if not has_r2:
         args.w2 = 0.0
+    # persist the parameters actually used for scoring (auto-tuned or CLI)
+    _used_keys = ["auto_tune","w_neg","w_r1","w_r2","w_r3","fix_neg_poisson","t0","slope","c1","c2","c3","w1","w2","w3",
+                  "lambda_alpha","lambda_cv","cv_cap","rho_syn","lambda_neg_glm","tau_neg_lfc","neg_gate_mode","max_q_bead","max_q_bead_r2",
+                  "min_log2fc_bead","min_log2fc_bead_r2","neg_centering","neg_center_quantile","max_neg_centered_lfc","pseudocount_k","dispersion"]
+    _used = {k: getattr(args, k) for k in _used_keys if hasattr(args, k)}
+    _auto_json = args.auto_save_json or os.path.join(args.outdir, "hit_params_used.json")
+    # Downstream exporters (export_final_excel.py, export_beginner_qc_report.py) read OUTDIR/hit_params.json
+    # (normally written by run_delegance_pipeline.py). When 03 is run stand-alone, write a minimal one so the
+    # sample-column mapping is never silently lost; the orchestrator overwrites it with its hashed version.
+    _hp_path = os.path.join(args.outdir, "hit_params.json")
+    if not os.path.isfile(_hp_path):
+        try:
+            with open(_hp_path, "w", encoding="utf-8") as _fh:
+                json.dump({"version": 2, "script": os.path.basename(__file__), "standalone": True,
+                           "normalized_columns": {"r1": list(r1_cols), "r2": list(r2_cols), "neg": [c for c in (neg_r1_col, neg_r2_col) if c], "del2": del2_col}},
+                          _fh, indent=1, ensure_ascii=False, default=str)
+            print(f"[OK] Wrote {_hp_path}")
+        except Exception as _e:
+            warnings.warn(f"could not write {_hp_path}: {_e}", stacklevel=2)
+    try:
+        with open(_auto_json, "w", encoding="utf-8") as _fh:
+            json.dump(_used, _fh, indent=1, ensure_ascii=False, default=str)
+        print(f"[OK] Wrote {_auto_json}")
+    except Exception as _e:
+        warnings.warn(f"could not write {_auto_json}: {_e}", stacklevel=1)
 
     # E/W/Synthon/Penalty/HitScore_GLM
     e1 = np.array([winsorize(x, 0.0, args.c1) for x in pd.to_numeric(m["LFC_R1_vs_DEL2_used"], errors="coerce").fillna(0.0)], dtype=float)
@@ -1732,7 +1808,15 @@ def main():
 
     # ---------- ReadScaler ----------
     rs_rows = []
-    for _, row in df_cpm.iterrows():
+    # ReadScaler statistics are computed on size-factor normalised counts (count / sf_lib,sample) so that
+    # sequencing-depth differences between samples (e.g. NEG vs R1) do not enter log2FC / q-values.
+    _rs_cols = [c for c in ([del2_col] + list(r1_cols) + list(r2_cols) + [neg_r1_col, neg_r2_col]) if c and c in df_cpm.columns]
+    df_rs_in = df_cpm.copy()
+    _libs = df_rs_in["LIB_ID"].astype(str).values if "LIB_ID" in df_rs_in.columns else np.array([""] * len(df_rs_in))
+    for c in _rs_cols:
+        _sf = np.array([max(_sfs_lookup(sfs, lv, c), 1e-12) for lv in _libs], dtype=float)
+        df_rs_in[c] = pd.to_numeric(df_rs_in[c], errors="coerce").astype(float).values / _sf
+    for _, row in df_rs_in.iterrows():
         rs = compute_readscaler_row(row, r1_cols, r2_cols, del2_col, neg_r1_col, neg_r2_col, eps=0.5)
         rs["id"] = row[id_col]
         rs["LIB_ID"] = row.get("LIB_ID", "")
@@ -1790,20 +1874,21 @@ def main():
     for k in ["bb_id","lib_id","smiles","tag_uid","tag_seq"]:
         if k not in meta_lib.columns: meta_lib[k] = ""
     meta_lib = meta_lib[["bb_id","lib_id","smiles","tag_uid","tag_seq"]].drop_duplicates()
+    # O(1) lookups: (lib_id, bb_id) -> record, with bb_id-only fallback (first occurrence wins, as before)
+    _by_lib_bb: Dict[Tuple[str,str], Dict[str,str]] = {}
+    _by_bb: Dict[str, Dict[str,str]] = {}
+    for _r in meta_lib.itertuples(index=False):
+        _rec = {"smiles": _r.smiles if isinstance(_r.smiles, str) else "", "tag_uid": _r.tag_uid if isinstance(_r.tag_uid, str) else "",
+                "tag_seq": (str(_r.tag_seq) if isinstance(_r.tag_seq, str) else "").replace(" ", "").upper()}
+        _by_lib_bb.setdefault((str(_r.lib_id), str(_r.bb_id)), _rec)
+        _by_bb.setdefault(str(_r.bb_id), _rec)
+    _EMPTY = {"smiles":"", "tag_uid":"", "tag_seq":""}
     def lookup(lib: str, bb: str) -> Dict[str,str]:
-        lib = str(lib) if lib is not None else ""; bb  = str(bb)
-        rec = meta_lib[(meta_lib["bb_id"]==bb)]
+        lib = str(lib) if lib is not None else ""; bb = str(bb)
         if lib != "":
-            rec2 = rec[rec["lib_id"]==lib]
-            if len(rec2)>0: rec = rec2
-        if len(rec)>0:
-            r = rec.iloc[0]
-            return {"smiles": r["smiles"], "tag_uid": r["tag_uid"], "tag_seq": (r["tag_seq"] or "").replace(" ","").upper()}
-        r2 = meta_lib[meta_lib["bb_id"]==bb]
-        if len(r2)>0:
-            r = r2.iloc[0]
-            return {"smiles": r["smiles"], "tag_uid": r["tag_uid"], "tag_seq": (r["tag_seq"] or "").replace(" ","").upper()}
-        return {"smiles":"", "tag_uid":"", "tag_seq":""}
+            rec = _by_lib_bb.get((lib, bb))
+            if rec is not None: return rec
+        return _by_bb.get(bb, _EMPTY)
     ann_cols = ["bb1_id","bb1_smiles","bb1_tag_uid","bb1_tag_seq",
                 "bb2_id","bb2_smiles","bb2_tag_uid","bb2_tag_seq",
                 "bb3_id","bb3_smiles","bb3_tag_uid","bb3_tag_seq",

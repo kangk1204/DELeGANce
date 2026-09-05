@@ -147,8 +147,8 @@ my %OPT = (
 
     # fastp auto-detect
     auto_insert_detect => 1,
-    auto_select_window => 1,
-    auto_center_window => 1,
+    auto_select_window => 0,   # -W 1: pick a single 3/4-cycle window (or 'both') from fastp support instead of Top-K 'multi'
+    auto_center_window => 0,   # -C 1: (with -W 1) re-centre the selected window on the nearest fastp peak
     auto_tol_from_fastp=> 0,
 
     # Top-K peaks for mixed DEL
@@ -288,14 +288,17 @@ our $LOG_FH;
 sub ensure_dir {
     my ($dir) = @_;
     return if -d $dir;
-    my $cmd = ($^O =~ /^MSWin32/i)
-        ? qq{powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$dir' | Out-Null"}
-        : qq{mkdir -p "$dir"};
-    system($cmd) == 0 or die "Failed to create dir $dir: $!\n";
+    # File::Path avoids interpolating the path into a shell command (quotes/special chars were unsafe)
+    require File::Path;
+    File::Path::make_path($dir, { error => \my $err });
+    if ($err && @$err) { die "Failed to create directory: $dir\n"; }
 }
 ensure_dir($OUT_DIR);
 open($LOG_FH, ">>", $LOG_FILE) or die "Cannot open log $LOG_FILE: $!\n";
 $LOG_FH->autoflush(1); STDOUT->autoflush(1);
+# Stage completion marker (log is append-mode; an old "All done." must not count as completion)
+my $DONE_MARKER = File::Spec->catfile($OUT_DIR, ".decode_done");
+unlink($DONE_MARKER) if -e $DONE_MARKER;
 sub ts { scalar localtime() }
 sub log_msg { my ($lvl,$msg)=@_; my $ln=ts()." [$lvl] $msg\n"; print $ln; print $LOG_FH $ln; }
 $SIG{__WARN__} = sub { my $m=join("",@_); chomp($m); log_msg("WARN",$m); };
@@ -375,6 +378,27 @@ sub mismatch_enabled_for_type {
 }
 
 # --------- BB 파일 로드 & Trie 구축 ----------
+my %VARIANT_SKIPPED;   # type -> count of 1-bp variants dropped because they collide with another anchor of the same lib
+sub _insert_variant_safe {
+    # A 1-bp variant of anchor A may coincide with (a variant of) another anchor B of the same lib when
+    # edit-distance(A,B) <= 2. Such a variant is ambiguous: keep the perfect-match entries and drop the variant
+    # with a warning instead of dying inside LibraryTrie::insert with a cryptic "dup sequence" message.
+    my ($trie, $type, $seq, $info, $lib, $tag_id) = @_;
+    my $node = $trie;
+    my $exists = 1;
+    foreach my $ch (split //, $seq) {
+        if (!exists $node->{children}{$ch}) { $exists = 0; last; }
+        $node = $node->{children}{$ch};
+    }
+    if ($exists && $node->{is_end} && exists $node->{values}{$lib} && @{ $node->{values}{$lib} }) {
+        $VARIANT_SKIPPED{$type}++;
+        log_msg("WARN", "$type 1-bp variant '$seq' of tag $tag_id (lib '$lib') collides with an existing $type entry; variant skipped (anchors within edit distance 2)")
+            if $VARIANT_SKIPPED{$type} <= 20;
+        return 0;
+    }
+    $trie->insert($seq, $info, $lib);
+    return 1;
+}
 sub load_fixed_bb_and_build_tries {
     my ($file)=@_;
     log_msg("INFO","Loading fixed BB info: $file");
@@ -424,7 +448,7 @@ sub load_fixed_bb_and_build_tries {
                     $CP_VARIANT_OWNER{$s} = $lib_norm;
                 }
                 my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ $CP_TRIE->insert($s,$info_m,$lib_norm); }
+                for my $s (@mis){ _insert_variant_safe($CP_TRIE, 'CP', $s, $info_m, $lib_norm, $tag_id); }
             }
             $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
         } elsif ($type eq "HP"){
@@ -433,7 +457,7 @@ sub load_fixed_bb_and_build_tries {
             if (mismatch_enabled_for_type('HP')){
                 my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
                 my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ $HP_TRIE->insert($s,$info_m,$lib_norm); }
+                for my $s (@mis){ _insert_variant_safe($HP_TRIE, 'HP', $s, $info_m, $lib_norm, $tag_id); }
             }
         } elsif ($type eq "OP"){
             my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
@@ -441,7 +465,7 @@ sub load_fixed_bb_and_build_tries {
             if (mismatch_enabled_for_type('OP')){
                 my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
                 my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ $OP_TRIE->insert($s,$info_m,$lib_norm); }
+                for my $s (@mis){ _insert_variant_safe($OP_TRIE, 'OP', $s, $info_m, $lib_norm, $tag_id); }
             }
         }
     }
@@ -955,7 +979,9 @@ sub process_merged_dir {
                 }
 
                 # 선택/센터링 로직(원하면 멀티 대신 단일 선택)
-                if ($AUTO_SELECT_WINDOW && !$AUTO_CENTER_WINDOW){
+                # NOTE: previously `$AUTO_SELECT_WINDOW && !$AUTO_CENTER_WINDOW` combined with the centering
+                # guard `$mode_local ne 'multi'` made both branches unreachable under the shipped defaults.
+                if ($AUTO_SELECT_WINDOW){
                     if (defined $det->{support3} && defined $det->{support4} && $det->{total}){
                         my $r3 = $det->{support3} / $det->{total};
                         my $r4 = $det->{support4} / $det->{total};
@@ -964,7 +990,7 @@ sub process_merged_dir {
                     }
                 }
                 if ($AUTO_CENTER_WINDOW){
-                    if ($AUTO_SELECT_WINDOW && $mode_local ne 'multi'){
+                    if ($mode_local ne 'multi'){
                         my ($target, $nearest_peak);
                         if     ($mode_local eq '3'){ $target = $EXP_LEN_3_BASE; }
                         elsif  ($mode_local eq '4'){ $target = $EXP_LEN_4_BASE; }
@@ -1025,6 +1051,7 @@ sub process_merged_dir {
             my $seq = <$IN>; my $plus = <$IN>; my $qual = <$IN>;
             last unless defined $qual;
             chomp($hdr); chomp($seq);
+            $seq =~ s/\r\z//; $seq = uc($seq);   # tolerate CRLF and lower-case FASTQ
             $total_reads++;
             my $read_id=$hdr; $read_id =~ s/^\@//;
             my $read_len=length($seq);
@@ -1399,6 +1426,8 @@ write_bb_frequency_by_cycle($BB_FREQ_BY_CYCLE_FILE);
 write_length_window_stats($LEN_STATS_FILE);
 write_qc_checks($QC_CHECKS_FILE);
 
+if (open(my $DM, ">", $DONE_MARKER)) { print $DM scalar(localtime()), "\n"; close($DM); }
+else { log_msg("WARN", "Could not write completion marker $DONE_MARKER: $!"); }
 log_msg("INFO","All done.");
 exit 0;
 

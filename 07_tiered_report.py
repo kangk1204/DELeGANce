@@ -4,24 +4,42 @@
 Selectivity report across active/inactive/both runs with diversity clustering.
 """
 
+# Postpone annotation evaluation so that bokeh-typed signatures (-> row, Div, ...)
+# do not raise NameError at import time when bokeh is unavailable (Python <= 3.13).
+from __future__ import annotations
+
 import argparse
+import base64
 import os
 import re
+import time
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 _HAS_BOKEH = True
+_BOKEH_IMPORT_ERR = ""
 try:
     from bokeh.io import output_file, save
     from bokeh.layouts import column, row
     from bokeh.models import (ColumnDataSource, CustomJS, DataTable, Div, HoverTool,
-                              HTMLTemplateFormatter, NumberFormatter, Panel, TableColumn,
-                              Tabs, TabPanel, Button, TextInput, MultiSelect, Select)
+                              HTMLTemplateFormatter, NumberFormatter, TableColumn,
+                              Tabs, Button, TextInput, MultiSelect, Select)
     from bokeh.plotting import figure
-except Exception:
+except Exception as e:
     _HAS_BOKEH = False
+    _BOKEH_IMPORT_ERR = str(e)
+
+# Panel (Bokeh 2.x) and TabPanel (Bokeh 3.x) are imported separately so that the
+# absence of either one does not disable bokeh entirely.
+_HAS_PANEL = False
+try:
+    from bokeh.models import Panel  # type: ignore
+    _HAS_PANEL = True
+except Exception:
+    _HAS_PANEL = False
 
 _HAS_TABPANEL = False
 try:
@@ -30,13 +48,23 @@ try:
 except Exception:
     _HAS_TABPANEL = False
 
+if _HAS_BOKEH and not (_HAS_PANEL or _HAS_TABPANEL):
+    _HAS_BOKEH = False
+    _BOKEH_IMPORT_ERR = "neither bokeh.models.Panel nor bokeh.models.TabPanel is importable"
+
 _HAS_RDKIT = True
 _RDKIT_IMPORT_ERR = ""
+_HAS_FPGEN = False
 try:
     from rdkit import Chem, DataStructs, RDLogger  # type: ignore
     from rdkit.Chem import AllChem, Draw  # type: ignore
     from rdkit.ML.Cluster import Butina  # type: ignore
     RDLogger.DisableLog("rdApp.warning")
+    try:
+        from rdkit.Chem import rdFingerprintGenerator  # type: ignore
+        _HAS_FPGEN = True
+    except Exception:
+        _HAS_FPGEN = False
 except Exception as e:
     _HAS_RDKIT = False
     _RDKIT_IMPORT_ERR = str(e)
@@ -130,13 +158,39 @@ def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
                 cand = os.path.join(norm, preset, "05_hybrid_annot.tsv")
                 if os.path.isfile(cand):
                     return cand
+                print(f"[WARN] --preset {preset!r} not found under {norm}; falling back to newest 05_hybrid_annot.tsv")
             paths = []
             for root, _, files in os.walk(norm):
                 if "05_hybrid_annot.tsv" in files:
                     paths.append(os.path.join(root, "05_hybrid_annot.tsv"))
             if paths:
-                return max(paths, key=lambda p: os.path.getmtime(p))
+                chosen = max(paths, key=os.path.getmtime)
+                if preset:
+                    print(f"[WARN] using {chosen} instead of preset {preset!r}")
+                return chosen
     raise FileNotFoundError(f"05_hybrid_annot.tsv not found under: {base}")
+
+
+def _pick_col(df: pd.DataFrame, *names: str) -> Optional[str]:
+    """Return the first column name present in df (e.g. 'ID_x' preferred, then 'ID')."""
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _id_col(df: pd.DataFrame) -> Optional[str]:
+    return _pick_col(df, "ID_x", "ID")
+
+
+def _bb_cols(df: pd.DataFrame) -> List[str]:
+    """BB columns in cycle order, preferring the merged '_x' names and falling back to bare names."""
+    out: List[str] = []
+    for i in (1, 2, 3, 4):
+        c = _pick_col(df, f"BB{i}_x", f"BB{i}")
+        if c:
+            out.append(c)
+    return out
 
 
 def _strip_lib_suffix(val: str) -> str:
@@ -153,9 +207,12 @@ def _to_int_series(s: pd.Series) -> pd.Series:
 
 
 def _make_compound_key(df: pd.DataFrame) -> pd.Series:
-    bb_cols = [c for c in ["BB1_x", "BB2_x", "BB3_x", "BB4_x"] if c in df.columns]
+    bb_cols = _bb_cols(df)
     if not bb_cols:
-        return df.get("ID_x", pd.Series(["NA"] * len(df))).astype(str)
+        idc = _id_col(df)
+        if idc is None:
+            return pd.Series(["NA"] * len(df), index=df.index)
+        return df[idc].astype(str)
     tmp = df[bb_cols].fillna("NA").astype(str).copy()
     for c in bb_cols:
         tmp[c] = tmp[c].map(_strip_lib_suffix)
@@ -192,15 +249,17 @@ def _sanitize_label(s: str) -> str:
 
 
 def _infer_score_col(paths: List[str], preset: Optional[str], override: Optional[str]) -> str:
-    if override:
-        return override
     has_glm = True
     has_rs = True
     for p in paths:
         hp = resolve_hybrid_path(p, preset)
         cols = pd.read_csv(hp, sep="\t", nrows=0).columns.tolist()
+        if override and override not in cols:
+            raise SystemExit(f"[ERROR] --score-col {override!r} not found in {hp}")
         has_glm = has_glm and ("HitScore_GLM" in cols)
         has_rs = has_rs and ("HitScore_RS" in cols)
+    if override:
+        return override
     if has_glm:
         return "HitScore_GLM"
     if has_rs:
@@ -237,7 +296,7 @@ def _coalesce_unprefixed_samples(df: pd.DataFrame, base_cols: List[str],
 
 def _sort_sample_cols_by_category(cols: List[str], prefixes: List[str]) -> List[str]:
     def _natural_key(s: str) -> List[object]:
-        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\\d+)", s)]
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
     def _sample_id(col: str, prefix: str) -> str:
         base = col[len(prefix):] if prefix and col.startswith(prefix) else col
@@ -323,6 +382,7 @@ def _final_hits_column_order(df: pd.DataFrame, sample_cols: List[str]) -> List[s
             "group", "group_code", "group_rank", "group_rank_score",
             "rank", "compound_key", "LIB_ID_x", "ID_x",
             "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x",
+            "LIB_ID", "ID", "BB1", "BB2", "BB3", "BB4", "CP",
         ],
         ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles", "BB_SMILES_CONCAT"],
         sample_cols,
@@ -412,7 +472,19 @@ def _rank_maps(df: pd.DataFrame, score_col: str) -> Dict[str, Dict[str, float]]:
     score_map = df.groupby("compound_key")[score_col].max().to_dict()
     items = [(k, v) for k, v in score_map.items() if np.isfinite(v)]
     items.sort(key=lambda x: (-x[1], x[0]))
-    rank_map = {k: i + 1 for i, (k, _) in enumerate(items)}
+    # Tied scores share the same rank (method='min': 1,2,2,4 ...) so that rank_pct
+    # does not depend on the compound_key string order among equal scores.
+    rank_map: Dict[str, int] = {}
+    prev_score: Optional[float] = None
+    prev_rank = 0
+    for i, (k, v) in enumerate(items):
+        if prev_score is not None and v == prev_score:
+            r = prev_rank
+        else:
+            r = i + 1
+        rank_map[k] = r
+        prev_score = v
+        prev_rank = r
     denom = max(1, len(items) - 1)
     rank_pct_map = {k: 100.0 * (1.0 - (r - 1) / denom) for k, r in rank_map.items()}
     if "HitScore_pct" in df.columns:
@@ -448,8 +520,6 @@ def smiles_to_base64(smiles: str, size=(110, 110)) -> str:
         if not mol:
             return _TRANSPARENT_PNG
         img = Draw.MolToImage(mol, size=size)
-        from io import BytesIO
-        import base64
         buf = BytesIO()
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -458,12 +528,22 @@ def smiles_to_base64(smiles: str, size=(110, 110)) -> str:
         return _TRANSPARENT_PNG
 
 
+_FPGEN_CACHE: Dict[Tuple[int, int], object] = {}
+
+
 def _fp_from_smiles(smiles: str, radius: int, nbits: int):
     if not isinstance(smiles, str) or not smiles.strip():
         return None
     mol = Chem.MolFromSmiles(smiles)
     if not mol:
         return None
+    if _HAS_FPGEN:
+        # rdFingerprintGenerator replaces the deprecated GetMorganFingerprintAsBitVect
+        gen = _FPGEN_CACHE.get((radius, nbits))
+        if gen is None:
+            gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nbits)
+            _FPGEN_CACHE[(radius, nbits)] = gen
+        return gen.GetFingerprint(mol)
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
 
 
@@ -512,6 +592,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     smi_cols = [c for c in ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles"] if c in df.columns]
@@ -521,15 +602,16 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     fps = []
     valid_pos = []
-    for i, row in df.reset_index(drop=True).iterrows():
+    for i, rec in df.reset_index(drop=True).iterrows():  # 'rec' avoids shadowing bokeh.layouts.row
         if mode == "compound_or":
             fp = None
             for col in smi_cols:
-                smi = row.get(col, "")
+                smi = rec.get(col, "")
                 fpi = _fp_from_smiles(smi, radius, nbits)
                 if fpi is None:
                     continue
@@ -542,7 +624,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         else:
             row_fps = []
             for col in smi_cols:
-                smi = row.get(col, "")
+                smi = rec.get(col, "")
                 row_fps.append(_fp_from_smiles(smi, radius, nbits))
             if any(fp is not None for fp in row_fps):
                 fps.append(row_fps)
@@ -556,20 +638,41 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     valid_fps = [fps[i] for i in valid_pos]
+    n_valid = len(valid_fps)
+    if n_valid > 5000:
+        print(f"[WARN] clustering {n_valid} compounds: pairwise distance matrix is O(n^2) "
+              f"({n_valid * (n_valid - 1) // 2} pairs); consider a smaller --top-n.")
     dists = []
     if mode == "compound_or":
-        for i in range(1, len(valid_fps)):
+        for i in range(1, n_valid):
             sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
             dists.extend([1.0 - s for s in sims])
     else:
-        for i in range(1, len(valid_fps)):
-            fi = valid_fps[i]
-            for j in range(i):
-                sim = _bbavg_similarity(fi, valid_fps[j])
-                dists.append(1.0 - sim)
+        # Per-BB averaged Tanimoto (same definition as _bbavg_similarity) computed with
+        # BulkTanimotoSimilarity per BB position instead of a Python loop over all pairs.
+        n_bb = len(smi_cols)
+        bb_fps = [[row_fps[k] if row_fps is not None else None for row_fps in valid_fps] for k in range(n_bb)]
+        bb_valid_idx = [np.array([j for j in range(n_valid) if bb_fps[k][j] is not None], dtype=int) for k in range(n_bb)]
+        for i in range(1, n_valid):
+            sim_sum = np.zeros(i, dtype=float)
+            sim_cnt = np.zeros(i, dtype=float)
+            for k in range(n_bb):
+                fi = bb_fps[k][i]
+                if fi is None:
+                    continue
+                idx = bb_valid_idx[k]
+                idx = idx[idx < i]
+                if idx.size == 0:
+                    continue
+                sims = DataStructs.BulkTanimotoSimilarity(fi, [bb_fps[k][j] for j in idx])
+                sim_sum[idx] += np.asarray(sims, dtype=float)
+                sim_cnt[idx] += 1.0
+            avg = np.divide(sim_sum, sim_cnt, out=np.zeros(i, dtype=float), where=sim_cnt > 0)
+            dists.extend((1.0 - avg).tolist())
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
@@ -580,6 +683,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
     out["cluster_medoid"] = 0
 
     scores, rank_pct, cpm_mean, raw_sum = _tie_break_arrays(out, rep_score_col)
+    id_col_name = _id_col(out)
     cluster_rows = []
     for cid, members in enumerate(clusters, start=1):
         members_pos = [valid_pos[i] for i in members]
@@ -632,11 +736,11 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
             "cluster_id": cid,
             "cluster_size": size,
             "rep_index": int(best_pos),
-            "rep_ID_x": rep.get("ID_x", "NA"),
+            "rep_ID_x": rep.get(id_col_name, "NA") if id_col_name else "NA",
             "rep_score": float(rep.get(rep_score_col, np.nan)) if pd.notna(rep.get(rep_score_col, np.nan)) else np.nan,
             "rep_compound_key": rep.get("compound_key", "NA"),
             "medoid_index": int(medoid_pos),
-            "medoid_ID_x": medoid.get("ID_x", "NA"),
+            "medoid_ID_x": medoid.get(id_col_name, "NA") if id_col_name else "NA",
             "medoid_score": float(medoid.get(rep_score_col, np.nan)) if pd.notna(medoid.get(rep_score_col, np.nan)) else np.nan,
             "medoid_compound_key": medoid.get("compound_key", "NA"),
             "medoid_avg_sim": float(medoid_avg),
@@ -674,7 +778,8 @@ def _make_panel(child, title: str):
 def _col_width(col: str, series: pd.Series) -> int:
     if col.startswith("bb") and col.endswith("_img"):
         return 90
-    if col in ("ID_x", "LIB_ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"):
+    if col in ("ID_x", "LIB_ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x",
+               "ID", "LIB_ID", "BB1", "BB2", "BB3", "BB4", "CP"):
         base = 150
     elif col in ("compound_key", "BB_SMILES_CONCAT"):
         base = 220
@@ -704,7 +809,8 @@ def _img_formatter(width: int, zoom: int) -> HTMLTemplateFormatter:
 
 def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
                          filename: str, group_col: Optional[str],
-                         page_state: ColumnDataSource, page_size: int) -> row:
+                         page_state: ColumnDataSource, page_size: int,
+                         search_cols: Optional[List[str]] = None) -> row:
     total = 0
     if full.data:
         first_key = next(iter(full.data.keys()))
@@ -713,16 +819,24 @@ def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
     shown = min(total, page_size) if total else 0
     pages = (total + page_size - 1) // page_size if total else 0
     page_label = f"1/{pages}" if pages else "0/0"
-    search = TextInput(title="Search", value="", placeholder="compound_key / ID / BB / CP")
+    search = TextInput(title="Search", value="", placeholder="compound_key / ID / BB / CP (text columns only)")
     sort_cols = list(full.data.keys()) if full.data else []
     sort_default = "__none__"
     for cand in ["group_rank", "rank", "group_rank_score", "specificity_score", "HitScore_GLM"]:
         if cand in sort_cols:
             sort_default = cand
             break
-    sort_options = ["__none__"] + sort_cols if sort_cols else ["__none__"]
+    sort_options = ["__none__", *sort_cols] if sort_cols else ["__none__"]
     sort_select = Select(title="Sort by", value=sort_default, options=sort_options)
-    sort_dir = Select(title="Order", value="desc", options=["desc", "asc"])
+    # Rank-like columns are ascending in the pre-sorted first page; the JS re-sort used by
+    # search/paging must start in the same direction or page 2 would show the tail.
+    rank_like = {"group_rank", "rank", "final_group_rank"}
+    default_dir = "asc" if sort_default in rank_like else "desc"
+    sort_dir = Select(title="Order", value=default_dir, options=["asc", "desc"])
+    if search_cols is None:
+        search_cols = [c for c in sort_cols
+                       if not (c.endswith("_img") or c in ("structure_html", "group_badge"))]
+    search_cols = [c for c in search_cols if c in sort_cols]
     if shown:
         count_text = f"<span class='table-count'>Showing 1-{shown} of {total} (page {page_label})</span>"
     else:
@@ -757,7 +871,7 @@ for (let i = 0; i < n; i++) {
   }
   if (keep && term) {
     let hit = false;
-    for (const c of cols) {
+    for (const c of search_cols) {
       const v = data[c][i];
       if (v === null || v === undefined) continue;
       if (String(v).toLowerCase().includes(term)) { hit = true; break; }
@@ -814,7 +928,8 @@ count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page $
     args = dict(
         source=source, full=full, search=search, count_div=count_div,
         group=group_select, group_col=group_col or "", page_state=page_state, page_size=page_size,
-        sort_col=sort_select, sort_dir=sort_dir
+        sort_col=sort_select, sort_dir=sort_dir,
+        search_cols=list(search_cols), filename=filename,
     )
     callback = CustomJS(args=args, code=filter_js)
     search.js_on_change("value", callback)
@@ -894,7 +1009,7 @@ for (let i = 0; i < n; i++) {
   }
   if (keep && term) {
     let hit = false;
-    for (const c of cols) {
+    for (const c of search_cols) {
       const v = data[c][i];
       if (v === null || v === undefined) continue;
       if (String(v).toLowerCase().includes(term)) { hit = true; break; }
@@ -972,7 +1087,7 @@ for (let i = 0; i < n; i++) {
   }
   if (keep && term) {
     let hit = false;
-    for (const c of cols) {
+    for (const c of search_cols) {
       const v = data[c][i];
       if (v === null || v === undefined) continue;
       if (String(v).toLowerCase().includes(term)) { hit = true; break; }
@@ -1061,7 +1176,7 @@ for (let i = 0; i < n; i++) {
   }
   if (keep && term) {
     let hit = false;
-    for (const c of cols) {
+    for (const c of search_cols) {
       const v = data[c][i];
       if (v === null || v === undefined) continue;
       if (String(v).toLowerCase().includes(term)) { hit = true; break; }
@@ -1152,6 +1267,10 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
             "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "compound_img",
             "bb1_img", "bb2_img", "bb3_img", "bb4_img",
         ]
+    # backward-compatible fallbacks (ID/LIB_ID/BB*/CP without the merge suffix)
+    for base in ["ID", "LIB_ID", "BB1", "BB2", "BB3", "BB4", "CP"]:
+        if f"{base}_x" not in df.columns and base in df.columns and base not in table_fields:
+            table_fields.append(base)
     if sample_cols:
         table_fields.extend(sample_cols)
     table_fields = [c for c in table_fields if c in df.columns]
@@ -1208,7 +1327,8 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     total_width = sum([c.width or 0 for c in table_cols]) + 40
     table_width = min(5000, max(1200, total_width))
     freeze_col = None
-    for col in ["CP_x", "BB4_x", "BB3_x", "BB2_x", "BB1_x", "LIB_ID_x", "ID_x"]:
+    for col in ["CP_x", "BB4_x", "BB3_x", "BB2_x", "BB1_x", "LIB_ID_x", "ID_x",
+                "CP", "BB4", "BB3", "BB2", "BB1", "LIB_ID", "ID"]:
         if col in table_df.columns:
             freeze_col = col
             break
@@ -1225,7 +1345,10 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         frozen_columns=frozen_columns,
     )
     group_col = "group" if "group" in table_df.columns else None
-    controls = _make_table_controls(source, full_source, download_name, group_col, page_state, page_size)
+    search_cols = [c for c in table_df.columns
+                   if not (c.endswith("_img") or c in ("structure_html", "group_badge"))]
+    controls = _make_table_controls(source, full_source, download_name, group_col, page_state, page_size,
+                                    search_cols=search_cols)
     table_layout = column(controls, table, sizing_mode="stretch_width")
     struct_div = None
     if with_structure and "structure_html" in table_df.columns:
@@ -1317,7 +1440,7 @@ def _parse_range(arg: Optional[str], values: pd.Series) -> Tuple[float, float]:
     s = str(arg).strip().lower()
     if s in ("", "auto"):
         return _auto_range_pct(values)
-    parts = [p for p in re.split(r"[,:\\s]+", s) if p]
+    parts = [p for p in re.split(r"[,:\s]+", s) if p]
     if len(parts) != 2:
         raise ValueError(f"Invalid range: {arg}")
     a, b = float(parts[0]), float(parts[1])
@@ -1337,7 +1460,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
                final_title: Optional[str] = None,
                html_mode: str = "cdn") -> None:
     if not _HAS_BOKEH:
-        print("[WARN] bokeh is not available; skipping interactive HTML output.")
+        print(f"[WARN] bokeh is not available ({_BOKEH_IMPORT_ERR}); skipping interactive HTML output.")
         return
 
     items = [Div(text=_style_block())]
@@ -1396,6 +1519,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
     df_plot["color"] = df_plot["group_code"].map(colors).fillna("#bdbdbd")
     cds = ColumnDataSource(df_plot)
 
+    idc = _id_col(df_plot) or "ID_x"
+    bbc = {i: (_pick_col(df_plot, f"BB{i}_x", f"BB{i}") or f"BB{i}_x") for i in (1, 2, 3, 4)}
     hover = HoverTool(tooltips=[
         ("group", "@group"),
         ("group_rank", "@group_rank"),
@@ -1405,11 +1530,11 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
         (f"{inactive_label}_pct", "@inactive_rank_pct{0.0}"),
         ("both_pct", "@both_rank_pct{0.0}"),
         ("cluster", "@cluster_id"),
-        ("ID", "@ID_x"),
-        ("BB1", "@BB1_x"),
-        ("BB2", "@BB2_x"),
-        ("BB3", "@BB3_x"),
-        ("BB4", "@BB4_x"),
+        ("ID", f"@{{{idc}}}"),
+        ("BB1", f"@{{{bbc[1]}}}"),
+        ("BB2", f"@{{{bbc[2]}}}"),
+        ("BB3", f"@{{{bbc[3]}}}"),
+        ("BB4", f"@{{{bbc[4]}}}"),
     ])
 
     x_min, x_max = _parse_range(plot_x_range, df_plot["active_rank_pct"])
@@ -1452,7 +1577,8 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
             download_name=f"{group.lower().replace(' ', '_')}_all.csv"
         )
         if all_table is not None:
-            panel_items.append(Div(text=f"<p>All hits (top {min(len(df_all_tier), max_table)} shown)</p>"))
+            n_shown = min(len(df_all_tier), max_table) if max_table else len(df_all_tier)
+            panel_items.append(Div(text=f"<p>All hits (top {n_shown} shown)</p>"))
             if all_struct is not None:
                 panel_items.append(all_struct)
             panel_items.append(all_table)
@@ -1517,24 +1643,31 @@ def main() -> int:
     ap.add_argument("--active-spec-max-inactive", type=float, default=50.0,
                     help="Active-specific: max inactive rank_pct")
     ap.add_argument("--active-spec-min-both", type=float, default=90.0,
-                    help="Active-specific: min both rank_pct (ignored when using active/inactive-only)")
+                    help="DEPRECATED (no effect): grouping uses only active/inactive rank_pct")
     ap.add_argument("--inactive-spec-min", type=float, default=99.0,
                     help="Inactive-specific: min inactive rank_pct")
     ap.add_argument("--inactive-spec-max-active", type=float, default=50.0,
                     help="Inactive-specific: max active rank_pct")
     ap.add_argument("--inactive-spec-min-both", type=float, default=90.0,
-                    help="Inactive-specific: min both rank_pct (ignored when using active/inactive-only)")
+                    help="DEPRECATED (no effect): grouping uses only active/inactive rank_pct")
     ap.add_argument("--both-spec-min", type=float, default=99.0,
-                    help="Both-specific: min both rank_pct")
+                    help="Both-specific (Common): floor applied to BOTH active and inactive rank_pct "
+                         "(effective min = max(--both-spec-min, --both-spec-min-active/-inactive)); "
+                         "both_rank_pct from --both-run is not used for grouping")
     ap.add_argument("--both-spec-min-active", type=float, default=90.0,
-                    help="Both-specific: min active rank_pct")
+                    help="Both-specific: min active rank_pct (only effective when > --both-spec-min)")
     ap.add_argument("--both-spec-min-inactive", type=float, default=90.0,
-                    help="Both-specific: min inactive rank_pct")
+                    help="Both-specific: min inactive rank_pct (only effective when > --both-spec-min)")
     ap.add_argument("--both-weight", type=float, default=0.3,
-                    help="Weight for both_rank_pct in specificity scores (ignored when using active/inactive-only)")
+                    help="DEPRECATED (no effect): both_rank_pct is not used in specificity scores")
 
     ap.add_argument("--neg-samples", nargs="+", default=None,
                     help="Negative control sample names (base names, e.g. K_R2C5 K_R3C5)")
+    ap.add_argument("--del2", default="DEL2",
+                    help="DEL2/naive-library baseline sample name (03_call_hits --del2); excluded from "
+                         "enrichment aggregation (default: DEL2)")
+    ap.add_argument("--exclude-samples", nargs="*", default=["DEL234"],
+                    help="Additional sample base names excluded from enrichment aggregation (default: DEL234)")
     ap.add_argument("--neg-max-pct", type=float, default=None,
                     help="Exclude candidates if any NEG sample CPM is >= this percentile (e.g. 99)")
     ap.add_argument("--final-active-n", type=int, default=0,
@@ -1573,7 +1706,23 @@ def main() -> int:
         raise SystemExit("[ERROR] --labels must match number of runs (active/inactive/(both))")
     if not labels:
         labels = [os.path.basename(os.path.normpath(p)) or f"run{i+1}" for i, p in enumerate(run_paths)]
-    labels = [_sanitize_label(l) for l in labels]
+    labels = [_sanitize_label(lab) for lab in labels]
+    # Duplicate labels (e.g. both runs given as .../05_hybrid_annot.tsv, or same preset dir name)
+    # would produce identical column prefixes and silently break the sample-column merge.
+    seen_labels: Dict[str, int] = {}
+    uniq_labels: List[str] = []
+    for lab in labels:
+        if lab in seen_labels:
+            seen_labels[lab] += 1
+            new_lab = f"{lab}_{seen_labels[lab]}"
+            while new_lab in seen_labels:
+                seen_labels[lab] += 1
+                new_lab = f"{lab}_{seen_labels[lab]}"
+            print(f"[WARN] duplicate run label {lab!r}; using {new_lab!r} (pass --labels to set explicit labels)")
+            lab = new_lab
+        seen_labels[lab] = seen_labels.get(lab, 1)
+        uniq_labels.append(lab)
+    labels = uniq_labels
     active_label = labels[0] if len(labels) > 0 else "sampleA"
     inactive_label = labels[1] if len(labels) > 1 else "sampleB"
     both_label = labels[2] if len(labels) > 2 else "both"
@@ -1603,13 +1752,13 @@ def main() -> int:
             group_codes["both"]: f"Common ({active_label}&{inactive_label})",
             group_codes["other"]: "Other",
         }
-    global GROUP_COLOR_MAP
-    GROUP_COLOR_MAP = {
+    GROUP_COLOR_MAP.clear()
+    GROUP_COLOR_MAP.update({
         group_codes["active"]: "#1b9e77",
         group_codes["inactive"]: "#d95f02",
         group_codes["both"]: "#7570b3",
         group_codes["other"]: "#9e9e9e",
-    }
+    })
     group_active = group_codes["active"]
     group_inactive = group_codes["inactive"]
     group_both = group_codes["both"]
@@ -1646,6 +1795,8 @@ def main() -> int:
 
     want_base = [
         "LIB_ID_x", "ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "cycles",
+        # backward-compatible fallbacks when the hybrid file has unsuffixed names
+        "LIB_ID", "ID", "BB1", "BB2", "BB3", "BB4", "CP",
         "bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles", "BB_SMILES_CONCAT",
         "HitScore_GLM", "HitScore_RS", "HitScore_pct", "SynthonScore",
         "GLM_hit", "RS_pass", "Consensus_hit", "NEG_hard_fail", "NEG_center_fail",
@@ -1698,7 +1849,7 @@ def main() -> int:
         use = [c for c in cols if c in df_best.columns]
         if not use:
             return None
-        block = df_best[["compound_key"] + use].copy()
+        block = df_best[["compound_key", *use]].copy()
         block = block.rename(columns=rename)
         return block
 
@@ -1720,16 +1871,19 @@ def main() -> int:
     if not top_frames:
         raise SystemExit("[ERROR] No candidates after filtering; check top-n or filters.")
     df_base = pd.concat(top_frames, ignore_index=True).drop_duplicates("compound_key").copy()
+    base_sample_cols = []
+    for col in active_sample_cols + inactive_sample_cols + both_sample_cols:
+        if col not in base_sample_cols:
+            base_sample_cols.append(col)
+    # Drop the unprefixed sample columns inherited from whichever run a row came from; the
+    # coalesced columns are rebuilt below strictly in active -> inactive -> both order.
+    df_base = df_base.drop(columns=[c for c in base_sample_cols if c in df_base.columns])
     for block in (active_samples, inactive_samples, both_samples):
         if block is not None:
             df_base = df_base.merge(block, on="compound_key", how="left")
     for col in prefixed_sample_cols:
         if col in df_base.columns:
             df_base[col] = pd.to_numeric(df_base[col], errors="coerce")
-    base_sample_cols = []
-    for col in active_sample_cols + inactive_sample_cols + both_sample_cols:
-        if col not in base_sample_cols:
-            base_sample_cols.append(col)
     prefixes = [f"{active_label}_", f"{inactive_label}_"]
     if both_label and both_label not in (active_label, inactive_label):
         prefixes.append(f"{both_label}_")
@@ -1781,15 +1935,27 @@ def main() -> int:
         for col, thr in thresholds.items():
             if col not in df.columns:
                 continue
-            mask &= pd.to_numeric(df[col], errors="coerce").fillna(0.0) < thr
+            vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            if thr <= 0:
+                # Zero-inflated NEG column: the percentile itself is 0, so "< thr" would drop
+                # every candidate. Keep rows whose NEG count is 0 and drop any positive NEG.
+                print(f"[WARN] NEG filter: percentile {args.neg_max_pct} of {col} is {thr}; keeping rows with {col} == 0")
+                mask &= vals <= 0
+            else:
+                mask &= vals < thr
         kept = int(mask.sum())
         print(f"[INFO] NEG filter: pct={args.neg_max_pct}, cols={len(thresholds)}, kept={kept}/{len(df)}")
         return df[mask].copy()
 
     df_base = _neg_filter(df_base)
+    if df_base.empty:
+        raise SystemExit("[ERROR] No candidates left after NEG filter; relax --neg-max-pct or check --neg-samples.")
 
-    df_base = _strip_bb_suffix_cols(df_base, ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"])
-    df_base = df_base.sort_values(score_col, ascending=False)
+    df_base = _strip_bb_suffix_cols(df_base, ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x",
+                                              "BB1", "BB2", "BB3", "BB4", "CP"])
+    # NOTE: score_col here is the value from the run each row originated from (active first);
+    # mergesort keeps the concat order (active, inactive, both) deterministic among ties.
+    df_base = df_base.sort_values(score_col, ascending=False, kind="mergesort")
     df_base["rank"] = np.arange(1, len(df_base) + 1, dtype=int)
 
     df_base["active_score"] = df_base["compound_key"].map(maps_active["score_map"])
@@ -1800,19 +1966,30 @@ def main() -> int:
 
     df_base["inactive_score"] = df_base["compound_key"].map(maps_inactive["score_map"])
     df_base["inactive_rank_pct"] = df_base["compound_key"].map(maps_inactive["rank_pct_map"]).fillna(0.0)
+    # Presence flags: a compound absent from a run gets rank_pct 0 above (kept for backward
+    # compatibility); these flags make "absent" distinguishable from "ranked at the bottom".
+    df_base["active_present"] = df_base["compound_key"].isin(maps_active["rank_map"]).astype(int)
+    df_base["inactive_present"] = df_base["compound_key"].isin(maps_inactive["rank_map"]).astype(int)
 
     if maps_both:
         df_base["both_score"] = df_base["compound_key"].map(maps_both["score_map"])
         df_base["both_rank_pct"] = df_base["compound_key"].map(maps_both["rank_pct_map"]).fillna(0.0)
+        df_base["both_present"] = df_base["compound_key"].isin(maps_both["rank_map"]).astype(int)
     else:
         df_base["both_score"] = np.nan
         df_base["both_rank_pct"] = np.nan
+        df_base["both_present"] = 0
 
     df_base["selectivity_score"] = df_base["active_rank_pct"] - df_base["inactive_rank_pct"]
     df_base["inactive_selectivity_score"] = df_base["inactive_rank_pct"] - df_base["active_rank_pct"]
     df_base["both_specific_score"] = (df_base["active_rank_pct"] + df_base["inactive_rank_pct"]) / 2.0
 
-    exclude_bases = {s.upper() for s in neg_samples} | {"DEL234"}
+    # Exclude NEG controls, the DEL2 baseline (03_call_hits --del2, default DEL2) and any extra
+    # names from enrichment aggregation; "DEL234" stays excluded via --exclude-samples default.
+    exclude_bases = {s.upper() for s in neg_samples}
+    if args.del2:
+        exclude_bases.add(str(args.del2).strip().upper())
+    exclude_bases |= {str(s).strip().upper() for s in (args.exclude_samples or []) if str(s).strip()}
     active_enrich_cols = _pick_enrich_cols(
         _filter_enrich_cols([c for c in active_prefixed if c in df_base.columns], f"{active_label}_", exclude_bases)
     )
@@ -1877,6 +2054,7 @@ def main() -> int:
         )
     else:
         cluster_df = None
+        print("[INFO] clustering disabled (--cluster 0); *_diverse.tsv will equal the full group lists.")
 
     group_order = [group_active, group_inactive, group_both, group_other]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
@@ -1896,6 +2074,8 @@ def main() -> int:
         ],
         default=df_base["specificity_score"] if args.rank_by == "specificity" else group_active_enrich,
     )
+    # -inf was only a sort sentinel for missing enrichment; do not leak it into outputs.
+    df_base["group_rank_score"] = df_base["group_rank_score"].replace(-np.inf, np.nan)
     df_base["group_tiebreak_score"] = np.select(
         [
             df_base["group_code"] == group_active,
@@ -1909,20 +2089,27 @@ def main() -> int:
         ],
         default=df_base["active_score"],
     )
+    df_base["_group_rank_sort"] = df_base["group_rank_score"].fillna(float("-inf"))
     if args.rank_by == "enrichment":
-        sort_cols = ["group_code", "group_rank_score", "specificity_score", "group_tiebreak_score"]
+        sort_cols = ["group_code", "_group_rank_sort", "specificity_score", "group_tiebreak_score"]
         sort_asc = [True, False, False, False]
     else:
-        sort_cols = ["group_code", "group_rank_score", "group_tiebreak_score"]
+        sort_cols = ["group_code", "_group_rank_sort", "group_tiebreak_score"]
         sort_asc = [True, False, False]
     df_base = df_base.sort_values(
         sort_cols,
         ascending=sort_asc,
+        kind="mergesort",
     )
-    df_base = df_base.drop(columns=["group_tiebreak_score"])
+    df_base = df_base.drop(columns=["group_tiebreak_score", "_group_rank_sort"])
     df_base["group_rank"] = df_base.groupby("group_code", observed=False).cumcount() + 1
     group_code_str = df_base["group_code"].astype(str)
     df_base["group"] = group_code_str.map(group_display).fillna(group_code_str)
+
+    # score NaN was filled with -inf for sorting/ranking (see _load loop); restore NaN for outputs.
+    for c in [score_col, "active_score", "inactive_score", "both_score"]:
+        if c in df_base.columns:
+            df_base[c] = pd.to_numeric(df_base[c], errors="coerce").replace(-np.inf, np.nan)
 
     out_all = f"{prefix}_all_candidates.tsv"
     df_base.to_csv(out_all, sep="\t", index=False)
@@ -1939,11 +2126,12 @@ def main() -> int:
                     return
                 pref = f"{label}_"
                 view = df_base.copy()
+                drop_cols = []
                 for col in sample_cols:
                     pref_col = f"{pref}{col}"
                     if pref_col in view.columns:
                         view[col] = view[pref_col]
-                drop_cols = []
+                        drop_cols.append(pref_col)  # avoid duplicated <label>_<sample> next to <sample>
                 for c in view.columns:
                     if c in prefixed_sample_cols and not c.startswith(pref):
                         drop_cols.append(c)
@@ -1956,6 +2144,8 @@ def main() -> int:
                 _write_excel_safe(view, f"{prefix}_all_candidates_{label}.xlsx", f"all-candidates-{label}")
             _export_run_candidates(active_label, active_sample_cols)
             _export_run_candidates(inactive_label, inactive_sample_cols)
+            if df_both is not None and both_sample_cols:
+                _export_run_candidates(both_label, both_sample_cols)
         else:
             print("[INFO] all-candidates Excel disabled for full (top-n=0) run; TSV only.")
     except Exception as exc:
@@ -2075,6 +2265,9 @@ def main() -> int:
             ]:
                 if os.path.exists(candidate):
                     final_hits_path = candidate
+                    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(candidate)))
+                    print(f"[WARN] embedding existing {candidate} (mtime={mtime}) from a previous run; "
+                          "pass --final-*-n to regenerate or --final-hits to choose a file")
                     break
         if final_hits_path:
             if os.path.exists(final_hits_path):
@@ -2108,21 +2301,11 @@ def main() -> int:
         f"{len(df_base)} active={summary['n_active']} inactive={summary['n_inactive']} "
         f"both={summary['n_both']} other={summary['n_other']}"
     )
-    base_outputs = [
-        out_all,
-        f"{prefix}_active_specific.tsv",
-        f"{prefix}_inactive_specific.tsv",
-        f"{prefix}_both_specific.tsv",
-    ]
+    base_outputs = [out_all] + [info["path"] for info in groups.values()]
     if other_path:
         base_outputs.append(other_path)
     print(f"[INFO] outputs: {', '.join(base_outputs)}")
-    print(
-        "[INFO] outputs: "
-        f"{prefix}_active_specific_diverse.tsv, "
-        f"{prefix}_inactive_specific_diverse.tsv, "
-        f"{prefix}_both_specific_diverse.tsv"
-    )
+    print("[INFO] outputs: " + ", ".join(info["diverse_path"] for info in groups.values()))
     if not args.no_html:
         print(f"[INFO] html: {html_path}")
     return 0

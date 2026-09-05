@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-LIB_RE = re.compile(r"(?:^|[_])LIB[A-Za-z0-9]+", re.IGNORECASE)
+# Matches the namespace token written by 01_preprocess_reads.pl ("_LIB" + [A-Za-z0-9_.-]); case-sensitive
+# and anchored to a token boundary so BB ids containing "lib" are not counted as suffixed.
+LIB_RE = re.compile(r"_LIB[^_]+(?=_|$)")
 
 
 def has_lib_suffix(text: str) -> bool:
@@ -41,7 +43,7 @@ def analyze_file(path: Path, sample_size: int, rng: random.Random) -> Tuple[Dict
         "id_missing_bb_missing_lib": [],
         "id_has_lib_bb_missing_lib": [],
     }
-    idx = {k: 0 for k in examples.keys()}
+    idx = dict.fromkeys(examples.keys(), 0)
 
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -143,8 +145,11 @@ def main() -> None:
 
     out_path = Path(args.out_tsv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df = pd.DataFrame(out_rows)
-    out_df.to_csv(out_path, sep="\t", index=False)
+    # plain csv writer: no pandas dependency (pd was only bound under __main__, so main() failed when imported)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()), delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(out_rows)
 
     ex_path = Path(args.out_examples)
     ex_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,5 +160,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import pandas as pd  # local import to keep top minimal
     main()

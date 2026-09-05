@@ -224,10 +224,10 @@ my $LOG_FILE           = File::Spec->catfile($RUN_DIR, "01_preprocess_reads.log"
 sub ensure_dir {
     my ($dir) = @_;
     return if -d $dir;
-    my $cmd = ($^O =~ /^MSWin32/i)
-        ? qq{powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$dir' | Out-Null"}
-        : qq{mkdir -p "$dir"};
-    system($cmd) == 0 or die "Failed to create directory: $dir\n";
+    # File::Path avoids interpolating the path into a shell command (quotes/special chars were unsafe)
+    require File::Path;
+    File::Path::make_path($dir, { error => \my $err });
+    if ($err && @$err) { die "Failed to create directory: $dir\n"; }
 }
 ensure_dir($RUN_DIR);
 ensure_dir($FASTP_DIR);
@@ -237,6 +237,9 @@ ensure_dir($NORM_DIR);
 open(my $LOG_FH, ">>", $LOG_FILE) or die "Cannot open log file $LOG_FILE: $!\n";
 $LOG_FH->autoflush(1);
 STDOUT->autoflush(1);
+# Stage completion marker (the log is append-mode, so an old "All done." line must not be used as a resume marker).
+my $DONE_MARKER = File::Spec->catfile($FASTP_DIR, ".preprocess_done");
+unlink($DONE_MARKER) if -e $DONE_MARKER;
 
 # Resolve BB information file (explicit or auto-detect)
 sub _auto_detect_bbinfo {
@@ -363,6 +366,8 @@ if (!$OPT_SKIP_FASTP) {
             "Provide pre-merged *_merged.fq.gz files or rerun without --skip-fastp.\n";
     }
 }
+if (open(my $DM, ">", $DONE_MARKER)) { print $DM scalar(localtime()), "\n"; close($DM); }
+else { log_msg("WARN", "Could not write completion marker $DONE_MARKER: $!"); }
 log_msg("INFO", "All done. See log: $LOG_FILE");
 
 #--------------------------- Step 1: bb_id-SMILES fix
@@ -619,6 +624,7 @@ sub run_fastp {
     my @file = readdir($OD); closedir($OD);
 
     my %paired;
+    my @failed_samples;
     my $ext_re = qr/(?:fastq|fq)(?:\.gz)?/i;
     # Optional custom pairing regex with named groups (?P<base>...), (?P<read>[12])
     my $PAIR_RE;
@@ -646,18 +652,26 @@ sub run_fastp {
             next FILE;
         }
         # Common bcl2fastq style: *_R1_*.fastq.gz / *_R2_*.fastq.gz
-        if ($fn =~ /^(.*?)[._-]R([12])(?:[._-]|\b).*\.(?:fastq|fq)(?:\.gz)?$/i) {
+        # Order matters: the simple *_1.fastq.gz / *_2.fastq.gz style is the most specific (digit directly before
+        # the extension) and must be tested FIRST. Testing the bcl2fastq "_R1" pattern first mis-pairs sample names
+        # that themselves contain _R1/_R2 (e.g. NEG_R1_2.fastq.gz was taken as read 1 of sample "NEG").
+        if ($fn =~ /^(.*?)[._-]([12])\.(?:fastq|fq)(?:\.gz)?$/i) {
             ($base, $read) = ($1, $2);
         }
-        # Simpler style: *_1.fastq.gz / *_2.fastq.gz (avoid L001 by requiring separator before digit and end before extension)
-        elsif ($fn =~ /^(.*?)[._-]([12])\.(?:fastq|fq)(?:\.gz)?$/i) {
+        # bcl2fastq style: <base>_R1_001.fastq.gz / <base>_R1.fastq.gz — R[12] must be followed by a separator
+        # token (lane/chunk) or directly by the extension, never by another word character.
+        elsif ($fn =~ /^(.*?)[._-]R([12])(?:[._-][^.]*)?\.(?:fastq|fq)(?:\.gz)?$/i) {
             ($base, $read) = ($1, $2);
         } else {
             next FILE;
         }
         my $path = File::Spec->catfile($FASTQ_DIR, $fn);
-        if ($read == 1) { $paired{$base}{f} = $path; }
-        elsif ($read == 2) { $paired{$base}{r} = $path; }
+        my $slot = ($read == 1) ? 'f' : 'r';
+        if (exists $paired{$base}{$slot}) {
+            die "FASTQ pairing conflict: read $read of sample '$base' matched twice ".
+                "('$paired{$base}{$slot}' and '$path'). Use --fastq-regex with (?<base>...)(?<read>[12]) to disambiguate.\n";
+        }
+        $paired{$base}{$slot} = $path;
     }
 
     my @samples = sort keys %paired;
@@ -703,6 +717,7 @@ sub run_fastp {
         my $pid = eval { open3(undef, $ch_out, $ch_err, @cmd) };
         if ($@) {
             log_msg("ERROR", "failed to start fastp: $@");
+            push @failed_samples, $sample;
             next;
         }
         while (1) {
@@ -726,9 +741,17 @@ sub run_fastp {
             last if $kid > 0;
         }
         my $exit = $?;
+        # drain whatever is still buffered in the pipes after the child exited
+        while (defined(my $line = <$ch_out>)) { print $LOG_FH $line; print $line; }
+        while (defined(my $line = <$ch_err>)) { print $LOG_FH $line; print $line; }
+        close($ch_out); close($ch_err);
         if ($exit != 0) {
             log_msg("ERROR", "fastp failed for sample '$sample' (exit=$exit). Check $LOG_FILE");
+            push @failed_samples, $sample;
         }
+    }
+    if (@failed_samples) {
+        die "fastp failed for ".scalar(@failed_samples)." sample(s): ".join(", ", @failed_samples).". See $LOG_FILE\n";
     }
 }
 __END__

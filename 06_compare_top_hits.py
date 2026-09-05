@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified report for up to 3 runs:
+Report for up to 3 runs:
 - Per-run top hit summaries
-- Cross-run comparison + Venn cells
-- Optional specificity report (active/inactive/both roles)
+- Cross-run comparison + Venn cells (compare_top<N>_interactive.html)
+- Optional specificity report (active/inactive/both roles), written to a separate
+  <spec-prefix>_interactive.html plus tier_report_* TSVs
 """
+
+# Deferred annotation evaluation: several signatures reference bokeh classes
+# (HTMLTemplateFormatter, TableColumn, ColumnDataSource, row); without this the
+# module would fail to import with NameError whenever bokeh is missing, making
+# the _HAS_BOKEH fallback unreachable on Python <= 3.13.
+from __future__ import annotations
 
 import argparse
 import base64
@@ -23,18 +30,33 @@ try:
     from bokeh.io import output_file, save
     from bokeh.layouts import column, row
     from bokeh.models import (ColumnDataSource, CustomJS, DataTable, Div, HoverTool,
-                              HTMLTemplateFormatter, NumberFormatter, Panel, TableColumn,
-                              Tabs, TabPanel, Button, TextInput, MultiSelect)
+                              HTMLTemplateFormatter, NumberFormatter, TableColumn,
+                              Tabs, Button, TextInput, MultiSelect)
     from bokeh.plotting import figure
 except Exception:
     _HAS_BOKEH = False
 
+# Tab panel class differs by bokeh version (2.x: Panel, 3.x: TabPanel). Resolve it
+# separately so that neither name being absent disables the whole HTML output.
+_PanelCls = None
 _HAS_TABPANEL = False
 try:
-    from bokeh.models import TabPanel as _BokehTabPanel  # type: ignore
+    from bokeh.models import TabPanel as _PanelCls  # type: ignore
     _HAS_TABPANEL = True
 except Exception:
-    _HAS_TABPANEL = False
+    try:
+        from bokeh.models import Panel as _PanelCls  # type: ignore
+    except Exception:
+        _PanelCls = None
+
+# bokeh 3.x renders every component in its own shadow root, so a <style> block
+# inside a Div does not reach DataTable cells. InlineStyleSheet (attached per
+# component) is the supported way to style them; fall back silently on 2.x.
+_InlineStyleSheet = None
+try:
+    from bokeh.models import InlineStyleSheet as _InlineStyleSheet  # type: ignore
+except Exception:
+    _InlineStyleSheet = None
 
 _HAS_RDKIT = True
 _RDKIT_IMPORT_ERR = ""
@@ -52,6 +74,28 @@ _TRANSPARENT_PNG = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
     "ASsJTYQAAAAASUVORK5CYII="
 )
+
+
+_CSS_TEXT = """
+.summary-cards { display:flex; flex-wrap:wrap; gap:12px; margin:6px 0 10px 0; }
+.summary-card { background:#f7f7fb; border:1px solid #dedee6; border-radius:8px; padding:8px 12px; min-width:160px; }
+.summary-label { font-size:11px; color:#666; letter-spacing:0.2px; text-transform:uppercase; }
+.summary-value { font-size:18px; font-weight:600; }
+.table-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0 8px 0; }
+.table-count { font-size:12px; color:#555; }
+.struct-thumb { position:relative; display:inline-block; }
+.struct-thumb .struct-popup { display:none; position:absolute; z-index:10; left:70px; top:-10px; background:#fff; padding:6px; border:1px solid #ddd; box-shadow:0 2px 6px rgba(0,0,0,0.2); }
+.struct-thumb:hover .struct-popup { display:block; }
+.group-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; color:#fff; }
+"""
+
+
+def _stylesheets() -> dict:
+    """kwargs to attach the shared CSS to a bokeh component (fresh model per call:
+    a bokeh model may belong to only one Document, and this script writes two)."""
+    if _InlineStyleSheet is None:
+        return {}
+    return {"stylesheets": [_InlineStyleSheet(css=_CSS_TEXT)]}
 
 
 def _style_block() -> str:
@@ -118,7 +162,43 @@ def _strip_lib_suffix(val: str) -> str:
 def _pick_latest(paths: List[str]) -> Optional[str]:
     if not paths:
         return None
-    return max(paths, key=lambda p: os.path.getmtime(p))
+    return max(paths, key=os.path.getmtime)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible input column access.
+# 05_hybrid_annot.tsv normally carries merge-suffixed names (ID_x, LIB_ID_x,
+# BB1_x..BB4_x, CP_x). Older/alternate tables may carry the plain names. All
+# downstream code (and all output files) use the *_x names; inputs are
+# normalized once at read time through these helpers.
+# ---------------------------------------------------------------------------
+_LEGACY_ID_COLS = ["ID", "LIB_ID", "BB1", "BB2", "BB3", "BB4", "CP"]
+
+
+def _pick_col(cols: List[str], base: str) -> Optional[str]:
+    """Return '<base>_x' if present, else '<base>' if present, else None."""
+    if f"{base}_x" in cols:
+        return f"{base}_x"
+    if base in cols:
+        return base
+    return None
+
+
+def _legacy_rename_map(cols: List[str]) -> Dict[str, str]:
+    """Map plain legacy names to their *_x equivalents when the *_x form is absent."""
+    ren: Dict[str, str] = {}
+    for base in _LEGACY_ID_COLS:
+        if f"{base}_x" not in cols and base in cols:
+            ren[base] = f"{base}_x"
+    return ren
+
+
+def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ren = _legacy_rename_map(df.columns.tolist())
+    if ren:
+        print(f"[WARN] legacy column names found; using {ren}")
+        df = df.rename(columns=ren)
+    return df
 
 
 def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
@@ -140,6 +220,9 @@ def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
                     paths.append(os.path.join(root, "05_hybrid_annot.tsv"))
             cand = _pick_latest(paths)
             if cand:
+                if len(paths) > 1:
+                    print(f"[WARN] {len(paths)} presets found under {norm}; using newest: {cand} "
+                          f"(pass --preset or the 05_hybrid_annot.tsv path to choose explicitly)")
                 return cand
     raise FileNotFoundError(f"05_hybrid_annot.tsv not found under: {base}")
 
@@ -168,10 +251,13 @@ def _to_int_series(s: pd.Series) -> pd.Series:
 def _make_compound_key(df: pd.DataFrame) -> pd.Series:
     bb_cols = [c for c in ["BB1_x", "BB2_x", "BB3_x", "BB4_x"] if c in df.columns]
     if not bb_cols:
-        return df.get("ID_x", pd.Series(["NA"] * len(df))).astype(str)
-    for c in bb_cols:
-        df[c] = df[c].fillna("NA").astype(str).map(_strip_lib_suffix)
-    return df[bb_cols].agg("|".join, axis=1)
+        if "ID_x" in df.columns:
+            return df["ID_x"].astype(str)
+        return pd.Series(["NA"] * len(df), index=df.index)
+    # Pure function: do NOT mutate the caller's BB columns. Callers that want the
+    # LIB suffix removed for display must call _strip_bb_suffix_cols explicitly.
+    parts = [df[c].fillna("NA").astype(str).map(_strip_lib_suffix) for c in bb_cols]
+    return pd.concat(parts, axis=1).agg("|".join, axis=1)
 
 
 def _apply_recommend_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -204,7 +290,8 @@ def _prefix_sample_cols(cols: List[str], prefix: str) -> Tuple[List[str], Dict[s
 
 def _sort_sample_cols_by_category(cols: List[str], prefixes: List[str]) -> List[str]:
     def _natural_key(s: str) -> List[object]:
-        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\\d+)", s)]
+        # NOTE: raw string -> single backslash; r"(\\d+)" matched a literal backslash.
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
     def _sample_id(col: str, prefix: str) -> str:
         base = col[len(prefix):] if prefix and col.startswith(prefix) else col
@@ -361,19 +448,61 @@ def _fp_from_smiles(smiles: str, radius: int, nbits: int):
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits)
 
 
+# How bbavg treats BB positions where one/both fingerprints are missing:
+#   "skip": average only over positions where both are valid (legacy behavior;
+#           two compounds sharing a single valid BB can reach similarity 1.0)
+#   "zero": missing positions count as similarity 0 (denominator = number of BB
+#           positions), which is more conservative.
+_BBAVG_MISSING = "skip"
+
+
 def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object]]) -> float:
     sims = []
+    n_pos = max(len(fps_a), len(fps_b))
     for fa, fb in zip(fps_a, fps_b):
         if fa is None or fb is None:
             continue
         sims.append(DataStructs.TanimotoSimilarity(fa, fb))
     if not sims:
         return 0.0
-    return float(sum(sims) / len(sims))
+    denom = n_pos if _BBAVG_MISSING == "zero" else len(sims)
+    return float(sum(sims) / max(1, denom))
+
+
+def _bbavg_lower_triangle_dists(valid_fps: List[List[Optional[object]]]) -> List[float]:
+    """Lower-triangular distance list (Butina order: d(1,0), d(2,0), d(2,1), ...)
+    using per-BB BulkTanimotoSimilarity instead of a pure-Python pair loop.
+    Numerically identical to 1 - _bbavg_similarity(fi, fj) for every pair."""
+    n = len(valid_fps)
+    n_pos = max((len(x) for x in valid_fps), default=0)
+    dists: List[float] = []
+    for i in range(1, n):
+        sim_sum = np.zeros(i, dtype=float)
+        cnt = np.zeros(i, dtype=float)
+        fi_list = valid_fps[i]
+        for k in range(n_pos):
+            fi = fi_list[k] if k < len(fi_list) else None
+            if fi is None:
+                continue
+            idx = [j for j in range(i) if k < len(valid_fps[j]) and valid_fps[j][k] is not None]
+            if not idx:
+                continue
+            sims = DataStructs.BulkTanimotoSimilarity(fi, [valid_fps[j][k] for j in idx])
+            sim_sum[idx] += np.asarray(sims, dtype=float)
+            cnt[idx] += 1.0
+        if _BBAVG_MISSING == "zero":
+            # per-pair denominator = number of BB positions of the longer compound (as in _bbavg_similarity)
+            denom = np.asarray([max(1, len(fi_list), len(valid_fps[j])) for j in range(i)], dtype=float)
+            avg = np.where(cnt > 0, sim_sum / denom, 0.0)
+        else:
+            avg = np.where(cnt > 0, sim_sum / np.maximum(cnt, 1.0), 0.0)
+        dists.extend((1.0 - avg).tolist())
+    return dists
 
 
 def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    scores = pd.to_numeric(df.get(primary_col, np.nan), errors="coerce").fillna(float("-inf")).to_numpy()
+    primary = df[primary_col] if primary_col in df.columns else pd.Series(np.nan, index=df.index)
+    scores = pd.to_numeric(primary, errors="coerce").fillna(float("-inf")).to_numpy()
     if "rank_pct" in df.columns:
         rank_pct = pd.to_numeric(df["rank_pct"], errors="coerce").fillna(0.0).to_numpy()
     elif "HitScore_pct" in df.columns:
@@ -459,11 +588,8 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
             sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
             dists.extend([1.0 - s for s in sims])
     else:
-        for i in range(1, len(valid_fps)):
-            fi = valid_fps[i]
-            for j in range(i):
-                sim = _bbavg_similarity(fi, valid_fps[j])
-                dists.append(1.0 - sim)
+        # Vectorized per-BB bulk Tanimoto (identical values to the former O(n^2) Python pair loop).
+        dists = _bbavg_lower_triangle_dists(valid_fps)
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
@@ -566,9 +692,9 @@ def _build_bb_frequency_df(df_top: pd.DataFrame, bb_top_k: int) -> pd.DataFrame:
             .to_dict()
         )
         lib_counts_map: Dict[str, str] = {}
-        for bb_val, sub in lib_counts.groupby("bb", sort=False):
-            sub = sub.sort_values("lib_count", ascending=False)
-            pairs = [f"{r.lib_id}:{int(r.lib_count)}" for r in sub.itertuples(index=False)]
+        for bb_val, sub_lc in lib_counts.groupby("bb", sort=False):
+            sub_sorted = sub_lc.sort_values(["lib_count", "lib_id"], ascending=[False, True], kind="mergesort")
+            pairs = [f"{r.lib_id}:{int(r.lib_count)}" for r in sub_sorted.itertuples(index=False)]
             lib_counts_map[str(bb_val)] = ", ".join(pairs)
 
         for _, row in grp.iterrows():
@@ -681,11 +807,8 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
             sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[:i])
             dists.extend([1.0 - s for s in sims])
     else:
-        for i in range(1, len(valid_fps)):
-            fi = valid_fps[i]
-            for j in range(i):
-                sim = _bbavg_similarity(fi, valid_fps[j])
-                dists.append(1.0 - sim)
+        # Vectorized per-BB bulk Tanimoto (identical values to the former O(n^2) Python pair loop).
+        dists = _bbavg_lower_triangle_dists(valid_fps)
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
@@ -903,7 +1026,7 @@ URL.revokeObjectURL(url);
     if group_select is not None:
         controls.append(group_select)
     controls.extend([reset_btn, download_btn, count_div])
-    return row(*controls, css_classes=["table-controls"])
+    return row(*controls, css_classes=["table-controls"], **_stylesheets())
 
 
 def _frozen_columns_for(cols: List[str]) -> int:
@@ -929,6 +1052,7 @@ def _table_layout(df: pd.DataFrame, cols: List[str], filename: str,
         width=_table_width(table_cols),
         index_position=None,
         frozen_columns=frozen_columns,
+        **_stylesheets(),
     )
     controls = _make_table_controls(source, full_source, filename, group_col)
     return column(controls, table, sizing_mode="stretch_width")
@@ -1069,6 +1193,7 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         width=table_width,
         index_position=None,
         frozen_columns=frozen_columns,
+        **_stylesheets(),
     )
     group_col = "group" if "group" in table_df.columns else None
     controls = _make_table_controls(source, full_source, download_name, group_col)
@@ -1118,7 +1243,8 @@ def _parse_range(arg: Optional[str], values: pd.Series) -> Tuple[float, float]:
     s = str(arg).strip().lower()
     if s in ("", "auto"):
         return _auto_range_pct(values)
-    parts = [p for p in re.split(r"[,:\\s]+", s) if p]
+    # NOTE: raw string -> r"[,:\\s]+" put a literal backslash and 's' in the class instead of whitespace.
+    parts = [p for p in re.split(r"[,:\s]+", s) if p]
     if len(parts) != 2:
         raise ValueError(f"Invalid range: {arg}")
     a, b = float(parts[0]), float(parts[1])
@@ -1156,9 +1282,9 @@ def _table_columns(df: pd.DataFrame, cols: List[str]) -> List[TableColumn]:
 
 
 def _make_panel(child, title: str):
-    if _HAS_TABPANEL:
-        return _BokehTabPanel(child=child, title=title)
-    return Panel(child=child, title=title)
+    if _PanelCls is None:
+        raise RuntimeError("bokeh is available but neither TabPanel nor Panel could be imported")
+    return _PanelCls(child=child, title=title)
 
 
 def _pattern_order(labels: List[str]) -> List[str]:
@@ -1181,7 +1307,7 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
                              title: str, max_table: int, plot_x_range: Optional[str],
                              plot_y_range: Optional[str], sample_cols: List[str],
                              group_display: Dict[str, str], active_label: str,
-                             inactive_label: str) -> List[Panel]:
+                             inactive_label: str) -> List[object]:
     if not _HAS_BOKEH:
         return []
 
@@ -1217,11 +1343,11 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
     items.append(Div(text="\n".join(summary_lines)))
 
     df_plot = df_all.copy()
-    df_plot["group_code"] = df_plot.get("group_code", df_plot.get("group", "Other"))
-    df_plot["active_rank_pct"] = pd.to_numeric(df_plot.get("active_rank_pct", 0), errors="coerce").fillna(0.0)
-    df_plot["inactive_rank_pct"] = pd.to_numeric(df_plot.get("inactive_rank_pct", 0), errors="coerce").fillna(0.0)
-    df_plot["both_rank_pct"] = pd.to_numeric(df_plot.get("both_rank_pct", 0), errors="coerce").fillna(0.0)
-    df_plot["selectivity_score"] = pd.to_numeric(df_plot.get("selectivity_score", 0), errors="coerce").fillna(0.0)
+    if "group_code" not in df_plot.columns:
+        df_plot["group_code"] = df_plot["group"] if "group" in df_plot.columns else "Other"
+    for _c in ("active_rank_pct", "inactive_rank_pct", "both_rank_pct", "selectivity_score"):
+        _ser = df_plot[_c] if _c in df_plot.columns else pd.Series(0.0, index=df_plot.index)
+        df_plot[_c] = pd.to_numeric(_ser, errors="coerce").fillna(0.0)
 
     colors = {
         "Active-specific": "#1b9e77",
@@ -1295,9 +1421,42 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
     return tabs
 
 
+def _reselect_reps_within_groups(df: pd.DataFrame, rep_score_col: str) -> pd.DataFrame:
+    """Clusters are computed over the whole candidate pool, but 'diverse' lists are
+    per group. Re-select cluster_rep within each (group_code, cluster_id) so that a
+    cluster spanning several groups keeps one representative in *each* group instead
+    of only in the group that happened to hold the pool-wide best member. If a group
+    has no cluster_medoid for a cluster, its group representative is used as medoid.
+    Tie-break order matches _cluster_candidates: score, rank_pct/HitScore_pct, CPM
+    mean, raw sum, then lowest row position."""
+    if "cluster_id" not in df.columns or "group_code" not in df.columns:
+        return df
+    out = df.reset_index(drop=True).copy()
+    scores, rank_pct, cpm_mean, raw_sum = _tie_break_arrays(out, rep_score_col)
+    cid = out["cluster_id"].astype(str)
+    valid = cid != "NA"
+    if not valid.any():
+        return out
+    rep_flags = np.zeros(len(out), dtype=int)
+    med_flags = _to_int_series(out["cluster_medoid"]).to_numpy().copy() if "cluster_medoid" in out.columns else np.zeros(len(out), dtype=int)
+    grp_keys = pd.DataFrame({"g": out["group_code"].astype(str), "c": cid})[valid]
+    # .groups yields index LABELS (== row positions of `out`, RangeIndex after reset);
+    # .indices would give positions within the `valid`-filtered frame instead.
+    for _key, labels in grp_keys.groupby(["g", "c"], sort=False).groups.items():
+        idx = [int(i) for i in labels]
+        best = max(idx, key=lambda i: (scores[i], rank_pct[i], cpm_mean[i], raw_sum[i], -i))
+        rep_flags[best] = 1
+        if not any(med_flags[i] == 1 for i in idx):
+            med_flags[best] = 1
+    out["cluster_rep"] = rep_flags
+    if "cluster_medoid" in out.columns:
+        out["cluster_medoid"] = med_flags
+    return out
+
+
 def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info: Optional[Dict],
                                score_col: str, args, out_dir: str,
-                               role_labels: Optional[Dict[str, str]] = None) -> Tuple[List[Panel], Dict[str, str]]:
+                               role_labels: Optional[Dict[str, str]] = None) -> Tuple[List[object], Dict[str, str]]:
     df_active = active_info["df"].copy()
     df_inactive = inactive_info["df"].copy()
     df_both = both_info["df"].copy() if both_info else None
@@ -1334,17 +1493,24 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
         use = [c for c in cols if c in df_best.columns]
         if not use:
             return None
-        block = df_best[["compound_key"] + use].copy()
+        block = df_best[["compound_key", *use]].copy()
         block = block.rename(columns=rename)
         return block
 
     frames = []
-    for df_best in [active_info["df_best"], inactive_info["df_best"], both_info["df_best"] if both_info else None]:
+    pool_sources = [("active", active_info), ("inactive", inactive_info), ("both", both_info)]
+    for role_name, info in pool_sources:
+        df_best = info["df_best"] if info else None
         if df_best is None or df_best.empty:
             continue
         df_top = df_best.head(top_n).copy()
         df_top = _apply_recommend_filter(df_top)
         if not df_top.empty:
+            # Record which run's row (and hence which run's inherited columns such as
+            # HitScore_pct / GLM_hit / LFC_*) this candidate carries after de-duplication
+            # (priority: active > inactive > both).
+            df_top["source_run"] = str(info.get("label", role_name))
+            df_top["source_role"] = role_name
             frames.append(df_top)
     if not frames:
         return [], {}
@@ -1376,10 +1542,16 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
         sample_cols = _dedupe_identical_sample_cols(df_base, sample_cols, prefixes)
 
     df_base = _strip_bb_suffix_cols(df_base, ["BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x"])
-    df_base = df_base.sort_values(score_col, ascending=False)
+
+    # Run-consistent metrics: every per-run value is looked up by compound_key in that
+    # run's own map. (Previously active_score and rank were taken from the row's own
+    # score_col, i.e. from whichever run the de-duplicated row happened to come from.)
+    active_score = pd.to_numeric(df_base["compound_key"].map(maps_active["score_map"]), errors="coerce")
+    df_base["active_score"] = active_score.where(np.isfinite(active_score.to_numpy(dtype=float)), np.nan)
+    df_base = df_base.sort_values(["active_score", "compound_key"], ascending=[False, True],
+                                  na_position="last", kind="mergesort")
     df_base["rank"] = np.arange(1, len(df_base) + 1, dtype=int)
 
-    df_base["active_score"] = df_base[score_col]
     df_base["active_rank"] = df_base["compound_key"].map(maps_active["rank_map"])
     df_base["active_rank_pct"] = df_base["compound_key"].map(maps_active["rank_pct_map"]).fillna(0.0)
     df_base["active_score_z"] = df_base["compound_key"].map(maps_active["score_z_map"]).fillna(0.0)
@@ -1446,12 +1618,15 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
             nbits=int(args.cluster_nbits),
             mode=str(args.cluster_mode),
         )
+        # Representatives per (group, cluster) so every group keeps one rep per cluster.
+        df_base = _reselect_reps_within_groups(df_base, "specificity_score")
     else:
         cluster_df = None
 
     group_order = ["Active-specific", "Inactive-specific", "Both-specific", "Other"]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
-    df_base = df_base.sort_values(["group_code", "specificity_score", "active_score"], ascending=[True, False, False])
+    df_base = df_base.sort_values(["group_code", "specificity_score", "active_score", "compound_key"],
+                                  ascending=[True, False, False, True], na_position="last", kind="mergesort")
     df_base["group_rank"] = df_base.groupby("group_code", observed=False).cumcount() + 1
     group_code_str = df_base["group_code"].astype(str)
     df_base["group"] = group_code_str.map(group_display).fillna(group_code_str)
@@ -1462,6 +1637,7 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
 
     groups = {}
     diverse_total = 0
+    clustering_on = rep_col in df_base.columns
     group_map = {
         "Active-specific": "active_specific",
         "Inactive-specific": "inactive_specific",
@@ -1503,7 +1679,7 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
         "n_inactive": len(groups.get("Inactive-specific", {}).get("all", [])),
         "n_both": len(groups.get("Both-specific", {}).get("all", [])),
         "n_other": len(df_other),
-        "n_diverse": diverse_total,
+        "n_diverse": diverse_total if clustering_on else "n/a (clustering disabled)",
         "group_defs": group_defs,
     }
     group_tables = {"summary": summary, **groups}
@@ -1536,9 +1712,17 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
 
 
 def build_interactive_html(summary_html: str, pattern_df: pd.DataFrame,
-                           overlap_df: pd.DataFrame, run_tabs: List[Panel],
-                           venn_tabs: List[Panel], spec_tabs: List[Panel],
+                           overlap_df: pd.DataFrame, run_tabs: List[object],
+                           venn_tabs: List[object], spec_tabs: List[object],
                            out_html: str) -> None:
+    """Write the main comparison HTML.
+
+    NOTE: `spec_tabs` is accepted for signature compatibility but main() passes [] on
+    purpose: the specificity panels are saved to their own HTML by
+    compute_specificity_report(), and bokeh models may belong to only one Document, so
+    re-using those panel objects here would raise
+    "Models must be owned by only a single document". To embed them, rebuild them.
+    """
     if not _HAS_BOKEH:
         print("[WARN] bokeh is not available; skipping interactive HTML output.")
         return
@@ -1560,12 +1744,12 @@ def build_interactive_html(summary_html: str, pattern_df: pd.DataFrame,
 
     if not overlap_df.empty:
         cols = [c for c in overlap_df.columns if c not in ("compound_key",)]
-        table = _table_layout(overlap_df, ["compound_key"] + cols, filename="overlap.csv", height=360)
+        table = _table_layout(overlap_df, ["compound_key", *cols], filename="overlap.csv", height=360)
         items.append(Div(text="<h3>Overlapping compounds (>=2 runs)</h3>"))
         items.append(table)
 
     comp_panel = _make_panel(column(*items, sizing_mode="stretch_width"), "Comparison")
-    tabs = Tabs(tabs=[comp_panel] + spec_tabs + venn_tabs + run_tabs)
+    tabs = Tabs(tabs=[comp_panel, *spec_tabs, *venn_tabs, *run_tabs])
     output_file(out_html, title="Top-hit comparison")
     save(tabs)
 
@@ -1620,23 +1804,29 @@ def main() -> int:
     ap.add_argument("--active-spec-max-inactive", type=float, default=50.0,
                     help="Active-specific: max inactive rank_pct")
     ap.add_argument("--active-spec-min-both", type=float, default=90.0,
-                    help="Active-specific: min both rank_pct (ignored when using active/inactive-only)")
+                    help="(unused; kept for CLI compatibility) Active-specific: min both rank_pct")
     ap.add_argument("--inactive-spec-min", type=float, default=99.0,
                     help="Inactive-specific: min inactive rank_pct")
     ap.add_argument("--inactive-spec-max-active", type=float, default=50.0,
                     help="Inactive-specific: max active rank_pct")
     ap.add_argument("--inactive-spec-min-both", type=float, default=90.0,
-                    help="Inactive-specific: min both rank_pct (ignored when using active/inactive-only)")
+                    help="(unused; kept for CLI compatibility) Inactive-specific: min both rank_pct")
     ap.add_argument("--both-spec-min", type=float, default=99.0,
                     help="Both-specific: min both rank_pct")
     ap.add_argument("--both-spec-min-active", type=float, default=90.0,
-                    help="Both-specific: min active rank_pct")
+                    help="Both-specific: min active rank_pct (effective threshold = max(--both-spec-min, this))")
     ap.add_argument("--both-spec-min-inactive", type=float, default=90.0,
-                    help="Both-specific: min inactive rank_pct")
+                    help="Both-specific: min inactive rank_pct (effective threshold = max(--both-spec-min, this))")
     ap.add_argument("--both-weight", type=float, default=0.3,
-                    help="Weight for both_rank_pct in specificity scores (ignored when using active/inactive-only)")
+                    help="(unused; kept for CLI compatibility) Weight for both_rank_pct in specificity scores")
+    ap.add_argument("--bbavg-missing", choices=["skip", "zero"], default="skip",
+                    help="bbavg clustering: how to treat BB positions with a missing fingerprint. "
+                         "skip = average over positions valid in both compounds (default, legacy); "
+                         "zero = count them as similarity 0 (more conservative).")
     ap.add_argument("--no-html", action="store_true", help="Skip interactive HTML output")
     args = ap.parse_args()
+    global _BBAVG_MISSING
+    _BBAVG_MISSING = str(args.bbavg_missing)
 
     run_paths = args.runs
     if len(run_paths) > 3:
@@ -1644,9 +1834,30 @@ def main() -> int:
     labels = args.labels or []
     if labels and len(labels) != len(run_paths):
         raise SystemExit("[ERROR] --labels must match number of --runs")
+    labels_explicit = bool(labels)
     if not labels:
         labels = [os.path.basename(os.path.normpath(p)) or f"run{i+1}" for i, p in enumerate(run_paths)]
     labels = [_sanitize_label(l) for l in labels]
+    if len(set(labels)) != len(labels):
+        if labels_explicit:
+            raise SystemExit(f"[ERROR] --labels must be unique (got {labels})")
+        # Derived labels collide (e.g. every --runs entry is a .../05_hybrid_annot.tsv path):
+        # disambiguate with _1, _2, ... so per-run outputs and union/overlap columns do not overwrite each other.
+        seen: Dict[str, int] = {}
+        uniq: List[str] = []
+        for l in labels:
+            seen[l] = seen.get(l, 0) + 1
+            uniq.append(l)
+        counters: Dict[str, int] = {}
+        fixed: List[str] = []
+        for l in uniq:
+            if seen[l] > 1:
+                counters[l] = counters.get(l, 0) + 1
+                fixed.append(f"{l}_{counters[l]}")
+            else:
+                fixed.append(l)
+        print(f"[WARN] derived run labels are not unique {labels}; using {fixed}. Pass --labels to set explicit names.")
+        labels = fixed
 
     roles = args.roles or []
     if roles and len(roles) != len(run_paths):
@@ -1678,7 +1889,15 @@ def main() -> int:
     out_dir = args.out_dir or "."
     os.makedirs(out_dir, exist_ok=True)
     name_top = max(top_n_list) if top_n_list else top_n
-    prefix = args.out_prefix or os.path.join(out_dir, f"compare_top{name_top}")
+    if args.out_prefix:
+        # Bare prefix -> inside --out-dir (same rule as 07_tiered_report.py); a prefix that
+        # already carries a directory (or is absolute) is used as-is.
+        if os.path.isabs(args.out_prefix) or os.path.dirname(args.out_prefix):
+            prefix = args.out_prefix
+        else:
+            prefix = os.path.join(out_dir, args.out_prefix)
+    else:
+        prefix = os.path.join(out_dir, f"compare_top{name_top}")
     html_path = f"{prefix}_interactive.html"
 
     run_info = []
@@ -1686,8 +1905,10 @@ def main() -> int:
         hybrid = resolve_hybrid_path(path, args.preset)
         header = pd.read_csv(hybrid, sep="\t", nrows=0).columns.tolist()
         sample_cols = _sample_cols_from_header(header)
+        # Backward-compatible ID columns: prefer *_x, fall back to plain names (renamed to *_x after read).
+        id_cols_present = [c for c in (_pick_col(header, b) for b in _LEGACY_ID_COLS) if c]
         want = [
-            "LIB_ID_x", "ID_x", "BB1_x", "BB2_x", "BB3_x", "BB4_x", "CP_x", "cycles",
+            *id_cols_present, "cycles",
             "bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles", "BB_SMILES_CONCAT",
             "HitScore_GLM", "HitScore_RS", "HitScore_pct", "SynthonScore",
             "GLM_hit", "RS_pass", "Consensus_hit", "NEG_hard_fail", "NEG_center_fail",
@@ -1703,10 +1924,19 @@ def main() -> int:
                 usecols.append(col)
         usecols = list(dict.fromkeys(usecols))
         df = pd.read_csv(hybrid, sep="\t", usecols=usecols)
+        df = _normalize_legacy_columns(df)
         df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(float("-inf"))
+        # Display convention for per-run outputs: BB/CP IDs without the LIB suffix
+        # (explicit now; _make_compound_key no longer strips the caller's columns in place).
+        for _bb in ["BB1_x", "BB2_x", "BB3_x", "BB4_x"]:
+            if _bb in df.columns:
+                df[_bb] = df[_bb].fillna("NA").astype(str).map(_strip_lib_suffix)
         df["compound_key"] = _make_compound_key(df)
         score_map = df.groupby("compound_key")[score_col].max().to_dict()
-        items = [(k, v) for k, v in score_map.items() if v == v]
+        # Exclude non-finite (NaN -> -inf) scores from ranking, consistent with _rank_maps()
+        # and with the z-score below; otherwise rank_pct denominators differ between the
+        # comparison tables and the specificity report.
+        items = [(k, v) for k, v in score_map.items() if np.isfinite(v)]
         items.sort(key=lambda x: (-x[1], x[0]))
         rank_map_all = {k: i + 1 for i, (k, _) in enumerate(items)}
         denom = max(1, len(items) - 1)
@@ -1729,7 +1959,7 @@ def main() -> int:
         score_z_map_all = {k: ((v - mu) / sd) if np.isfinite(v) else np.nan for k, v in score_map.items()}
         run_top_n = top_n_list[idx] if top_n_list else top_n
         run_rec_n = rec_n_list[idx] if rec_n_list else rec_n
-        df_best = df.sort_values(score_col, ascending=False).drop_duplicates("compound_key")
+        df_best = df.sort_values([score_col, "compound_key"], ascending=[False, True], kind="mergesort").drop_duplicates("compound_key")
         df_top = df_best.head(run_top_n).copy()
         df_top["compound_key"] = _make_compound_key(df_top)
         if rank_map_all:
@@ -1749,7 +1979,7 @@ def main() -> int:
                 mode=str(args.cluster_mode),
             )
         df_rec = _apply_recommend_filter(df_top)
-        df_rec = df_rec.sort_values(score_col, ascending=False)
+        df_rec = df_rec.sort_values([score_col, "compound_key"], ascending=[False, True], kind="mergesort")
         df_rec = df_rec.drop_duplicates("compound_key").head(run_rec_n).copy()
         if rank_map_all:
             df_rec["rank"] = df_rec["compound_key"].map(rank_map_all)
@@ -1760,7 +1990,7 @@ def main() -> int:
         diverse = df_rec.copy()
         if rep_col in diverse.columns:
             diverse = diverse[_to_int_series(diverse[rep_col]) == 1].copy()
-        diverse = diverse.sort_values(score_col, ascending=False).copy()
+        diverse = diverse.sort_values([score_col, "compound_key"], ascending=[False, True], kind="mergesort").copy()
 
         freq_df = _build_bb_frequency_df(df_top, int(args.bb_top_k)) if int(args.include_summary) == 1 else pd.DataFrame()
 
@@ -1796,17 +2026,21 @@ def main() -> int:
         cluster_path = f"{prefix}_{label}_clusters.tsv"
         info["top"].to_csv(top_path, sep="\t", index=False)
         info["rec"].to_csv(rec_path, sep="\t", index=False)
-        if not info["diverse"].empty:
-            info["diverse"].to_csv(div_path, sep="\t", index=False)
-        if isinstance(info.get("freq"), pd.DataFrame):
-            info["freq"].to_csv(freq_path, sep="\t", index=False)
-        if info.get("cluster_df") is not None and not info["cluster_df"].empty:
-            info["cluster_df"].to_csv(cluster_path, sep="\t", index=False)
+        # Only record paths of files that were actually written (used by the [INFO] summary).
         info["top_path"] = top_path
         info["rec_path"] = rec_path
-        info["diverse_path"] = div_path
-        info["freq_path"] = freq_path
-        info["cluster_path"] = cluster_path
+        info["diverse_path"] = None
+        info["freq_path"] = None
+        info["cluster_path"] = None
+        if not info["diverse"].empty:
+            info["diverse"].to_csv(div_path, sep="\t", index=False)
+            info["diverse_path"] = div_path
+        if isinstance(info.get("freq"), pd.DataFrame) and not info["freq"].empty:
+            info["freq"].to_csv(freq_path, sep="\t", index=False)
+            info["freq_path"] = freq_path
+        if info.get("cluster_df") is not None and not info["cluster_df"].empty:
+            info["cluster_df"].to_csv(cluster_path, sep="\t", index=False)
+            info["cluster_path"] = cluster_path
 
     top_sets = {r["label"]: set(r["top"]["compound_key"].astype(str)) for r in run_info}
     union_keys = sorted(set().union(*top_sets.values()))
@@ -1824,6 +2058,9 @@ def main() -> int:
             score = info.get("top_score_map", {}).get(key, np.nan)
             if (score != score) and int(args.fill_scores) == 1:
                 score = info.get("score_map", {}).get(key, np.nan)
+            # score_map stores NaN scores as -inf; never emit -inf into the tables.
+            if score is None or not np.isfinite(float(score)):
+                score = np.nan
             row[f"{lbl}_score"] = float(score) if score == score else np.nan
             score_z = info.get("score_z_map_all", {}).get(key, np.nan)
             row[f"{lbl}_score_z"] = float(score_z) if score == score and score_z == score_z else np.nan
@@ -1844,7 +2081,7 @@ def main() -> int:
         pattern_df = (
             pattern_df.groupby("pattern", as_index=False)
             .size().rename(columns={"size": "count"})
-            .sort_values("count", ascending=False)
+            .sort_values(["count", "pattern"], ascending=[False, True], kind="mergesort")
         )
         pattern_df["pct"] = (pattern_df["count"] / pattern_df["count"].sum()) * 100.0
 
@@ -1858,8 +2095,8 @@ def main() -> int:
     overlap_df.to_csv(overlap_path, sep="\t", index=False)
     pattern_df.to_csv(pattern_path, sep="\t", index=False)
 
-    venn_tabs: List[Panel] = []
-    spec_tabs: List[Panel] = []
+    venn_tabs: List[object] = []
+    spec_tabs: List[object] = []
     spec_outputs: Dict[str, str] = {}
 
     if int(args.include_specificity) == 1 and roles:
@@ -1934,11 +2171,11 @@ def main() -> int:
             cols_rec = [c for c in cols_rec if c in rec_df.columns]
             cols_div = [c for c in cols_rec if c in div_df.columns]
             if "compound_img" in top_df.columns:
-                cols_top = ["compound_img"] + cols_top
+                cols_top = ["compound_img", *cols_top]
             if "compound_img" in rec_df.columns:
-                cols_rec = ["compound_img"] + cols_rec
+                cols_rec = ["compound_img", *cols_rec]
             if not div_df.empty and "compound_img" in div_df.columns:
-                cols_div = ["compound_img"] + cols_div
+                cols_div = ["compound_img", *cols_div]
 
             top_table = _table_layout(
                 top_df,
@@ -2028,9 +2265,10 @@ def main() -> int:
                         sub["lib_ids"] = sub.get("lib_ids", "").astype(str)
                         sub["lib_counts"] = sub.get("lib_counts", "").astype(str)
                         sub = sub.sort_values("count", ascending=False)
-                        sub["smiles"] = sub["bb"].map(lambda bb: smi_map.get(bb, ""))
+                        # ruff B023: closure over loop variable is consumed immediately (same iteration) -> safe
+                        sub["smiles"] = sub["bb"].map(lambda bb, _m=smi_map: _m.get(bb, ""))
 
-                        def _img_for_smiles(smi: str) -> str:
+                        def _img_for_smiles(smi: str) -> str:  # ruff B023: img_cache is per-run, called below in the same iteration
                             if not smi:
                                 return _TRANSPARENT_PNG
                             if smi in img_cache:
@@ -2072,7 +2310,7 @@ def main() -> int:
             rank_cols = [f"{lbl}_rank" for lbl in labels if f"{lbl}_rank" in union_df.columns]
             rank_pct_cols = [f"{lbl}_rank_pct" for lbl in labels if f"{lbl}_rank_pct" in union_df.columns]
             hitpct_cols = [f"{lbl}_HitScore_pct" for lbl in labels if f"{lbl}_HitScore_pct" in union_df.columns]
-            base_cols = ["compound_key", "pattern"] + rank_cols + rank_pct_cols + hitpct_cols + score_cols
+            base_cols = ["compound_key", "pattern", *rank_cols, *rank_pct_cols, *hitpct_cols, *score_cols]
             base_cols = [c for c in base_cols if c in union_df.columns]
 
             pattern_lookup = {p: i for i, p in enumerate(pattern_df["pattern"].tolist())} if not pattern_df.empty else {}
@@ -2086,7 +2324,7 @@ def main() -> int:
                     sub_scores = sub[score_cols].apply(pd.to_numeric, errors="coerce")
                     sub["best_score"] = sub_scores.max(axis=1)
                     sub = sub.sort_values("best_score", ascending=False)
-                    cols = base_cols + ["best_score"] if "best_score" not in base_cols else base_cols
+                    cols = [*base_cols, "best_score"] if "best_score" not in base_cols else base_cols
                 else:
                     cols = base_cols
                 cols = [c for c in cols if c in sub.columns]
@@ -2107,10 +2345,8 @@ def main() -> int:
     print(f"[INFO] score_col={score_col}")
     print(f"[INFO] outputs: {union_path}, {overlap_path}, {pattern_path}")
     for info in run_info:
-        extra = f", {info['diverse_path']}, {info['freq_path']}"
-        if info.get("cluster_df") is not None and not info["cluster_df"].empty:
-            extra += f", {info['cluster_path']}"
-        print(f"[INFO] {info['label']}: {info['top_path']}, {info['rec_path']}{extra}")
+        written = [info["top_path"], info["rec_path"], info.get("diverse_path"), info.get("freq_path"), info.get("cluster_path")]
+        print(f"[INFO] {info['label']}: " + ", ".join(p for p in written if p))
     if spec_outputs:
         print(f"[INFO] specificity outputs: {spec_outputs.get('prefix','')}_*.tsv")
         if spec_outputs.get("html"):

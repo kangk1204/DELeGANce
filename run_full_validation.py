@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 import os
+import gzip
 import json
 import argparse
 import random
 from collections import defaultdict, Counter
 from datetime import datetime
+
+
+def _open_text(path):
+    """Open a (possibly gzipped) text file; tolerate non-UTF-8 bytes instead of aborting."""
+    if str(path).endswith('.gz'):
+        return gzip.open(path, 'rt', encoding='utf-8', errors='replace')
+    return open(path, 'r', encoding='utf-8', errors='replace')
 
 
 def one_bp_substitution(s):
@@ -19,6 +27,9 @@ def one_bp_substitution(s):
 
 
 def one_bp_insertion(s):
+    # NOTE: intentionally mirrors 02_decode_reads.pl::one_bp_insertion, including its
+    # unreachable `i == 0` / `i == L` guards (no insertions at either end). Keep in sync with
+    # the decoder; do not "fix" here alone or validator/decoder equivalence breaks.
     out = set()
     nucs = 'AGCT'
     L = len(s)
@@ -50,10 +61,13 @@ def merge_seq_qual(seq_map, seq, qual):
         seq_map[seq] = qual
 
 
-def build_variant_map(seq):
+def build_variant_map(seq, mismatch='hp_op_cp'):
+    """Perfect sequence plus (if mismatch != 'none') all 1-bp sub/ins/del variants, as the decoder indexes them."""
     seq = seq.upper()
     out = {}
     merge_seq_qual(out, seq, 'perf')
+    if mismatch == 'none':
+        return out
     for s in one_bp_substitution(seq):
         merge_seq_qual(out, s, 'miss')
     for s in one_bp_insertion(seq):
@@ -87,7 +101,7 @@ def _merge_len_maps(a, b):
     return out
 
 
-def load_bb_sets(bb_path):
+def load_bb_sets(bb_path, mismatch='hp_op_cp'):
     hp_sets = defaultdict(set)
     op_sets = defaultdict(set)
     cp_sets = defaultdict(set)
@@ -98,7 +112,7 @@ def load_bb_sets(bb_path):
     op_variants = defaultdict(dict)
     cp_variants = defaultdict(dict)
     cp_owner = {}
-    with open(bb_path, 'r') as f:
+    with _open_text(bb_path) as f:
         for line in f:
             line = line.rstrip('\n')
             if not line or line.startswith('#'):
@@ -123,18 +137,18 @@ def load_bb_sets(bb_path):
                         codon_sets_by_cycle[lib_norm][c].add(seq)
                         lib_cycles[lib_norm].add(c)
             elif typ == 'HP':
-                variants = build_variant_map(seq)
+                variants = build_variant_map(seq, mismatch)
                 hp_sets[lib_norm].update(variants.keys())
                 for s, q in variants.items():
                     merge_seq_qual(hp_variants[lib_norm], s, q)
             elif typ == 'OP':
-                variants = build_variant_map(seq)
+                variants = build_variant_map(seq, mismatch)
                 op_sets[lib_norm].update(variants.keys())
                 for s, q in variants.items():
                     merge_seq_qual(op_variants[lib_norm], s, q)
             elif typ == 'CP':
                 if lib_norm:
-                    variants = build_variant_map(seq)
+                    variants = build_variant_map(seq, mismatch)
                     cp_sets[lib_norm].update(variants.keys())
                     for s, q in variants.items():
                         if s in cp_owner and cp_owner[s] != lib_norm:
@@ -353,11 +367,16 @@ def pick_codons_by_adjacency_py(seq, op_end, cp_pos, expected_cycles, adj_tol, c
     return codon_chain_exists(by_cycle, 1, expected_cycles, op_end, cp_pos, adj_tol, memo)
 
 
-def decode_attempt_orient(seq, adj_tol, bb):
+def _cap(n):
+    # 0 (decoder default for --max-cp-cands/--max-anchor-cands) means "no limit"
+    return None if not n or n <= 0 else n
+
+
+def decode_attempt_orient(seq, adj_tol, bb, max_cp_cands=0, max_anchor_cands=0):
     cp_hits = scan_cp_hits(seq, bb['cp_by_len'])
     if not cp_hits:
         return False
-    cp_hits = sort_hits(cp_hits, max_n=6)
+    cp_hits = sort_hits(cp_hits, max_n=_cap(max_cp_cands))
 
     for cp in cp_hits:
         lib_id = cp['lib_id']
@@ -374,7 +393,7 @@ def decode_attempt_orient(seq, adj_tol, bb):
         op_hits = [h for h in op_hits_all if h['pos'] < cp['pos']]
         if not op_hits:
             continue
-        op_hits = sort_hits(op_hits, max_n=5)
+        op_hits = sort_hits(op_hits, max_n=_cap(max_anchor_cands))
 
         hp_hits_all = scan_hits(seq, hp_map)
         if not hp_hits_all:
@@ -384,7 +403,7 @@ def decode_attempt_orient(seq, adj_tol, bb):
             hp_hits = [h for h in hp_hits_all if h['pos'] < op['pos']]
             if not hp_hits:
                 continue
-            hp_hits = sort_hits(hp_hits, max_n=5)
+            hp_hits = sort_hits(hp_hits, max_n=_cap(max_anchor_cands))
             for hp in hp_hits:
                 if not gap_ok(op['pos'], hp['end'], adj_tol):
                     continue
@@ -394,17 +413,17 @@ def decode_attempt_orient(seq, adj_tol, bb):
     return False
 
 
-def decode_attempt(seq, adj_tol, bb):
-    if decode_attempt_orient(seq, adj_tol, bb):
+def decode_attempt(seq, adj_tol, bb, max_cp_cands=0, max_anchor_cands=0):
+    if decode_attempt_orient(seq, adj_tol, bb, max_cp_cands, max_anchor_cands):
         return True
     rc = rc_seq(seq)
-    return decode_attempt_orient(rc, adj_tol, bb)
+    return decode_attempt_orient(rc, adj_tol, bb, max_cp_cands, max_anchor_cands)
 
 
 def reservoir_sample(path, sample_n, seed):
     rng = random.Random(seed)
     sample = []
-    with open(path, 'r') as f:
+    with _open_text(path) as f:
         header = f.readline()
         for i, line in enumerate(f):
             if len(sample) < sample_n:
@@ -416,7 +435,8 @@ def reservoir_sample(path, sample_n, seed):
     return header, sample
 
 
-def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_path=None):
+def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_path=None,
+                              max_cp_cands=0, max_anchor_cands=0):
     header, sample = reservoir_sample(path, sample_n, seed)
     if not sample:
         return {'sampled_n': 0}
@@ -456,7 +476,7 @@ def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_p
         if len_reject:
             counts['len_reject'] += 1
         else:
-            decode_possible = decode_attempt(read_seq, adj_tol, bb)
+            decode_possible = decode_attempt(read_seq, adj_tol, bb, max_cp_cands, max_anchor_cands)
             if decode_possible:
                 counts['unexpected_decoded'] += 1
             else:
@@ -476,7 +496,7 @@ def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_p
             })
 
     if out_path and rows:
-        with open(out_path, 'w') as f:
+        with open(out_path, 'w', encoding='utf-8') as f:
             f.write('\t'.join(['read_id', 'read_len', 'reason', 'len_reject', 'decode_possible']) + '\n')
             for r in rows:
                 f.write('\t'.join([r['read_id'], r['read_len'], r['reason'], r['len_reject'], r['decode_possible']]) + '\n')
@@ -485,7 +505,7 @@ def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_p
 
 
 def read_single_row_tsv(path):
-    with open(path, 'r') as f:
+    with _open_text(path) as f:
         header = f.readline().rstrip('\n').split('\t')
         row = f.readline().rstrip('\n').split('\t')
     return {header[i]: row[i] for i in range(min(len(header), len(row)))}
@@ -494,7 +514,7 @@ def read_single_row_tsv(path):
 def read_table_by_sample(path):
     if not os.path.exists(path):
         return {}
-    with open(path, 'r') as f:
+    with _open_text(path) as f:
         header = f.readline().rstrip('\n').split('\t')
         idx = {h: i for i, h in enumerate(header)}
         s_i = idx.get('sample')
@@ -510,17 +530,38 @@ def read_table_by_sample(path):
         return out
 
 
+def _strip_tsv_suffix(fn, prefix):
+    """Return the sample name for '<prefix><sample>.tsv[.gz]', or None if fn does not match."""
+    if not fn.startswith(prefix):
+        return None
+    if fn.endswith('.tsv.gz'):
+        return fn[len(prefix):-7]
+    if fn.endswith('.tsv'):
+        return fn[len(prefix):-4]
+    return None
+
+
+def _find_sample_file(sdir, prefix, sample):
+    """Locate '<prefix><sample>.tsv' (or .tsv.gz) in sdir; None if absent."""
+    for suffix in ('.tsv', '.tsv.gz'):
+        cand = os.path.join(sdir, f"{prefix}{sample}{suffix}")
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def list_samples_from_decoded(decoded_dir):
     samples = []
     for fn in os.listdir(decoded_dir):
-        if fn.startswith('decoded_reads_') and fn.endswith('.tsv'):
-            samples.append(fn[len('decoded_reads_'):-4])
+        name = _strip_tsv_suffix(fn, 'decoded_reads_')
+        if name is not None:
+            samples.append(name)
     return sorted(samples)
 
 
 def read_reason_counts(path):
     counts = Counter()
-    with open(path, 'r') as f:
+    with _open_text(path) as f:
         header = f.readline().rstrip('\n').split('\t')
         idx = {h:i for i,h in enumerate(header)}
         r_i = idx.get('reason')
@@ -538,10 +579,11 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
                           lib_expected_cycles, len_conf, progress_every=1000000, log=None,
                           max_lines=0, sample_n=0, sample_seed=2026):
     counts = Counter()
-    with open(path, 'r') as f:
+    with _open_text(path) as f:
         header = f.readline().rstrip('\n').split('\t')
         idx = {h:i for i,h in enumerate(header)}
         line_no = 0
+        processed = 0  # rows actually examined (excludes the row that triggered the max_lines break)
         if sample_n and sample_n > 0:
             rng = random.Random(sample_seed)
             sample_lines = []
@@ -561,6 +603,7 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
         for line_no, line in lines_iter:
             if not sample_n and max_lines and line_no > max_lines:
                 break
+            processed += 1
             row = line.rstrip('\n').split('\t')
             if len(row) != len(header):
                 counts['row_len_mismatch'] += 1
@@ -593,6 +636,10 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
             except Exception:
                 errs.append('cycles_parse')
                 cycles = 0
+            if cycles < 0 or cycles > 4:
+                # decoded header only carries C1..C4; guard against corrupt rows (would KeyError below)
+                errs.append('cycles_out_of_range')
+                cycles = 0
             if cycles:
                 expected = lib_expected_cycles.get(lib_id)
                 if expected is None:
@@ -600,6 +647,8 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
                 elif cycles != expected:
                     errs.append('cycles_mismatch')
 
+            # ruff B023: closes over `row`/`read_seq` of the current iteration but is called
+            # immediately below within the same iteration, so late binding cannot occur.
             def check_anchor(tag):
                 pos = row[idx[f'{tag}_pos']]
                 ln = row[idx[f'{tag}_len']]
@@ -652,7 +701,9 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
             if cpos and cp_pos is not None and cpos[-1] > cp_pos:
                 errs.append('order_violation')
 
-            def gap_ok(start_pos, start_len, next_pos, label):
+            # ruff B023: closes over `errs` of the current iteration; called immediately below
+            # (same iteration), so this is safe. Named gap_check to avoid shadowing module-level gap_ok().
+            def gap_check(start_pos, start_len, next_pos, label):
                 if start_pos is None or start_len is None or next_pos is None:
                     return
                 gap = next_pos - (start_pos + start_len)
@@ -660,13 +711,13 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
                     errs.append(label)
 
             if hp_pos is not None and hp_len is not None and op_pos is not None:
-                gap_ok(hp_pos, hp_len, op_pos, 'gap_HP_OP')
+                gap_check(hp_pos, hp_len, op_pos, 'gap_HP_OP')
             if op_pos is not None and op_len is not None and cpos:
-                gap_ok(op_pos, op_len, cpos[0], 'gap_OP_C1')
+                gap_check(op_pos, op_len, cpos[0], 'gap_OP_C1')
             for i in range(1, len(cpos)):
-                gap_ok(cpos[i-1], clen[i-1], cpos[i], f'gap_C{i}_C{i+1}')
+                gap_check(cpos[i-1], clen[i-1], cpos[i], f'gap_C{i}_C{i+1}')
             if cpos and cp_pos is not None:
-                gap_ok(cpos[-1], clen[-1], cp_pos, 'gap_C_last_CP')
+                gap_check(cpos[-1], clen[-1], cp_pos, 'gap_C_last_CP')
 
             for l in clen:
                 if l != 9:
@@ -704,7 +755,7 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
         if sample_n and sample_n > 0:
             counts['validated_lines'] = len(sample_lines)
         else:
-            counts['validated_lines'] = line_no
+            counts['validated_lines'] = processed
 
     return counts
 
@@ -726,7 +777,8 @@ def parse_length_conf(row):
 
 
 def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_sample=0,
-                sample_seed=2026, decoded_max_lines=0, decoded_sample=0):
+                sample_seed=2026, decoded_max_lines=0, decoded_sample=0,
+                max_cp_cands=0, max_anchor_cands=0):
     out = {
         'name': run_name,
         'dir': run_dir,
@@ -753,9 +805,10 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
         decoding_summary_map = read_table_by_sample(os.path.join(decoded_root, 'decoding_summary.tsv'))
         qc_map = read_table_by_sample(os.path.join(decoded_root, 'qc_checks.tsv'))
         length_stats_map = read_table_by_sample(os.path.join(decoded_root, 'length_window_stats.tsv'))
-        samples = list_samples_from_decoded(decoded_root)
-        if not samples:
-            samples = sorted(set(sample_stats_map) | set(decoding_summary_map) | set(qc_map))
+        # Union of decoded files and stats tables: a sample present in sample_stats but lacking a
+        # decoded_reads file must not silently vanish from the summary.
+        samples = sorted(set(list_samples_from_decoded(decoded_root))
+                         | set(sample_stats_map) | set(decoding_summary_map) | set(qc_map))
     else:
         samples = [d.replace('02_decoded_', '') for d in sample_dirs]
 
@@ -802,16 +855,16 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
             for k in ('codon_len_not9', 'order_violation', 'cp_len_out_of_27_29'):
                 out['qc_totals'][k] += int(qc.get(k, 0))
 
-        und_path = None
-        und_file = f"undecoded_reads_{sample}.tsv"
-        und_cand = os.path.join(sdir, und_file)
-        if os.path.exists(und_cand):
-            und_path = und_cand
-        else:
+        und_path = _find_sample_file(sdir, 'undecoded_reads_', sample)
+        if und_path is None and use_legacy:
+            # Legacy per-sample directories may use a differently named file; in the shared
+            # 02_decoded layout this fallback would pick ANOTHER sample's file, so legacy-only.
             for fn in os.listdir(sdir):
-                if fn.startswith('undecoded_reads_') and fn.endswith('.tsv'):
+                if _strip_tsv_suffix(fn, 'undecoded_reads_') is not None:
                     und_path = os.path.join(sdir, fn)
                     break
+        if und_path is None:
+            s['undecoded_missing'] = True
         if und_path:
             rc = read_reason_counts(und_path)
             s['undecoded_reason_counts'] = dict(rc)
@@ -833,16 +886,15 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
             s['length_conf_missing'] = True
             out['length_conf_missing_samples'] += 1
 
-        dec_path = None
-        dec_file = f"decoded_reads_{sample}.tsv"
-        dec_cand = os.path.join(sdir, dec_file)
-        if os.path.exists(dec_cand):
-            dec_path = dec_cand
-        else:
+        dec_path = _find_sample_file(sdir, 'decoded_reads_', sample)
+        if dec_path is None and use_legacy:
             for fn in os.listdir(sdir):
-                if fn.startswith('decoded_reads_') and fn.endswith('.tsv'):
+                if _strip_tsv_suffix(fn, 'decoded_reads_') is not None:
                     dec_path = os.path.join(sdir, fn)
                     break
+        if dec_path is None:
+            s['decoded_missing'] = True
+            log(f"[{run_name}] sample={sample} WARN: decoded_reads file not found; validation skipped")
         if dec_path:
             vc = validate_decoded_file(
                 dec_path, adj_tol,
@@ -855,8 +907,11 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
             out['validation_totals'].update(vc)
 
         if und_path and undecoded_sample > 0:
-            out_path = os.path.join(sdir, f"undecoded_sample_recheck_{undecoded_sample}.tsv")
-            uv = validate_undecoded_sample(und_path, undecoded_sample, sample_seed, adj_tol, len_conf, bb, out_path)
+            # File name carries the sample: in the shared 02_decoded layout a sample-less name
+            # was overwritten by every subsequent sample.
+            out_path = os.path.join(sdir, f"undecoded_sample_recheck_{sample}_{undecoded_sample}.tsv")
+            uv = validate_undecoded_sample(und_path, undecoded_sample, sample_seed, adj_tol, len_conf, bb, out_path,
+                                           max_cp_cands=max_cp_cands, max_anchor_cands=max_anchor_cands)
             s['undecoded_sample_validation'] = uv
             s['undecoded_sample_recheck'] = out_path
             out['undecoded_sample_totals'].update(uv)
@@ -876,7 +931,7 @@ def write_summary_tsv(out_path, runs):
         'length_conf_missing',
         'undecoded_sampled','undecoded_unexpected_decoded','undecoded_len_reject','undecoded_reason_len_mismatch'
     ]
-    with open(out_path, 'w') as f:
+    with open(out_path, 'w', encoding='utf-8') as f:
         f.write('\t'.join(cols) + '\n')
         for r in runs:
             for sample, s in sorted(r['samples'].items()):
@@ -929,17 +984,24 @@ def main():
     ap.add_argument('--decoded-sample', type=int, default=0,
                     help="Randomly sample N decoded reads per sample (0 = disabled; uses reservoir sampling)")
     ap.add_argument('--sample-seed', type=int, default=2026)
+    # Mirror the decoder's effective settings so the undecoded re-check reproduces 02_decode_reads.pl.
+    ap.add_argument('--mismatch', choices=['none', 'hp_op_cp'], default='hp_op_cp',
+                    help="Anchor (HP/OP/CP) 1-bp mismatch indexing mode used by the decode run (default hp_op_cp)")
+    ap.add_argument('--max-cp-cands', type=int, default=0,
+                    help="Cap on CP candidates per read in the re-check (0 = unlimited, decoder default)")
+    ap.add_argument('--max-anchor-cands', type=int, default=0,
+                    help="Cap on OP/HP anchor candidates in the re-check (0 = unlimited, decoder default)")
     ap.add_argument('--log', required=True)
     args = ap.parse_args()
 
     def log(msg):
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(args.log, 'a') as lf:
+        with open(args.log, 'a', encoding='utf-8') as lf:
             lf.write(f"[{ts}] {msg}\n")
         print(f"[{ts}] {msg}")
 
-    log('Loading BB sets')
-    bb = load_bb_sets(args.bb)
+    log(f'Loading BB sets (mismatch={args.mismatch})')
+    bb = load_bb_sets(args.bb, mismatch=args.mismatch)
 
     runs = []
     for name, rdir, adj_tol_s in args.run:
@@ -948,7 +1010,8 @@ def main():
         runs.append(collect_run(
             name, rdir, adj_tol, bb, args.progress_every, log,
             undecoded_sample=args.undecoded_sample, sample_seed=args.sample_seed,
-            decoded_max_lines=args.decoded_max_lines, decoded_sample=args.decoded_sample
+            decoded_max_lines=args.decoded_max_lines, decoded_sample=args.decoded_sample,
+            max_cp_cands=args.max_cp_cands, max_anchor_cands=args.max_anchor_cands
         ))
         log(f"End run: {name}")
 
@@ -957,7 +1020,7 @@ def main():
         for k in ('decode_fail_totals','qc_totals','undecoded_reason_totals','validation_totals','undecoded_sample_totals'):
             r[k] = dict(r[k])
 
-    with open(args.out_json, 'w') as f:
+    with open(args.out_json, 'w', encoding='utf-8') as f:
         json.dump(runs, f, indent=2, sort_keys=True)
     write_summary_tsv(args.out_tsv, runs)
     log(f"Wrote {args.out_json} and {args.out_tsv}")

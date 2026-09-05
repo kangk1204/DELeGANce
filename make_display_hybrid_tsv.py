@@ -7,8 +7,11 @@ from typing import List, Optional
 import pandas as pd
 
 
-LIB_SUFFIX_RE = re.compile(r"_LIB[\w\.-]+$")
-LIB_ANY_RE = re.compile(r"_LIB[\w\.-]+")
+# Anchored: strip only a trailing "_LIB<lib>" namespace token from a single BB value
+LIB_SUFFIX_RE = re.compile(r"_LIB[^_]+$")
+# Token-anchored variant for full tag IDs (cycles_BB1_BB2_BB3[_BB4]); the old unanchored
+# pattern (\w includes "_") consumed everything after the first "_LIB" and truncated the ID.
+LIB_ANY_RE = re.compile(r"_LIB[^_]+(?=_|$)")
 
 
 def strip_lib_suffix(value) -> str:
@@ -50,7 +53,7 @@ def normalize_display(df: pd.DataFrame) -> pd.DataFrame:
         if re.fullmatch(r"BB[1-4](_[xy])?", c) or re.fullmatch(r"bb[1-4]_id", c):
             bb_cols.append(c)
 
-    # Strip LIB suffix from BB columns
+    # Strip LIB suffix from BB columns (in place; values below reuse the stripped columns)
     for c in bb_cols:
         df[c] = df[c].map(strip_lib_suffix)
 
@@ -59,10 +62,11 @@ def normalize_display(df: pd.DataFrame) -> pd.DataFrame:
     b3_col = pick_bb_col(cols, "BB3")
     b4_col = pick_bb_col(cols, "BB4")
 
-    b1 = df[b1_col].map(strip_lib_suffix) if b1_col else "NA"
-    b2 = df[b2_col].map(strip_lib_suffix) if b2_col else "NA"
-    b3 = df[b3_col].map(strip_lib_suffix) if b3_col else "NA"
-    b4 = df[b4_col].map(strip_lib_suffix) if b4_col else "NA"
+    def _bb(col: Optional[str]) -> pd.Series:
+        # Missing BB column -> Series of "NA" (a bare str has no .astype)
+        return df[col] if col else pd.Series(["NA"] * len(df), index=df.index)
+
+    b1, b2, b3, b4 = _bb(b1_col), _bb(b2_col), _bb(b3_col), _bb(b4_col)
 
     if lib_col:
         libs = df[lib_col].astype(str)
@@ -135,8 +139,8 @@ def main() -> None:
     if not args.run_root:
         raise SystemExit("[ERROR] --run_root or --in_tsv is required.")
 
-    for run_root in args.run_root:
-        run_root = Path(run_root)
+    for run_root_str in args.run_root:
+        run_root = Path(run_root_str)
         in_tsv = _resolve_annot(run_root, args.prefer_dir)
         out_tsv = in_tsv.with_name("05_hybrid_annot_display.tsv")
         process_one(in_tsv, out_tsv)

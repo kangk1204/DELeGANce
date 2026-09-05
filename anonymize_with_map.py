@@ -9,7 +9,9 @@ Usage:
 
 Notes:
 - Only renames paths that exist.
-- Renames are performed in a safe order (longer names first).
+- Renames are performed in a safe order (longer names first, deepest paths first).
+- .git/, .venv/, __pycache__/ and the mapping file itself are never renamed.
+- Use --dry-run to preview the renames without touching the filesystem.
 """
 import argparse
 from pathlib import Path
@@ -42,21 +44,46 @@ def build_pairs(rows, mode: str):
     return pairs
 
 
-def rename_paths(root: Path, pairs):
+_SKIP_DIRS = {".git", ".venv", "venv", ".conda", "__pycache__", ".idea", ".vscode"}
+
+
+def _skip(path: Path, root: Path, protected: set) -> bool:
+    rel_parts = path.relative_to(root).parts
+    if any(part in _SKIP_DIRS for part in rel_parts):
+        return True
+    return path.resolve() in protected
+
+
+def rename_paths(root: Path, pairs, protected=None, dry_run: bool = False):
     renamed = []
+    failed = []
+    protected = protected or set()
     for src, dst in pairs:
-        for path in sorted(root.rglob("*")):
-            if src not in path.name:
+        # Bottom-up (deepest first): renaming a parent directory before its children invalidated the
+        # pre-collected child paths (FileNotFoundError, tree left half-renamed). rglob is re-run per pair.
+        paths = sorted(root.rglob("*"), key=lambda p: (len(p.parts), str(p)), reverse=True)
+        for path in paths:
+            if src not in path.name or _skip(path, root, protected):
                 continue
             new_name = path.name.replace(src, dst)
             if new_name == path.name:
                 continue
             target = path.with_name(new_name)
             if target.exists():
+                print(f"[SKIP] target exists: {target}")
                 continue
-            path.rename(target)
+            if dry_run:
+                print(f"[DRY] {path} -> {target}")
+                renamed.append((path, target))
+                continue
+            try:
+                path.rename(target)
+            except OSError as e:
+                failed.append((path, target, str(e)))
+                print(f"[FAIL] {path} -> {target}: {e}")
+                continue
             renamed.append((path, target))
-    return renamed
+    return renamed, failed
 
 
 def main():
@@ -64,6 +91,7 @@ def main():
     p.add_argument("--map", default="local_target_map.tsv")
     p.add_argument("--mode", choices=["anonymize", "deanonymize"], required=True)
     p.add_argument("--root", default=".")
+    p.add_argument("--dry-run", action="store_true", help="Print planned renames without applying them")
     args = p.parse_args()
 
     map_path = Path(args.map)
@@ -76,8 +104,11 @@ def main():
         print("[INFO] No mappings to apply.")
         return
 
-    renamed = rename_paths(Path(args.root), pairs)
-    print(f"[OK] renamed {len(renamed)} path(s).")
+    renamed, failed = rename_paths(Path(args.root), pairs, protected={map_path.resolve()}, dry_run=args.dry_run)
+    verb = "would rename" if args.dry_run else "renamed"
+    print(f"[OK] {verb} {len(renamed)} path(s); {len(failed)} failure(s).")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

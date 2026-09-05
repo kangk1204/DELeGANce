@@ -6,21 +6,26 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Mirrors the pairing rules of 01_preprocess_reads.pl: "<base>[._-]R1<anything>.fastq[.gz]" and
+# "<base>[._-]1.fastq[.gz]" (separator may be "_", "." or "-"; the old pattern rejected "-R1" and
+# lane/trim tokens other than "_NNN", so files the pipeline accepts were silently skipped here).
 READ_RE = re.compile(
-    r"^(?P<base>.+)(?P<read>_R?1|_R?2|_1|_2|\.R1|\.R2|\.1|\.2)(?:_[0-9]{3})?(?P<ext>\.f(?:ast)?q(?:\.gz)?)$",
+    r"^(?P<base>.+?)(?P<read>[._-]R?[12])(?P<mid>(?:[._-][^./\\]*?)*?)(?P<ext>\.f(?:ast)?q(?:\.gz)?)$",
     re.IGNORECASE,
 )
 
 
 def open_maybe_gz(path: Path, mode: str):
     if path.name.endswith(".gz"):
-        return gzip.open(path, mode)
+        # compresslevel 6 instead of the default 9: much faster writes, marginal size difference
+        return gzip.open(path, mode, compresslevel=6) if "w" in mode else gzip.open(path, mode)
     return open(path, mode, encoding="utf-8", errors="replace")
 
 
 def read_record(handle) -> Optional[Tuple[str, str, str, str]]:
     h = handle.readline()
-    if not h:
+    if not h or not h.strip():
+        # EOF, or a trailing blank line at end of file (not a truncated record)
         return None
     s = handle.readline()
     p = handle.readline()
@@ -106,8 +111,7 @@ def subsample_pair(r1_path: Path, r2_path: Path, out_r1: Path, out_r2: Path,
                 w2.writelines(rec2)
                 kept += 1
                 total += 1
-            for _ in r1:
-                break
+        # head mode does not scan the rest of the file: total == kept (reported as pairs read)
         return total, kept
 
     reservoir: List[Tuple[int, Tuple[str, str, str, str], Tuple[str, str, str, str]]] = []
@@ -165,10 +169,15 @@ def main() -> int:
         if not r1_path.exists() or not r2_path.exists():
             raise SystemExit(f"[ERROR] Missing FASTQ: {r1_path} or {r2_path}")
         out_r1, out_r2 = build_out_paths(base, r1_path, r2_path, out_dir, args.suffix)
+        inputs = {r1_path.resolve(), r2_path.resolve()}
+        if out_r1.resolve() in inputs or out_r2.resolve() in inputs:
+            raise SystemExit(f"[ERROR] Output would overwrite input: {out_r1} / {out_r2} "
+                             f"(use a different --output-dir or a non-empty --suffix)")
         if (out_r1.exists() or out_r2.exists()) and not args.overwrite:
             raise SystemExit(f"[ERROR] Output exists: {out_r1} or {out_r2} (use --overwrite)")
         total, kept = subsample_pair(r1_path, r2_path, out_r1, out_r2, args.n_pairs, args.mode, args.seed)
-        print(f"[OK] {base}: total_pairs={total}, kept={kept} → {out_r1.name}, {out_r2.name}")
+        label = "pairs_read" if args.mode == "head" else "total_pairs"
+        print(f"[OK] {base}: {label}={total}, kept={kept} → {out_r1.name}, {out_r2.name}")
     return 0
 
 
