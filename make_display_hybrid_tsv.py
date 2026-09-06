@@ -2,16 +2,18 @@
 import argparse
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 
 # Anchored: strip only a trailing "_LIB<lib>" namespace token from a single BB value
-LIB_SUFFIX_RE = re.compile(r"_LIB[^_]+$")
-# Token-anchored variant for full tag IDs (cycles_BB1_BB2_BB3[_BB4]); the old unanchored
-# pattern (\w includes "_") consumed everything after the first "_LIB" and truncated the ID.
+LIB_SUFFIX_RE = re.compile(r"_LIB[\w.-]+$")
+# Fallback for full tag IDs (cycles_BB1_BB2_BB3[_BB4]) when no lib_id is known. It is ambiguous for
+# lib_ids containing "_" (01_preprocess allows [A-Za-z0-9_.-]), so strip_lib_anywhere() removes exact
+# "_LIB<lib_id>" tokens whenever the run's lib_ids are known and uses this regex only otherwise.
 LIB_ANY_RE = re.compile(r"_LIB[^_]+(?=_|$)")
+NA_LIB_VALUES = {"", "na", "nan", "none", "<na>"}
 
 
 def strip_lib_suffix(value) -> str:
@@ -23,10 +25,26 @@ def strip_lib_suffix(value) -> str:
     return LIB_SUFFIX_RE.sub("", s)
 
 
-def strip_lib_anywhere(value) -> str:
+def known_libs_from(series) -> Tuple[str, ...]:
+    """Distinct real lib_ids of a LIB_ID column (NA-like values dropped), longest first."""
+    if series is None:
+        return ()
+    vals = {str(v).strip() for v in series.dropna().unique()}
+    vals = {v for v in vals if v.lower() not in NA_LIB_VALUES}
+    return tuple(sorted(vals, key=len, reverse=True))
+
+
+def strip_lib_anywhere(value, known_libs: Tuple[str, ...] = ()) -> str:
+    """Remove "_LIB<lib>" tokens from a full tag ID: exact tokens for the known lib_ids (followed by "_" or
+    end of string); the generic LIB_ANY_RE only when no lib_id is known."""
     if value is None:
         return ""
-    return LIB_ANY_RE.sub("", str(value))
+    s = str(value)
+    if known_libs:
+        for lib in known_libs:
+            s = re.sub(r"_LIB" + re.escape(lib) + r"(?=_|$)", "", s)
+        return s
+    return LIB_ANY_RE.sub("", s)
 
 
 def pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
@@ -69,15 +87,18 @@ def normalize_display(df: pd.DataFrame) -> pd.DataFrame:
     b1, b2, b3, b4 = _bb(b1_col), _bb(b2_col), _bb(b3_col), _bb(b4_col)
 
     if lib_col:
-        libs = df[lib_col].astype(str)
+        libs = df[lib_col].fillna("").astype(str).str.strip()
         id_display = libs + "_" + b1.astype(str) + "_" + b2.astype(str) + "_" + b3.astype(str) + "_" + b4.astype(str)
-        valid = ~libs.str.lower().isin(["", "na", "nan", "none"])
+        valid = ~libs.str.lower().isin(sorted(NA_LIB_VALUES))
         if id_cols:
-            fallback = df[id_cols[0]].astype(str).map(strip_lib_anywhere)
+            # rows without a lib_id: strip only the exact "_LIB<lib_id>" tokens of the libs seen in this table
+            known = known_libs_from(df[lib_col])
+            fallback = df[id_cols[0]].astype(str).map(lambda v: strip_lib_anywhere(v, known))
             id_display = id_display.where(valid, fallback)
         else:
             id_display = id_display.where(valid, "")
     else:
+        # no LIB_ID column at all: no lib_id is known, generic regex fallback
         id_display = df[id_cols[0]].astype(str).map(strip_lib_anywhere) if id_cols else ""
 
     for c in id_cols:

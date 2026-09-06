@@ -359,7 +359,8 @@ if (!$OPT_SKIP_FASTP) {
 } else {
     # When skipping fastp, ensure merged FASTQ files already exist.
     opendir(my $DH, $FASTP_DIR) or die "Cannot open $FASTP_DIR: $!\n";
-    my @merged = grep { /_merged\.(?:fq|fastq)(?:\.gz)?$/i } readdir($DH);
+    # same pattern as 02_decode_reads.pl AUTO_FASTQ_REGEX (accept *.fpmerged.fq(.gz) as well)
+    my @merged = grep { /(?:\.fpmerged\.fq(?:\.gz)?|_merged\.(?:fq|fastq)(?:\.gz)?)$/i } readdir($DH);
     closedir($DH);
     if (!@merged) {
         die "SKIP_FASTP=1 but no merged FASTQ found in $FASTP_DIR. ".
@@ -472,7 +473,8 @@ sub resolve_bb_id_smiles_and_write_fixed {
             $fixed_bb_id = $fixed_bb_id . "_LIB" . $lib_sanitized;
         }
 
-        # 출력
+        # 출력 (type 은 대문자로 정규화해 기록 — 02_decode_reads.pl 은 대소문자 무시 비교)
+        $d[0] = $bb_type;
         $d[2] = $fixed_bb_id;
         print $OUTF join("\t", @d), "\n";
     }
@@ -525,6 +527,7 @@ sub check_bb_info_and_build_index {
     log_msg("INFO", "# Reading FIXED BB info: $file");
 
     my $line_no = 0;
+    my $header_checked = 0;
     my @bad_rows;
     my %codon_seen_per_lib;   # enforce codon uniqueness within lib_id
     my %anchor_seen_per_lib;  # HP/OP/CP seq reuse within lib_id/type
@@ -545,7 +548,7 @@ sub check_bb_info_and_build_index {
         next if $line =~ /^\s*$/;
         my @d = split /\t/, $line, -1;
 
-        if ($line_no == 1 && defined($d[0]) && $d[0] =~ /^(type|bb[_-]?type)$/i) { next; }
+        if (!$header_checked) { $header_checked = 1; next if (defined($d[0]) && $d[0] =~ /^(type|bb[_-]?type)$/i); }
         next if @d < 7;
 
         my ($bb_type_raw, $seq_raw, $bb_id_fixed, $cycle, $tag_id, $lib_id, $smiles_raw, $comp_seq_raw) = @d;
@@ -613,6 +616,15 @@ sub check_bb_info_and_build_index {
 }
 
 #--------------------------- Step 3: fastp
+sub _assign_pair {
+    my ($paired, $base, $read, $path) = @_;
+    my $slot = ($read == 1) ? 'f' : 'r';
+    if (exists $paired->{$base}{$slot}) {
+        die "FASTQ pairing conflict: read $read of sample '$base' matched twice ".
+            "('$paired->{$base}{$slot}' and '$path'). Use --fastq-regex with (?<base>...)(?<read>[12]) to disambiguate.\n";
+    }
+    $paired->{$base}{$slot} = $path;
+}
 sub run_fastp {
     my $threads = $OPT_THREADS // $ENV{FASTP_THREADS} // 4;
     my $ver = `fastp --version 2>&1`;
@@ -646,9 +658,7 @@ sub run_fastp {
             unless (defined $base && defined $read && $read =~ /^[12]$/) {
                 next FILE;
             }
-            my $path = File::Spec->catfile($FASTQ_DIR, $fn);
-            if ($read == 1) { $paired{$base}{f} = $path; }
-            elsif ($read == 2) { $paired{$base}{r} = $path; }
+            _assign_pair(\%paired, $base, $read, File::Spec->catfile($FASTQ_DIR, $fn));
             next FILE;
         }
         # Common bcl2fastq style: *_R1_*.fastq.gz / *_R2_*.fastq.gz
@@ -660,22 +670,18 @@ sub run_fastp {
         }
         # bcl2fastq style: <base>_R1_001.fastq.gz / <base>_R1.fastq.gz — R[12] must be followed by a separator
         # token (lane/chunk) or directly by the extension, never by another word character.
-        elsif ($fn =~ /^(.*?)[._-]R([12])(?:[._-][^.]*)?\.(?:fastq|fq)(?:\.gz)?$/i) {
+        # The base is GREEDY so that a base containing "_R1_" itself (e.g. X_R1_L001_R1_001.fastq.gz) is split at
+        # the LAST _R[12] token: X_R1_L001 / read 1.
+        elsif ($fn =~ /^(.*)[._-]R([12])(?:[._-][^.]*)?\.(?:fastq|fq)(?:\.gz)?$/i) {
             ($base, $read) = ($1, $2);
         } else {
             next FILE;
         }
-        my $path = File::Spec->catfile($FASTQ_DIR, $fn);
-        my $slot = ($read == 1) ? 'f' : 'r';
-        if (exists $paired{$base}{$slot}) {
-            die "FASTQ pairing conflict: read $read of sample '$base' matched twice ".
-                "('$paired{$base}{$slot}' and '$path'). Use --fastq-regex with (?<base>...)(?<read>[12]) to disambiguate.\n";
-        }
-        $paired{$base}{$slot} = $path;
+        _assign_pair(\%paired, $base, $read, File::Spec->catfile($FASTQ_DIR, $fn));
     }
 
     my @samples = sort keys %paired;
-    if (!@samples) { log_msg("WARN", "No paired-end files detected in $FASTQ_DIR"); return; }
+    if (!@samples) { die "No paired-end FASTQ files detected in $FASTQ_DIR (expected <sample>_1/_2.fastq.gz or <sample>_R1/_R2*.fastq.gz).\n"; }
 
     log_msg("INFO", "# Processing FASTQ files sequentially..");
     my $idx = 0;
@@ -684,7 +690,9 @@ sub run_fastp {
         my $r1 = $paired{$sample}{f} // "";
         my $r2 = $paired{$sample}{r} // "";
         unless (-s $r1 && -s $r2) {
-            log_msg("WARN", sprintf("[%d/%d] %s: SKIP (pair missing: R1=%s, R2=%s)", $idx, scalar(@samples), $sample, $r1, $r2));
+            # A missing mate or an empty file is an input error: it must not silently drop the sample from the run.
+            log_msg("ERROR", sprintf("[%d/%d] %s: pair missing or empty (R1=%s, R2=%s)", $idx, scalar(@samples), $sample, $r1 || '-', $r2 || '-'));
+            push @failed_samples, $sample;
             next;
         }
 

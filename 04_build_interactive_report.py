@@ -72,13 +72,13 @@ def parse_args():
     p.add_argument("--top_table", type=int, default=500, help="오른쪽 Top 테이블 행 수(기본 500)")
     p.add_argument("--imgsize", type=int, default=150, help="RDKit 분자 이미지 한 변 픽셀(기본 150)")
     p.add_argument("--debug", type=int, choices=[0,1], default=0,
-                   help="1이면 디버그 패널/콘솔 로깅 활성화")
+                   help="1이면 디버그 패널/콘솔 로깅 활성화(0이면 콘솔 로그도 출력하지 않음)")
     # HTTP fallback for images when RDKit is unavailable
     p.add_argument("--img_fallback", choices=["auto","none","http"], default="none",
                    help="RDKit 미설치 시 이미지 대체 방식(기본 none→이미지 생략). "
                         "http/auto 선택 시 BB SMILES가 외부 서버(cactus.nci.nih.gov)로 전송됨 — 명시적 opt-in 필요")
     p.add_argument("--img_http_cap", type=int, default=400,
-                   help="HTTP 대체 이미지 최대 개수(유니크 BB 기준, 기본 400)")
+                   help="HTTP 대체 이미지 최대 개수(유니크 SMILES 기준, 기본 400)")
     p.add_argument("--min_dot", type=float, default=4, help="포인트 최소 크기")
     p.add_argument("--max_dot", type=float, default=16, help="포인트 최대 크기")
     p.add_argument("--plot_height", type=int, default=220, help="BB x BB 산점도 각 패널 높이(px)")
@@ -157,7 +157,7 @@ def _strip_lib_suffix(bb: str) -> str:
     if bb is None:
         return "NA"
     s = str(bb)
-    if s in ("", "NA", "nan", "None"):
+    if s.strip() in _MISSING_MARKERS:  # same marker set as _is_missing / _normalize_bb_value (incl. "N/A")
         return "NA"
     return re.sub(r"_LIB[\w\.-]+$", "", s)
 
@@ -229,7 +229,7 @@ def parse_id_to_fields(id_str: str) -> Tuple[int, List[str]]:
 
 def _normalize_bb_value(value: object) -> str:
     s = "" if value is None else str(value).strip()
-    if s in ("", "NA", "N/A", "nan", "None"):
+    if s in _MISSING_MARKERS:
         return "NA"
     return s
 
@@ -447,7 +447,7 @@ def load_master(path_master: str) -> pd.DataFrame:
 
     # 선택적 수치 변환(해당 열의 90% 이상이 숫자로 변환될 수 있는 경우에만) — 문자열(object) 열만 대상
     for c in df.columns:
-        if c in keep_str or c == "id":
+        if c in keep_str:  # "id" is in keep_str
             continue
         s = df[c]
         if s.dtype != object:
@@ -469,12 +469,16 @@ def build_records_from_master(df_master: pd.DataFrame,
     df = df_master.copy()
 
     # pass_filters 옵션
-    if only_passed and "pass_filters" in df.columns:
+    if only_passed:
+        if "pass_filters" not in df.columns:
+            raise SystemExit("[master] --only_passed 가 지정되었지만 master에 'pass_filters' 컬럼이 없습니다 "
+                             "(03_call_hits의 05_hybrid_annot.tsv 를 입력했는지 확인하세요).")
         if df["pass_filters"].dtype != bool:
             df["pass_filters"] = df["pass_filters"].astype(str).str.lower().isin(["true", "1", "t", "yes", "y"])
         df = df[df["pass_filters"]]
 
-    # HitScore 정렬 & 상위 N (deterministic: stable sort + secondary keys, matching 03's top-K ordering)
+    # HitScore 정렬 & 상위 N (deterministic: multi-key lexsort; ties broken by HitScore_RS desc, id asc.
+    # NOTE: pandas ignores `kind` for multi-column sorts, but its lexsort is stable, so the order is reproducible.)
     df["HitScore"] = pd.to_numeric(df["HitScore"], errors="coerce")
     df = df[np.isfinite(df["HitScore"])].copy()
     sort_keys = ["HitScore"]
@@ -578,8 +582,9 @@ def main():
     need_bb_map = False
     if df["LibID"].isna().any():
         need_bb_map = True
-    for k in ("bb1_smiles","bb2_smiles","bb3_smiles","bb4_smiles"):
-        if k in df.columns and _is_missing(df[k]).any():
+    for i, k in enumerate(("bb1_smiles","bb2_smiles","bb3_smiles","bb4_smiles"), start=1):
+        # ignore rows whose BB{i} itself is NA (e.g. BB4 of a 3-cycle library): nothing to look up there
+        if k in df.columns and (_is_missing(df[k]) & (df[f"BB{i}"].astype(str) != "NA")).any():
             need_bb_map = True
 
     # 필요 BB 집합 수집
@@ -661,19 +666,19 @@ def main():
         print(f"  - [알림] RDKit 미설치: 이미지 없이 진행합니다. ({_RDKIT_IMPORT_ERR})")
     unique_bb = set(df["BB1"]) | set(df["BB2"]) | set(df["BB3"]) | set(df["BB4"])
     unique_bb.discard("NA")
-    bb_to_img: Dict[str, str] = {}
+    # One image per unique SMILES (a BB always maps to one SMILES). Images are stored ONCE in `smiles_to_img`
+    # and passed to the JS callbacks as a dict; rows reference them by their SMILES1..4 values. Previously the
+    # base64 PNG was replicated into per-row IMG1..IMG4 CDS columns (rows x 4 x ~5 KB -> 100s of MB at top 10000).
+    unique_smiles = set()
+    for i in (1, 2, 3, 4):
+        unique_smiles |= {x for x in df[f"SMILES{i}"].astype(str).tolist() if x.strip()}
+    smiles_to_img: Dict[str, str] = {}
     if _HAS_RDKIT:
-        print(f"[{time.strftime('%H:%M:%S')}] Generate RDKit Base64 images (unique BB set: {len(unique_bb)})...")
+        print(f"[{time.strftime('%H:%M:%S')}] Generate RDKit Base64 images (unique BB {len(unique_bb)}, unique SMILES {len(unique_smiles)})...")
         ok, ng = 0, 0
-        for bb in sorted(unique_bb):
-            # 해당 BB의 첫 번째 SMILES를 찾아 그립니다
-            smi = ""
-            for i in (1,2,3,4):
-                s = df.loc[df[f"BB{i}"] == bb, f"SMILES{i}"]
-                if len(s) and isinstance(s.iloc[0], str) and s.iloc[0].strip():
-                    smi = s.iloc[0]; break
+        for smi in sorted(unique_smiles):
             img = smiles_to_base64(smi, (args.imgsize, args.imgsize))
-            bb_to_img[bb] = img
+            smiles_to_img[smi] = img
             if isinstance(img, str) and img.startswith("data:image"):
                 ok += 1
             else:
@@ -681,18 +686,13 @@ def main():
         print(f"  - RDKit 이미지: 성공 {ok}, 실패/결측 {ng}")
     elif args.img_fallback in ("auto","http"):
         cap = max(0, int(args.img_http_cap))
-        sel = sorted(unique_bb)[:cap]
-        print(f"[{time.strftime('%H:%M:%S')}] HTTP 이미지 페치 (유니크 BB {len(unique_bb)} → {len(sel)} 제한)...")
+        sel = sorted(unique_smiles)[:cap]
+        print(f"[{time.strftime('%H:%M:%S')}] HTTP 이미지 페치 (유니크 SMILES {len(unique_smiles)} → {len(sel)} 제한)...")
         ok, ng = 0, 0
         consecutive_http_err = 0
-        for bb in sel:
-            smi = ""
-            for i in (1,2,3,4):
-                s = df.loc[df[f"BB{i}"] == bb, f"SMILES{i}"]
-                if len(s) and isinstance(s.iloc[0], str) and s.iloc[0].strip():
-                    smi = s.iloc[0]; break
+        for smi in sel:
             img = http_smiles_to_base64(smi, args.imgsize)
-            bb_to_img[bb] = img
+            smiles_to_img[smi] = img
             if isinstance(img, str) and img.startswith("data:image"):
                 ok += 1
                 consecutive_http_err = 0
@@ -705,12 +705,6 @@ def main():
                         print("  - [경고] HTTP 이미지 요청이 연속 실패하여 나머지 요청을 중단합니다 (네트워크 차단?).")
                         break
         print(f"  - HTTP 이미지: 성공 {ok}, 실패/결측 {ng} (캡 {cap})")
-
-    def _img(bb): return bb_to_img.get(bb, "N/A") if (bb and bb != "NA") else "N/A"
-    df["IMG1"] = df["BB1"].map(_img)
-    df["IMG2"] = df["BB2"].map(_img)
-    df["IMG3"] = df["BB3"].map(_img)
-    df["IMG4"] = df["BB4"].map(_img)
 
     # 4.5) Normalize BB/ID for display (remove LIB suffix)
     for k in ("BB1", "BB2", "BB3", "BB4"):
@@ -768,6 +762,10 @@ def main():
     metric_field_map: Dict[str, str] = {}
     for m in metric_candidates:
         safe = f"M__{sanitize_field_name(m)}"
+        # sanitize_field_name("a.b") == sanitize_field_name("a_b"): keep distinct CDS fields for distinct metrics
+        k2 = 2
+        while safe in metric_field_map.values():
+            safe = f"M__{sanitize_field_name(m)}_{k2}"; k2 += 1
         metric_field_map[m] = safe
         df[safe] = pd.to_numeric(df[m], errors="coerce")
 
@@ -803,7 +801,7 @@ def main():
         "id","LibID","cycles","BB1","BB2","BB3","BB4",
         "BB1_disp","BB2_disp","BB3_disp","BB4_disp",
         "SMILES1","SMILES2","SMILES3","SMILES4",
-        "IMG1","IMG2","IMG3","IMG4","CombinedID","DisplayID",
+        "CombinedID","DisplayID",
         *metric_field_map.values(), "value", "size", "_rank_default",
     ]
     source = ColumnDataSource(data=df_cds[cds_cols].to_dict("list"), name="main_source")
@@ -940,6 +938,35 @@ def main():
         };
         return String(text || '').replace(/[&<>"']/g, function(m) { return map[m]; });
     }
+
+    // Debug logging: only when the page was built with --debug 1 (DEBUG const); mirrors into the debug panel (DBG) if present
+    function dlog() {
+        if (typeof DEBUG === 'undefined' || !DEBUG) { return; }
+        const parts = Array.prototype.slice.call(arguments).map(function(x) { return String(x); });
+        console.log.apply(console, parts);
+        try {
+            if (typeof DBG !== 'undefined' && DBG) {
+                DBG.text = "<pre style='margin:0'>" + escapeHtml(parts.join(' ')) + "</pre>";
+            }
+        } catch (e) {}
+    }
+
+    // Image lookup: images are stored ONCE per SMILES in the shared IMG_SRC ColumnDataSource (columns: smiles, img);
+    // rows carry only their SMILES/BB keys. A window-level map is built lazily on first use.
+    function imgFor(smiles, bb) {
+        if (!bb || bb === 'NA') { return 'N/A'; }
+        if (!smiles) { return 'No SMILES'; }
+        if (typeof IMG_SRC === 'undefined' || !IMG_SRC) { return 'N/A'; }
+        if (!window._DELE_img_map || window._DELE_img_map_src !== IMG_SRC.id) {
+            const m = {};
+            const ks = IMG_SRC.data['smiles'] || [], vs = IMG_SRC.data['img'] || [];
+            for (let i = 0; i < ks.length; i++) { m[ks[i]] = vs[i]; }
+            window._DELE_img_map = m;
+            window._DELE_img_map_src = IMG_SRC.id;
+        }
+        const v = window._DELE_img_map[smiles];
+        return (v === undefined || v === null) ? 'N/A' : v;
+    }
     
     // Sort indices based on current sort selection
     function sortIndices(indices, sortMode, data) {
@@ -987,15 +1014,17 @@ def main():
         const bb3 = escapeHtml(data['BB3_disp'] ? data['BB3_disp'][index] : data['BB3'][index]);
         const bb4 = escapeHtml(data['BB4_disp'] ? data['BB4_disp'][index] : data['BB4'][index]);
         
-        const img1 = data['IMG1'][index];
-        const img2 = data['IMG2'][index];
-        const img3 = data['IMG3'][index];
-        const img4 = data['IMG4'][index];
+        const rawSmi1 = data['SMILES1'][index], rawSmi2 = data['SMILES2'][index];
+        const rawSmi3 = data['SMILES3'][index], rawSmi4 = data['SMILES4'][index];
+        const img1 = imgFor(rawSmi1, data['BB1'][index]);
+        const img2 = imgFor(rawSmi2, data['BB2'][index]);
+        const img3 = imgFor(rawSmi3, data['BB3'][index]);
+        const img4 = imgFor(rawSmi4, data['BB4'][index]);
         
-        const smi1 = escapeHtml(data['SMILES1'][index]);
-        const smi2 = escapeHtml(data['SMILES2'][index]);
-        const smi3 = escapeHtml(data['SMILES3'][index]);
-        const smi4 = escapeHtml(data['SMILES4'][index]);
+        const smi1 = escapeHtml(rawSmi1);
+        const smi2 = escapeHtml(rawSmi2);
+        const smi3 = escapeHtml(rawSmi3);
+        const smi4 = escapeHtml(rawSmi4);
         
         function generateCellHtml(img, bb, label, smiles) {
             const imgStyle = 'width:150px;height:150px;object-fit:contain;border:1px solid #ddd;margin-bottom:5px;background-color:#fff;';
@@ -1078,7 +1107,7 @@ def main():
         const sortMode = select_sort.value;
         const metricName = select_metric.value;
         
-        console.log('Selection changed:', selectedIndices.length, 'items selected');
+        dlog('Selection changed:', selectedIndices.length, 'items selected');
         
         updateDetailPanel(selectedIndices, data, detail_div, sortMode, metricName, detail_init, false);
         
@@ -1118,7 +1147,7 @@ def main():
             event.ctrlKey || event.metaKey || event.shiftKey
         );
         
-        console.log('Tap event:', selectedIndices.length, 'items, accumulate:', accumulate);
+        dlog('Tap event:', selectedIndices.length, 'items, accumulate:', accumulate);
         
         updateDetailPanel(selectedIndices, data, detail_div, sortMode, metricName, detail_init, accumulate);
         
@@ -1128,6 +1157,14 @@ def main():
     """
 
     debug_prefix = f"const DEBUG = {str(int(args.debug) == 1).lower()};\n"
+    # Shared args for callbacks that render the detail panel: image table (one row per SMILES, serialised once as a
+    # Bokeh model shared by reference — a plain dict arg would be embedded once per CustomJS) + optional debug panel
+    _img_keys = sorted(smiles_to_img)
+    img_source = ColumnDataSource(data={"smiles": _img_keys, "img": [smiles_to_img[k] for k in _img_keys]},
+                                  name="img_source")
+    detail_args = dict(IMG_SRC=img_source)
+    if debug_panel is not None:
+        detail_args["DBG"] = debug_panel
     
     # Selection change 콜백 등록
     selection_cb = CustomJS(
@@ -1137,7 +1174,8 @@ def main():
             select_sort=select_sort, 
             select_metric=select_metric,
             top_source=top_source,
-            detail_init=detail_init
+            detail_init=detail_init,
+            **detail_args
         ), 
         code=debug_prefix + selection_change_js
     )
@@ -1149,7 +1187,8 @@ def main():
             detail_div=detail_div, 
             select_sort=select_sort, 
             select_metric=select_metric,
-            detail_init=detail_init
+            detail_init=detail_init,
+            **detail_args
         ), 
         code=debug_prefix + tap_handler_js
     )
@@ -1306,7 +1345,8 @@ def main():
             detail_div=detail_div, 
             select_metric=select_metric, 
             select_sort=select_sort,
-            detail_init=detail_init
+            detail_init=detail_init,
+            **detail_args
         ), 
         code=debug_prefix + sort_change_js
     ))
@@ -1353,7 +1393,8 @@ def main():
             detail_div=detail_div, 
             select_metric=select_metric, 
             select_sort=select_sort,
-            detail_init=detail_init
+            detail_init=detail_init,
+            **detail_args
         ), 
         code=debug_prefix + table_select_js
     )

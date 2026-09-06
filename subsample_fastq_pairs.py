@@ -6,13 +6,43 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Mirrors the pairing rules of 01_preprocess_reads.pl: "<base>[._-]R1<anything>.fastq[.gz]" and
-# "<base>[._-]1.fastq[.gz]" (separator may be "_", "." or "-"; the old pattern rejected "-R1" and
-# lane/trim tokens other than "_NNN", so files the pipeline accepts were silently skipped here).
-READ_RE = re.compile(
-    r"^(?P<base>.+?)(?P<read>[._-]R?[12])(?P<mid>(?:[._-][^./\\]*?)*?)(?P<ext>\.f(?:ast)?q(?:\.gz)?)$",
-    re.IGNORECASE,
-)
+# Mirrors the two pairing rules of 01_preprocess_reads.pl, tested in the same order:
+#   1) "<base>[._-][12].fastq[.gz]"                        (digit directly before the extension; lazy base)
+#   2) "<base>[._-]R[12][<sep><token>].fastq[.gz]"          (bcl2fastq style; GREEDY base so that a base that itself
+#                                                            contains "_R1_" splits at the LAST _R[12] token)
+# A name such as NEG_R1_2.fastq.gz is therefore sample NEG_R1 / read 2 (rule 1), never sample NEG / read 1.
+_RE_SIMPLE = re.compile(r"^(?P<base>.+?)(?P<read>[._-][12])(?P<mid>)(?P<ext>\.f(?:ast)?q(?:\.gz)?)$", re.IGNORECASE)
+_RE_BCL = re.compile(r"^(?P<base>.+)(?P<read>[._-]R[12])(?P<mid>(?:[._-][^./\\]*)?)(?P<ext>\.f(?:ast)?q(?:\.gz)?)$", re.IGNORECASE)
+
+
+class _PairMatch:
+    __slots__ = ("_g",)
+
+    def __init__(self, groups: Dict[str, str]):
+        self._g = groups
+
+    def group(self, name: str) -> str:
+        return self._g[name]
+
+
+def match_read_name(name: str) -> Optional[_PairMatch]:
+    """Return a match-like object with groups base/read/mid/ext, or None (same semantics as 01_preprocess_reads.pl)."""
+    for rx in (_RE_SIMPLE, _RE_BCL):
+        m = rx.match(name)
+        if m:
+            return _PairMatch(m.groupdict())
+    return None
+
+
+class _ReadRe:
+    """Backward-compatible shim so existing call sites can keep using READ_RE.match(name)."""
+
+    @staticmethod
+    def match(name: str) -> Optional[_PairMatch]:
+        return match_read_name(name)
+
+
+READ_RE = _ReadRe()
 
 
 def open_maybe_gz(path: Path, mode: str):
@@ -24,8 +54,10 @@ def open_maybe_gz(path: Path, mode: str):
 
 def read_record(handle) -> Optional[Tuple[str, str, str, str]]:
     h = handle.readline()
-    if not h or not h.strip():
-        # EOF, or a trailing blank line at end of file (not a truncated record)
+    while h and not h.strip():
+        # skip blank lines between records (a trailing blank line is then a clean EOF)
+        h = handle.readline()
+    if not h:
         return None
     s = handle.readline()
     p = handle.readline()
@@ -86,8 +118,10 @@ def build_out_paths(base: str, r1_in: Path, r2_in: Path, out_dir: Path, suffix: 
     m2 = READ_RE.match(r2_in.name)
     if not m1 or not m2:
         raise ValueError(f"Output naming failed for base '{base}'")
-    out_r1 = f"{m1.group('base')}{suffix}{m1.group('read')}{m1.group('ext')}"
-    out_r2 = f"{m2.group('base')}{suffix}{m2.group('read')}{m2.group('ext')}"
+    out_r1 = f"{m1.group('base')}{suffix}{m1.group('read')}{m1.group('mid')}{m1.group('ext')}"
+    out_r2 = f"{m2.group('base')}{suffix}{m2.group('read')}{m2.group('mid')}{m2.group('ext')}"
+    if out_r1 == out_r2:
+        raise SystemExit(f"[ERROR] R1 and R2 output names collide for '{base}': {out_r1} (inputs {r1_in.name}, {r2_in.name})")
     return out_dir / out_r1, out_dir / out_r2
 
 

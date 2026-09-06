@@ -8,17 +8,20 @@ if [ "$#" -lt 1 ]; then
   exit 2
 fi
 
-# Repository-wide default DEL2 column is "DEL2" (README, 03_call_hits.py --del2_col).
-DEL2_COL="${DEL2_COL:-DEL2}"
+# DEL2 column: when DEL2_COL is not set, --del2_col is NOT passed so export_beginner_qc_report.py
+# falls back to normalized_columns.del2 in hit_params.json (written by the orchestrator next to
+# 05_hybrid_annot.tsv), then to its name heuristic. Set DEL2_COL explicitly to override.
+DEL2_COL="${DEL2_COL-}"
 TOP_HITSCORE="${TOP_HITSCORE:-10000}"
 PLOT_HEIGHT="${PLOT_HEIGHT:-260}"
 
 runs=("$@")
 patterns=()
 for run_root in "${runs[@]}"; do
-  # run_delegance_pipeline.py passes --run_root as an ABSOLUTE path; match that, anchored at the
+  # run_delegance_pipeline.py passes --run_root as os.path.abspath(<--output-dir>) (symlinks NOT
+  # resolved); build the same string here so the pattern matches the child's argv. Anchored at the
   # end of the argument so "run1" does not also wait for "run10". Regex metacharacters escaped.
-  abs_root="$(cd "${run_root}" 2>/dev/null && pwd -P || printf '%s' "${run_root}")"
+  abs_root="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${run_root}")"
   esc_root="$(printf '%s' "${abs_root}" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')"
   patterns+=("03_call_hits\.py --run_root ${esc_root}( |\$)")
 done
@@ -66,7 +69,7 @@ PY
   # in the same directory (and the target of index.html's "All-in-one report" link).
   python3 "$ROOT_DIR/export_beginner_qc_report.py" \
     --annot_tsv "$annot" \
-    --del2_col "${DEL2_COL}" \
+    ${DEL2_COL:+--del2_col "${DEL2_COL}"} \
     --out_html "${norm}/beginner_qc_report.html" \
     --out_tsv "${norm}/beginner_qc_tophits.tsv"
   # Optional exporters: a missing openpyxl/xlsxwriter or bokeh must not abort the remaining runs.

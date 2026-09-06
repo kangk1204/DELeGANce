@@ -26,6 +26,14 @@ NEG_COLS_STR="${NEG_COLS:-}"
 DEL2_COL="${DEL2_COL:-}"
 
 while [[ $# -gt 0 ]]; do
+  # Options that take a value must have one (otherwise set -u reports a bare "$2: unbound variable").
+  case "$1" in
+    --run-root|--r1|--r2|--neg|--del2)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a value." >&2
+        usage; exit 2
+      fi ;;
+  esac
   case "$1" in
     --run-root)
       RUN_ROOTS+=("$2"); shift 2 ;;

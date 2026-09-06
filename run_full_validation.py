@@ -132,7 +132,9 @@ def load_bb_sets(bb_path, mismatch='hp_op_cp'):
             if typ.lower().startswith('codon'):
                 if lib_norm:
                     codon_sets[lib_norm].add(seq)
-                    if str(cycle).isdigit():
+                    # Same rule as 02_decode_reads.pl (cycle =~ /^[1-4]$/): cycle values outside 1..4 are
+                    # ignored for the expected-cycle decision instead of forcing a 4-cycle library.
+                    if str(cycle) in ('1', '2', '3', '4'):
                         c = int(cycle)
                         codon_sets_by_cycle[lib_norm][c].add(seq)
                         lib_cycles[lib_norm].add(c)
@@ -316,7 +318,10 @@ def scan_cp_hits(seq, cp_by_len):
 
 
 def sort_hits(hits, max_n=None):
-    hits.sort(key=lambda h: (qual_rank(h.get('qual')), h.get('pos', 0)), reverse=True)
+    # Same decision rule as 02_decode_reads.pl pick_best_*: perfect matches first, then larger position first.
+    # Ties (same qual and pos, different match length) follow the decoder's trie scan order (shorter match
+    # first) so that --max-cp-cands/--max-anchor-cands truncate the same candidate set as the decoder.
+    hits.sort(key=lambda h: (-qual_rank(h.get('qual')), -h.get('pos', 0), len(h.get('seq', ''))))
     if max_n is not None and len(hits) > max_n:
         return hits[:max_n]
     return hits
@@ -482,9 +487,15 @@ def validate_undecoded_sample(path, sample_n, seed, adj_tol, len_conf, bb, out_p
             else:
                 counts['expected_fail'] += 1
 
-        reason_has_len = 'len_out_of_range' in reason
-        if reason_has_len != len_reject:
-            counts['reason_len_mismatch'] += 1
+        # reason_len_mismatch = decoder said len_out_of_range XOR the validator's re-classification rejects.
+        # Without length_window_stats (len_conf None) len_reject is always False and every decoder length
+        # rejection would be counted as a mismatch, so the comparison is skipped and flagged instead.
+        if len_conf:
+            reason_has_len = 'len_out_of_range' in reason
+            if reason_has_len != len_reject:
+                counts['reason_len_mismatch'] += 1
+        else:
+            counts['len_conf_missing'] = 1
 
         if out_path:
             rows.append({
@@ -672,6 +683,7 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
             cpos = []
             clen = []
             cseq = []
+            cidx = []  # cycle number of each retained codon (a missing/corrupt cycle leaves a hole)
             for i in range(1, cycles + 1):
                 p = row[idx[f'C{i}_pos']]
                 l = row[idx[f'C{i}_len']]
@@ -689,7 +701,7 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
                     continue
                 if read_seq[p_i:p_i+l_i] != s:
                     errs.append(f'c{i}_seq_mismatch')
-                cpos.append(p_i); clen.append(l_i); cseq.append(s)
+                cpos.append(p_i); clen.append(l_i); cseq.append(s); cidx.append(i)
 
             if hp_pos is not None and op_pos is not None and hp_pos > op_pos:
                 errs.append('order_violation')
@@ -715,7 +727,8 @@ def validate_decoded_file(path, adj_tol, hp_sets, op_sets, cp_sets, codon_sets,
             if op_pos is not None and op_len is not None and cpos:
                 gap_check(op_pos, op_len, cpos[0], 'gap_OP_C1')
             for i in range(1, len(cpos)):
-                gap_check(cpos[i-1], clen[i-1], cpos[i], f'gap_C{i}_C{i+1}')
+                # label with the actual cycle numbers: if C2 is missing, C1->C3 is reported as gap_C1_C3
+                gap_check(cpos[i-1], clen[i-1], cpos[i], f'gap_C{cidx[i-1]}_C{cidx[i]}')
             if cpos and cp_pos is not None:
                 gap_check(cpos[-1], clen[-1], cp_pos, 'gap_C_last_CP')
 
@@ -797,9 +810,15 @@ def collect_run(run_name, run_dir, adj_tol, bb, progress_every, log, undecoded_s
         'length_conf_missing_samples': 0,
     }
 
+    if not os.path.isdir(run_dir):
+        raise SystemExit(f"[ERROR] run '{run_name}': directory not found: {run_dir}")
     sample_dirs = sorted([d for d in os.listdir(run_dir) if d.startswith('02_decoded_')])
     decoded_root = os.path.join(run_dir, '02_decoded')
     use_legacy = bool(sample_dirs)
+    if not use_legacy and not os.path.isdir(decoded_root):
+        # Neither the shared 02_decoded/ nor legacy 02_decoded_<sample>/ layout exists: the run would
+        # otherwise be reported with zero samples and no message.
+        log(f"[{run_name}] WARN: neither {decoded_root} nor 02_decoded_<sample>/ found under {run_dir}; no samples to validate")
     if not use_legacy and os.path.isdir(decoded_root):
         sample_stats_map = read_table_by_sample(os.path.join(decoded_root, 'sample_stats.tsv'))
         decoding_summary_map = read_table_by_sample(os.path.join(decoded_root, 'decoding_summary.tsv'))

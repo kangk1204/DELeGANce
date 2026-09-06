@@ -39,10 +39,8 @@ except Exception:
 # Tab panel class differs by bokeh version (2.x: Panel, 3.x: TabPanel). Resolve it
 # separately so that neither name being absent disables the whole HTML output.
 _PanelCls = None
-_HAS_TABPANEL = False
 try:
     from bokeh.models import TabPanel as _PanelCls  # type: ignore
-    _HAS_TABPANEL = True
 except Exception:
     try:
         from bokeh.models import Panel as _PanelCls  # type: ignore
@@ -81,7 +79,7 @@ _CSS_TEXT = """
 .summary-card { background:#f7f7fb; border:1px solid #dedee6; border-radius:8px; padding:8px 12px; min-width:160px; }
 .summary-label { font-size:11px; color:#666; letter-spacing:0.2px; text-transform:uppercase; }
 .summary-value { font-size:18px; font-weight:600; }
-.table-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0 8px 0; }
+.table-controls, :host(.table-controls) { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0 8px 0; }
 .table-count { font-size:12px; color:#555; }
 .struct-thumb { position:relative; display:inline-block; }
 .struct-thumb .struct-popup { display:none; position:absolute; z-index:10; left:70px; top:-10px; background:#fff; padding:6px; border:1px solid #ddd; box-shadow:0 2px 6px rgba(0,0,0,0.2); }
@@ -99,20 +97,8 @@ def _stylesheets() -> dict:
 
 
 def _style_block() -> str:
-    return """
-<style>
-.summary-cards { display:flex; flex-wrap:wrap; gap:12px; margin:6px 0 10px 0; }
-.summary-card { background:#f7f7fb; border:1px solid #dedee6; border-radius:8px; padding:8px 12px; min-width:160px; }
-.summary-label { font-size:11px; color:#666; letter-spacing:0.2px; text-transform:uppercase; }
-.summary-value { font-size:18px; font-weight:600; }
-.table-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0 8px 0; }
-.table-count { font-size:12px; color:#555; }
-.struct-thumb { position:relative; display:inline-block; }
-.struct-thumb .struct-popup { display:none; position:absolute; z-index:10; left:70px; top:-10px; background:#fff; padding:6px; border:1px solid #ddd; box-shadow:0 2px 6px rgba(0,0,0,0.2); }
-.struct-thumb:hover .struct-popup { display:block; }
-.group-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; color:#fff; }
-</style>
-"""
+    # Legacy <style> injection (bokeh 2.x, no shadow DOM). Single source: _CSS_TEXT.
+    return f"<style>{_CSS_TEXT}</style>"
 
 
 def _summary_cards(cards: List[Tuple[str, str]]) -> str:
@@ -214,6 +200,8 @@ def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
                 cand = os.path.join(norm, preset, "05_hybrid_annot.tsv")
                 if os.path.isfile(cand):
                     return cand
+                print(f"[WARN] preset '{preset}' has no 05_hybrid_annot.tsv under {norm}; "
+                      f"falling back to the newest 05_hybrid_annot.tsv found there")
             paths = []
             for root, _, files in os.walk(norm):
                 if "05_hybrid_annot.tsv" in files:
@@ -248,6 +236,13 @@ def _to_int_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
 
 
+def _finite_or_nan(s: pd.Series) -> pd.Series:
+    """Numeric series with non-finite values (the -inf used internally for missing
+    scores) replaced by NaN, so that -inf never reaches an output table."""
+    num = pd.to_numeric(s, errors="coerce")
+    return num.where(np.isfinite(num.to_numpy(dtype=float)), np.nan)
+
+
 def _make_compound_key(df: pd.DataFrame) -> pd.Series:
     bb_cols = [c for c in ["BB1_x", "BB2_x", "BB3_x", "BB4_x"] if c in df.columns]
     if not bb_cols:
@@ -275,6 +270,45 @@ def _apply_recommend_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 def _sanitize_label(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "run"
+
+
+def _default_label(path: str, i: int) -> str:
+    """Derive a run label from a --runs entry. Directories keep their basename; a
+    05_hybrid_annot.tsv path uses its enclosing <run>[_<preset>] directories (skipping
+    '03_normalized') so that several runs given as file paths do not all collapse to
+    the file name."""
+    q = os.path.normpath(path)
+    if os.path.isfile(q) or q.lower().endswith(".tsv"):
+        parts = [x for x in q.split(os.sep)[:-1] if x and x != "03_normalized" and x not in (".", "..")]
+        if parts:
+            return "_".join(parts[-2:])
+        return f"run{i+1}"
+    return os.path.basename(q) or f"run{i+1}"
+
+
+def _uniquify_labels(labels: List[str]) -> List[str]:
+    """Append _1, _2, ... to duplicated labels; the suffixed name is re-checked against
+    every other label so the result is guaranteed unique (e.g. ['x','x','x_1'] ->
+    ['x_1','x_2','x_1'] is NOT produced)."""
+    counts: Dict[str, int] = {}
+    for l in labels:
+        counts[l] = counts.get(l, 0) + 1
+    taken = set(labels)
+    used: set = set()
+    fixed: List[str] = []
+    for l in labels:
+        if counts[l] == 1 and l not in used:
+            cand = l
+        else:
+            k = 1
+            cand = f"{l}_{k}"
+            while cand in used or (cand in taken and counts.get(cand, 0) == 1):
+                k += 1
+                cand = f"{l}_{k}"
+        used.add(cand)
+        fixed.append(cand)
+    assert len(set(fixed)) == len(fixed)
+    return fixed
 
 
 def _sample_cols_from_header(header: List[str]) -> List[str]:
@@ -451,21 +485,27 @@ def _fp_from_smiles(smiles: str, radius: int, nbits: int):
 # How bbavg treats BB positions where one/both fingerprints are missing:
 #   "skip": average only over positions where both are valid (legacy behavior;
 #           two compounds sharing a single valid BB can reach similarity 1.0)
-#   "zero": missing positions count as similarity 0 (denominator = number of BB
-#           positions), which is more conservative.
+#   "zero": positions where exactly one compound has a valid fingerprint count as
+#           similarity 0 (denominator = number of positions where at least one of
+#           the two has a fingerprint). Positions empty in BOTH compounds (e.g. the
+#           always-present bb4_smiles column of a 3-cycle library) are ignored, so
+#           the similarity of two identical 3-cycle compounds is still 1.0.
 _BBAVG_MISSING = "skip"
 
 
 def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object]]) -> float:
     sims = []
-    n_pos = max(len(fps_a), len(fps_b))
+    n_union = 0
     for fa, fb in zip(fps_a, fps_b):
+        if fa is None and fb is None:
+            continue
+        n_union += 1
         if fa is None or fb is None:
             continue
         sims.append(DataStructs.TanimotoSimilarity(fa, fb))
     if not sims:
         return 0.0
-    denom = n_pos if _BBAVG_MISSING == "zero" else len(sims)
+    denom = n_union if _BBAVG_MISSING == "zero" else len(sims)
     return float(sum(sims) / max(1, denom))
 
 
@@ -475,6 +515,11 @@ def _bbavg_lower_triangle_dists(valid_fps: List[List[Optional[object]]]) -> List
     Numerically identical to 1 - _bbavg_similarity(fi, fj) for every pair."""
     n = len(valid_fps)
     n_pos = max((len(x) for x in valid_fps), default=0)
+    # present[i, k] = compound i has a fingerprint at BB position k
+    present = np.zeros((n, n_pos), dtype=bool)
+    for i, fl in enumerate(valid_fps):
+        for k in range(min(n_pos, len(fl))):
+            present[i, k] = fl[k] is not None
     dists: List[float] = []
     for i in range(1, n):
         sim_sum = np.zeros(i, dtype=float)
@@ -491,9 +536,10 @@ def _bbavg_lower_triangle_dists(valid_fps: List[List[Optional[object]]]) -> List
             sim_sum[idx] += np.asarray(sims, dtype=float)
             cnt[idx] += 1.0
         if _BBAVG_MISSING == "zero":
-            # per-pair denominator = number of BB positions of the longer compound (as in _bbavg_similarity)
-            denom = np.asarray([max(1, len(fi_list), len(valid_fps[j])) for j in range(i)], dtype=float)
-            avg = np.where(cnt > 0, sim_sum / denom, 0.0)
+            # per-pair denominator = number of BB positions where at least one of the two
+            # compounds has a fingerprint (as in _bbavg_similarity)
+            union_cnt = (present[i][None, :] | present[:i]).sum(axis=1).astype(float)
+            avg = np.where(cnt > 0, sim_sum / np.maximum(union_cnt, 1.0), 0.0)
         else:
             avg = np.where(cnt > 0, sim_sum / np.maximum(cnt, 1.0), 0.0)
         dists.extend((1.0 - avg).tolist())
@@ -535,6 +581,7 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     smi_cols = [c for c in ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles"] if c in df_top.columns]
@@ -544,6 +591,7 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     fps = []
@@ -579,6 +627,7 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     valid_fps = [fps[i] for i in valid_pos]
@@ -754,6 +803,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     smi_cols = [c for c in ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles"] if c in df.columns]
@@ -763,6 +813,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     fps = []
@@ -798,6 +849,7 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         out["cluster_id"] = "NA"
         out["cluster_size"] = 0
         out["cluster_rep"] = 0
+        out["cluster_medoid"] = 0
         return out, None
 
     valid_fps = [fps[i] for i in valid_pos]
@@ -930,7 +982,7 @@ def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
         first_key = next(iter(full.data.keys()))
         total = len(full.data[first_key])
     search = TextInput(title="Search", value="", placeholder="compound_key / ID / BB / CP")
-    count_div = Div(text=f"<span class='table-count'>Showing {total} of {total}</span>")
+    count_div = Div(text=f"<span class='table-count'>Showing {total} of {total}</span>", **_stylesheets())
     reset_btn = Button(label="Reset", button_type="default", width=70)
     download_btn = Button(label="Download CSV", button_type="primary")
 
@@ -1002,7 +1054,8 @@ function csvEscape(value) {
   return s;
 }
 const data = source.data;
-const cols = Object.keys(data);
+// Skip the CDS index column and the base64 image / hidden HTML columns (display-only, multi-MB).
+const cols = Object.keys(data).filter(c => c !== 'index' && c !== 'structure_html' && !c.endsWith('_img'));
 const n = cols.length ? data[cols[0]].length : 0;
 let csv = cols.join(',') + '\\n';
 for (let i = 0; i < n; i++) {
@@ -1152,7 +1205,9 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         if col == "compound_img":
             table_cols.append(TableColumn(field=col, title="compound_img", formatter=compound_formatter, width=_col_width(col, table_df[col])))
             continue
-        if col == "structure_html":
+        if col in ("structure_html", "group", "group_code"):
+            # structure_html: hidden payload for the structure preview; group/group_code:
+            # filter-callback fields only (group_badge already shows the group).
             continue
         if table_df[col].dtype.kind in "if":
             if col in ("rank", "cluster_size", "cluster_rep", "cluster_medoid", "group_rank"):
@@ -1200,7 +1255,7 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
     table_layout = column(controls, table, sizing_mode="stretch_width")
     struct_div = None
     if with_structure and "structure_html" in table_df.columns:
-        struct_div = Div(text="<i>Click a row to view structure</i>")
+        struct_div = Div(text="<i>Click a row to view structure</i>", **_stylesheets())
         callback = CustomJS(args=dict(source=source, div=struct_div), code="""
 const inds = source.selected.indices;
 if (inds.length === 0) {
@@ -1311,7 +1366,7 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
     if not _HAS_BOKEH:
         return []
 
-    items = [Div(text=_style_block())]
+    items = []
     summary = group_tables.get("summary", {})
     group_defs = summary.get("group_defs", {})
     a_def = group_defs.get("Active-specific", "")
@@ -1328,6 +1383,7 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
         ("Unclassified", str(summary.get("n_other", 0))),
     ]
     summary_lines = [
+        _style_block(),
         f"<h2>{title}</h2>",
         _summary_cards(cards),
         "<ul>",
@@ -1340,7 +1396,7 @@ def build_specificity_panels(df_all: pd.DataFrame, group_tables: Dict[str, Dict[
         "<li>Cutoffs use rank_pct percentiles per run (e.g., 99 = top 1% within that run; higher is better).</li>",
         "</ul>",
     ]
-    items.append(Div(text="\n".join(summary_lines)))
+    items.append(Div(text="\n".join(summary_lines), **_stylesheets()))
 
     df_plot = df_all.copy()
     if "group_code" not in df_plot.columns:
@@ -1442,7 +1498,7 @@ def _reselect_reps_within_groups(df: pd.DataFrame, rep_score_col: str) -> pd.Dat
     grp_keys = pd.DataFrame({"g": out["group_code"].astype(str), "c": cid})[valid]
     # .groups yields index LABELS (== row positions of `out`, RangeIndex after reset);
     # .indices would give positions within the `valid`-filtered frame instead.
-    for _key, labels in grp_keys.groupby(["g", "c"], sort=False).groups.items():
+    for labels in grp_keys.groupby(["g", "c"], sort=False).groups.values():
         idx = [int(i) for i in labels]
         best = max(idx, key=lambda i: (scores[i], rank_pct[i], cpm_mean[i], raw_sum[i], -i))
         rep_flags[best] = 1
@@ -1485,7 +1541,7 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
     maps_inactive = _rank_maps(df_inactive, score_col)
     maps_both = _rank_maps(df_both, score_col) if df_both is not None else None
 
-    top_n = int(args.spec_top_n) if args.spec_top_n else int(args.top_n)
+    top_n = max(1, int(args.spec_top_n) if args.spec_top_n else int(args.top_n))
 
     def _sample_block(df_best: pd.DataFrame, cols: List[str], rename: Dict[str, str]) -> Optional[pd.DataFrame]:
         if df_best is None or df_best.empty or not cols:
@@ -1513,6 +1569,8 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
             df_top["source_role"] = role_name
             frames.append(df_top)
     if not frames:
+        print("[WARN] specificity candidate pool is empty after the top-N cut and hit filters; "
+              "no tier_report_* outputs written.")
         return [], {}
 
     df_base = pd.concat(frames, ignore_index=True).drop_duplicates("compound_key").copy()
@@ -1546,8 +1604,7 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
     # Run-consistent metrics: every per-run value is looked up by compound_key in that
     # run's own map. (Previously active_score and rank were taken from the row's own
     # score_col, i.e. from whichever run the de-duplicated row happened to come from.)
-    active_score = pd.to_numeric(df_base["compound_key"].map(maps_active["score_map"]), errors="coerce")
-    df_base["active_score"] = active_score.where(np.isfinite(active_score.to_numpy(dtype=float)), np.nan)
+    df_base["active_score"] = _finite_or_nan(df_base["compound_key"].map(maps_active["score_map"]))
     df_base = df_base.sort_values(["active_score", "compound_key"], ascending=[False, True],
                                   na_position="last", kind="mergesort")
     df_base["rank"] = np.arange(1, len(df_base) + 1, dtype=int)
@@ -1557,11 +1614,11 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
     df_base["active_score_z"] = df_base["compound_key"].map(maps_active["score_z_map"]).fillna(0.0)
     df_base["active_hit_pct"] = df_base["compound_key"].map(maps_active["hitpct_map"]).fillna(0.0)
 
-    df_base["inactive_score"] = df_base["compound_key"].map(maps_inactive["score_map"])
+    df_base["inactive_score"] = _finite_or_nan(df_base["compound_key"].map(maps_inactive["score_map"]))
     df_base["inactive_rank_pct"] = df_base["compound_key"].map(maps_inactive["rank_pct_map"]).fillna(0.0)
 
     if maps_both:
-        df_base["both_score"] = df_base["compound_key"].map(maps_both["score_map"])
+        df_base["both_score"] = _finite_or_nan(df_base["compound_key"].map(maps_both["score_map"]))
         df_base["both_rank_pct"] = df_base["compound_key"].map(maps_both["rank_pct_map"]).fillna(0.0)
     else:
         df_base["both_score"] = np.nan
@@ -1622,6 +1679,13 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
         df_base = _reselect_reps_within_groups(df_base, "specificity_score")
     else:
         cluster_df = None
+    # Clustering counts as performed only when a cluster table was produced (RDKit present,
+    # bb*_smiles available, >=1 valid fingerprint). Otherwise *_diverse.tsv is written as an
+    # empty table (header only) and announced, instead of silently equalling the full group.
+    clustering_on = cluster_df is not None
+    if not clustering_on:
+        reason = "--cluster 0" if int(args.cluster) != 1 else "no usable fingerprints/RDKit"
+        print(f"[INFO] clustering not performed ({reason}); tier_report *_diverse.tsv files are written empty (header only).")
 
     group_order = ["Active-specific", "Inactive-specific", "Both-specific", "Other"]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
@@ -1637,7 +1701,6 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
 
     groups = {}
     diverse_total = 0
-    clustering_on = rep_col in df_base.columns
     group_map = {
         "Active-specific": "active_specific",
         "Inactive-specific": "inactive_specific",
@@ -1645,9 +1708,10 @@ def compute_specificity_report(active_info: Dict, inactive_info: Dict, both_info
     }
     for group, tag in group_map.items():
         df_group = df_base[df_base["group_code"] == group].copy()
-        df_div = df_group.copy()
-        if rep_col in df_div.columns:
-            df_div = df_div[_to_int_series(df_div[rep_col]) == 1].copy()
+        if clustering_on and rep_col in df_group.columns:
+            df_div = df_group[_to_int_series(df_group[rep_col]) == 1].copy()
+        else:
+            df_div = df_group.iloc[0:0].copy()
         df_group_path = f"{prefix}_{tag}.tsv"
         df_div_path = f"{prefix}_{tag}_diverse.tsv"
         df_group.to_csv(df_group_path, sep="\t", index=False)
@@ -1727,7 +1791,7 @@ def build_interactive_html(summary_html: str, pattern_df: pd.DataFrame,
         print("[WARN] bokeh is not available; skipping interactive HTML output.")
         return
 
-    items = [Div(text=summary_html)]
+    items = [Div(text=summary_html, **_stylesheets())]
 
     if not pattern_df.empty:
         src = ColumnDataSource(pattern_df)
@@ -1836,26 +1900,14 @@ def main() -> int:
         raise SystemExit("[ERROR] --labels must match number of --runs")
     labels_explicit = bool(labels)
     if not labels:
-        labels = [os.path.basename(os.path.normpath(p)) or f"run{i+1}" for i, p in enumerate(run_paths)]
+        labels = [_default_label(p, i) for i, p in enumerate(run_paths)]
     labels = [_sanitize_label(l) for l in labels]
     if len(set(labels)) != len(labels):
         if labels_explicit:
             raise SystemExit(f"[ERROR] --labels must be unique (got {labels})")
-        # Derived labels collide (e.g. every --runs entry is a .../05_hybrid_annot.tsv path):
-        # disambiguate with _1, _2, ... so per-run outputs and union/overlap columns do not overwrite each other.
-        seen: Dict[str, int] = {}
-        uniq: List[str] = []
-        for l in labels:
-            seen[l] = seen.get(l, 0) + 1
-            uniq.append(l)
-        counters: Dict[str, int] = {}
-        fixed: List[str] = []
-        for l in uniq:
-            if seen[l] > 1:
-                counters[l] = counters.get(l, 0) + 1
-                fixed.append(f"{l}_{counters[l]}")
-            else:
-                fixed.append(l)
+        # Derived labels collide: disambiguate with _1, _2, ... (re-checked against all other
+        # labels) so per-run outputs and union/overlap columns do not overwrite each other.
+        fixed = _uniquify_labels(labels)
         print(f"[WARN] derived run labels are not unique {labels}; using {fixed}. Pass --labels to set explicit names.")
         labels = fixed
 
@@ -1866,9 +1918,17 @@ def main() -> int:
     for r in roles:
         if r not in ("active", "inactive", "both", "other"):
             raise SystemExit("[ERROR] --roles must be one of: active, inactive, both, other")
+    for r in ("active", "inactive", "both"):
+        if roles.count(r) > 1:
+            raise SystemExit(f"[ERROR] --roles: role '{r}' is assigned to more than one run")
+    if roles and int(args.include_specificity) == 1 and not ("active" in roles and "inactive" in roles):
+        print("[WARN] --roles needs one 'active' and one 'inactive' run for the specificity report; "
+              "specificity outputs will be skipped.")
     role_labels = _role_label_map(roles, labels)
 
-    score_col = infer_score_col(run_paths, args.preset, args.score_col)
+    # Resolve each run once (avoids duplicate [WARN]s from a second resolve in the loop below).
+    hybrid_paths = [resolve_hybrid_path(p, args.preset) for p in run_paths]
+    score_col = infer_score_col(hybrid_paths, args.preset, args.score_col)
     def _parse_int_list(s: Optional[str]) -> Optional[List[int]]:
         if not s:
             return None
@@ -1901,9 +1961,11 @@ def main() -> int:
     html_path = f"{prefix}_interactive.html"
 
     run_info = []
-    for idx, (path, label) in enumerate(zip(run_paths, labels)):
-        hybrid = resolve_hybrid_path(path, args.preset)
+    for idx, (hybrid, label) in enumerate(zip(hybrid_paths, labels)):
         header = pd.read_csv(hybrid, sep="\t", nrows=0).columns.tolist()
+        if score_col not in header:
+            raise SystemExit(f"[ERROR] score column '{score_col}' not found in {hybrid} "
+                             f"(available: HitScore_GLM={'HitScore_GLM' in header}, HitScore_RS={'HitScore_RS' in header})")
         sample_cols = _sample_cols_from_header(header)
         # Backward-compatible ID columns: prefer *_x, fall back to plain names (renamed to *_x after read).
         id_cols_present = [c for c in (_pick_col(header, b) for b in _LEGACY_ID_COLS) if c]
@@ -1987,9 +2049,16 @@ def main() -> int:
             df_rec["score_z"] = df_rec["compound_key"].map(score_z_map_all)
             df_rec["HitScore_pct"] = df_rec["compound_key"].map(hitpct_map_all)
         top_score_map = df_top.groupby("compound_key")[score_col].max().to_dict()
-        diverse = df_rec.copy()
-        if rep_col in diverse.columns:
-            diverse = diverse[_to_int_series(diverse[rep_col]) == 1].copy()
+        # Same rule as the specificity report / 07: clustering counts as performed only when a
+        # cluster table exists; otherwise the diverse list is an empty table (header only).
+        clustering_done = cluster_df is not None
+        if clustering_done and rep_col in df_rec.columns:
+            diverse = df_rec[_to_int_series(df_rec[rep_col]) == 1].copy()
+        else:
+            diverse = df_rec.iloc[0:0].copy()
+            if int(args.include_summary) == 1:
+                reason = "--cluster 0" if int(args.cluster) != 1 else "no usable fingerprints/RDKit"
+                print(f"[INFO] {label}: clustering not performed ({reason}); {label}_diverse.tsv is written empty (header only).")
         diverse = diverse.sort_values([score_col, "compound_key"], ascending=[False, True], kind="mergesort").copy()
 
         freq_df = _build_bb_frequency_df(df_top, int(args.bb_top_k)) if int(args.include_summary) == 1 else pd.DataFrame()
@@ -2032,9 +2101,9 @@ def main() -> int:
         info["diverse_path"] = None
         info["freq_path"] = None
         info["cluster_path"] = None
-        if not info["diverse"].empty:
-            info["diverse"].to_csv(div_path, sep="\t", index=False)
-            info["diverse_path"] = div_path
+        # Written even when empty (header only) so the file set is the same for every run.
+        info["diverse"].to_csv(div_path, sep="\t", index=False)
+        info["diverse_path"] = div_path
         if isinstance(info.get("freq"), pd.DataFrame) and not info["freq"].empty:
             info["freq"].to_csv(freq_path, sep="\t", index=False)
             info["freq_path"] = freq_path
@@ -2119,7 +2188,11 @@ def main() -> int:
                 role_labels=role_labels,
             )
 
-    if not args.no_html:
+    if not args.no_html and not _HAS_BOKEH:
+        # build_interactive_html() would print the same warning, but the table/panel helpers
+        # used below reference bokeh classes directly and would raise NameError first.
+        print("[WARN] bokeh is not available; skipping interactive HTML output.")
+    if not args.no_html and _HAS_BOKEH:
         summary_lines = [_style_block(), "<h2>Top-hit comparison</h2>"]
         cards = [
             ("Runs", str(len(run_paths))),
@@ -2262,9 +2335,9 @@ def main() -> int:
                             continue
                         smi_map = (bb_smiles_map or {}).get(bb_col, {})
                         sub["bb"] = sub["bb"].astype(str)
-                        sub["lib_ids"] = sub.get("lib_ids", "").astype(str)
-                        sub["lib_counts"] = sub.get("lib_counts", "").astype(str)
-                        sub = sub.sort_values("count", ascending=False)
+                        for _c in ("lib_ids", "lib_counts"):
+                            sub[_c] = (sub[_c] if _c in sub.columns else pd.Series("", index=sub.index)).astype(str)
+                        sub = sub.sort_values(["count", "bb"], ascending=[False, True], kind="mergesort")
                         # ruff B023: closure over loop variable is consumed immediately (same iteration) -> safe
                         sub["smiles"] = sub["bb"].map(lambda bb, _m=smi_map: _m.get(bb, ""))
 
@@ -2323,7 +2396,8 @@ def main() -> int:
                 if score_cols:
                     sub_scores = sub[score_cols].apply(pd.to_numeric, errors="coerce")
                     sub["best_score"] = sub_scores.max(axis=1)
-                    sub = sub.sort_values("best_score", ascending=False)
+                    sub = sub.sort_values(["best_score", "compound_key"], ascending=[False, True],
+                                          na_position="last", kind="mergesort")
                     cols = [*base_cols, "best_score"] if "best_score" not in base_cols else base_cols
                 else:
                     cols = base_cols
@@ -2351,7 +2425,7 @@ def main() -> int:
         print(f"[INFO] specificity outputs: {spec_outputs.get('prefix','')}_*.tsv")
         if spec_outputs.get("html"):
             print(f"[INFO] specificity html: {spec_outputs.get('html')}")
-    if not args.no_html:
+    if not args.no_html and _HAS_BOKEH:
         print(f"[INFO] html: {html_path}")
     return 0
 

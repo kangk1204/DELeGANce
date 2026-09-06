@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import os
 import random
 import re
 from collections import Counter
@@ -174,7 +175,19 @@ def main():
     counts_all = Counter()  # keyed by (lib_id, id) — raw_counts_matrix rows are (lib_id, id) pairs
     total_reads = 0
 
-    with open(decoded_path, "r", newline="") as f:
+    if not os.path.isfile(decoded_path):
+        raise SystemExit(f"[ERROR] decoded reads file not found: {decoded_path} "
+                         f"(check --run_root and --sample; expected 02_decoded/decoded_reads_<sample>.tsv)")
+    if not os.path.isfile(matrix_path):
+        raise SystemExit(f"[ERROR] raw counts matrix not found: {matrix_path}")
+    with open(matrix_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        matrix_cols = f.readline().rstrip("\r\n").split("\t")
+    for col in ("lib_id", "id", args.sample):
+        if col not in matrix_cols:
+            avail = [c for c in matrix_cols if c not in ("lib_id", "id")]
+            raise SystemExit(f"[ERROR] column '{col}' not in {matrix_path}; sample columns available: {avail}")
+
+    with open(decoded_path, "r", encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for i, row in enumerate(reader, 1):
             rid = row.get("id", "")

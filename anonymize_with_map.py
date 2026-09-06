@@ -11,7 +11,8 @@ Notes:
 - Only renames paths that exist.
 - Renames are performed in a safe order (longer names first, deepest paths first).
 - .git/, .venv/, __pycache__/ and the mapping file itself are never renamed.
-- Use --dry-run to preview the renames without touching the filesystem.
+- Use --dry-run to preview the renames without touching the filesystem (paths are printed as they
+  are at preview time, i.e. before any parent directory would have been renamed).
 """
 import argparse
 from pathlib import Path
@@ -104,8 +105,12 @@ def main():
         print("[INFO] No mappings to apply.")
         return
 
-    renamed, failed = rename_paths(Path(args.root), pairs, protected={map_path.resolve()}, dry_run=args.dry_run)
+    # never rename the mapping file itself, nor its JSON twin (both are gitignored local-only files)
+    protected = {map_path.resolve(), map_path.with_suffix(".json").resolve(), map_path.with_suffix(".tsv").resolve()}
+    renamed, failed = rename_paths(Path(args.root), pairs, protected=protected, dry_run=args.dry_run)
     verb = "would rename" if args.dry_run else "renamed"
+    if args.dry_run and renamed:
+        print("[DRY] note: child paths are shown under their current (not yet renamed) parent directories")
     print(f"[OK] {verb} {len(renamed)} path(s); {len(failed)} failure(s).")
     if failed:
         raise SystemExit(1)

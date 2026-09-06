@@ -22,7 +22,7 @@ def strip_lib_suffix(bb: str) -> str:
     if s in ("", "NA", "nan", "None"):
         return "NA"
     # Anchored token: strip only a trailing "_LIB<lib>" namespace suffix
-    return re.sub(r"_LIB[^_]+$", "", s)
+    return re.sub(r"_LIB[\w.-]+$", "", s)
 
 
 def _resolve_annot(run_root: Path, prefer_dir: str) -> Path:
@@ -56,15 +56,22 @@ def _guess_run_name(annot_path: Path) -> str:
 
 
 def load_params_from_annot(annot_path: Path) -> Dict:
+    """hit_params.json next to the annot (written UTF-8 by run_delegance_pipeline.py / 03_call_hits.py).
+    Missing or unreadable -> {} with a warning instead of aborting the whole export."""
     hp = annot_path.parent / "hit_params.json"
-    if hp.exists():
-        return json.loads(hp.read_text())
-    return {}
+    if not hp.exists():
+        return {}
+    try:
+        params = json.loads(hp.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[WARN] {hp} is not valid JSON ({e}); ignoring it")
+        return {}
+    return params if isinstance(params, dict) else {}
 
 
 def sample_columns_from_params(params: Dict) -> List[str]:
     cols = []
-    norm = params.get("normalized_columns", {})
+    norm = params.get("normalized_columns") or {}
     del2 = norm.get("del2")
     if del2:
         cols.append(del2)
@@ -110,13 +117,16 @@ def build_core(df: pd.DataFrame, sample_cols: List[str]) -> pd.DataFrame:
     out["BB3"] = bb3_raw.map(strip_lib_suffix)
     out["BB4"] = bb4_raw.map(strip_lib_suffix)
 
-    out["ID"] = (
-        out["LibID"].astype(str) + "_" +
+    bb_join = (
         out["BB1"].astype(str) + "_" +
         out["BB2"].astype(str) + "_" +
         out["BB3"].astype(str) + "_" +
         out["BB4"].astype(str)
     )
+    # A missing LibID (NaN / "NA") must not become a "nan_" prefix: fall back to the BB-only ID
+    lib_str = out["LibID"].fillna("").astype(str).str.strip()
+    lib_ok = ~lib_str.str.lower().isin(["", "na", "nan", "none", "<na>"])
+    out["ID"] = (lib_str + "_" + bb_join).where(lib_ok, bb_join)
     # Backward-compatible alias
     out["ID_display"] = out["ID"]
 
@@ -322,7 +332,8 @@ def main():
             df = pd.read_csv(annot_path, sep="\t", low_memory=False)
             if not sample_cols:
                 sample_cols = sample_columns_from_header(list(df.columns))
-                print(f"[WARN] hit_params.json not found next to {annot_path}; "
+                why = "not found" if not params else "has no normalized_columns"
+                print(f"[WARN] hit_params.json {why} next to {annot_path}; "
                       f"sample columns inferred from header ({len(sample_cols)} found)")
             summary_rows.append(build_summary(df, run_name))
 
@@ -347,18 +358,23 @@ def main():
             core_sheet = sheet_name(run_name, "_All_Core", used_sheets)
             top_sheet = sheet_name(run_name, f"_Top{top_n}", used_sheets)
             cons_sheet = sheet_name(run_name, "_Consensus", used_sheets)
-            param_sheet = sheet_name(run_name, "_Params", used_sheets)
 
             core.to_excel(writer, sheet_name=core_sheet, index=False)
             top.to_excel(writer, sheet_name=top_sheet, index=False)
             consensus.to_excel(writer, sheet_name=cons_sheet, index=False)
 
-            if params:
+            # _Params only when the orchestrator's hit_params.json carries "args"; the minimal file written by a
+            # stand-alone 03_call_hits.py run has no args, and an empty sheet would be misleading.
+            param_args = params.get("args") if isinstance(params, dict) else None
+            if isinstance(param_args, dict) and param_args:
+                param_sheet = sheet_name(run_name, "_Params", used_sheets)
                 flat = []
-                for k, v in params.get("args", {}).items():
+                for k, v in param_args.items():
                     flat.append((k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v))
                 p_df = pd.DataFrame(flat, columns=["param", "value"])
                 p_df.to_excel(writer, sheet_name=param_sheet, index=False)
+            elif params:
+                print(f"[INFO] hit_params.json next to {annot_path} has no 'args' (stand-alone 03 run); _Params sheet skipped")
 
         summary = pd.concat(summary_rows, ignore_index=True)
         summary.to_excel(writer, sheet_name="Summary", index=False)

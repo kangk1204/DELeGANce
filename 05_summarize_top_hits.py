@@ -56,6 +56,12 @@ def _pick_latest(paths: List[str]) -> Optional[str]:
 # output TSV column names (rep_ID_x, ...) stay unchanged.
 _KEY_COL_BASES = ["ID", "LIB_ID", "BB1", "BB2", "BB3", "BB4", "CP"]
 
+# Textual missing-value markers (03 writes NA as "NA"; pandas may yield "nan" after astype(str)); same set as 04.
+_MISSING_MARKERS = {"", "NA", "N/A", "nan", "None"}
+
+# Butina clustering is O(n^2) in time and memory (n(n-1)/2 distances): refuse very large top-N unless forced.
+CLUSTER_MAX_ROWS = 20000
+
 
 def pick_col(df_or_cols, primary: str, *fallbacks: str) -> Optional[str]:
     """Return the first present column among primary/fallbacks, e.g. pick_col(df, 'ID_x', 'ID')."""
@@ -96,6 +102,8 @@ def resolve_hybrid_path(base: str, preset: Optional[str]) -> str:
                 cand = os.path.join(norm, preset, "05_hybrid_annot.tsv")
                 if os.path.isfile(cand):
                     return cand
+                # An explicit preset must exist: do not silently fall back to another (newest) preset
+                raise FileNotFoundError(f"05_hybrid_annot.tsv not found for --preset {preset}: {cand}")
             paths = []
             for root, _, files in os.walk(norm):
                 if "05_hybrid_annot.tsv" in files:
@@ -114,7 +122,7 @@ def _strip_lib_suffix(val: str) -> str:
     if val is None:
         return "NA"
     s = str(val).strip()
-    if s in ("", "NA", "nan", "None"):
+    if s in _MISSING_MARKERS:
         return "NA"
     return re.sub(r"_LIB[\w\.-]+$", "", s)
 
@@ -240,24 +248,26 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
     return scores, rank_pct, cpm_mean, raw_sum
 
 
+def _no_cluster_frame(df_top: pd.DataFrame) -> pd.DataFrame:
+    """Same cluster columns as the clustered path (incl. cluster_medoid) so the output schema does not depend on RDKit."""
+    out = df_top.copy()
+    out["cluster_id"] = "NA"
+    out["cluster_size"] = 0
+    out["cluster_rep"] = 0
+    out["cluster_medoid"] = 0
+    return out
+
+
 def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
                       radius: int, nbits: int, mode: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     if not _HAS_RDKIT:
         print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
-        out = df_top.copy()
-        out["cluster_id"] = "NA"
-        out["cluster_size"] = 0
-        out["cluster_rep"] = 0
-        return out, None
+        return _no_cluster_frame(df_top), None
 
     smi_cols = [c for c in ["bb1_smiles", "bb2_smiles", "bb3_smiles", "bb4_smiles"] if c in df_top.columns]
     if not smi_cols:
         print("[WARN] No bb*_smiles columns available; clustering skipped.")
-        out = df_top.copy()
-        out["cluster_id"] = "NA"
-        out["cluster_size"] = 0
-        out["cluster_rep"] = 0
-        return out, None
+        return _no_cluster_frame(df_top), None
 
     fps = []
     valid_pos = []
@@ -288,11 +298,7 @@ def _cluster_top_hits(df_top: pd.DataFrame, score_col: str, sim_cutoff: float,
 
     if not valid_pos:
         print("[WARN] No valid fingerprints; clustering skipped.")
-        out = df_top.copy()
-        out["cluster_id"] = "NA"
-        out["cluster_size"] = 0
-        out["cluster_rep"] = 0
-        return out, None
+        return _no_cluster_frame(df_top), None
 
     valid_fps = [fps[i] for i in valid_pos]
     dists = []
@@ -584,6 +590,8 @@ def main() -> int:
                     help="Morgan fingerprint radius (default: 2)")
     ap.add_argument("--cluster-nbits", type=int, default=2048,
                     help="Morgan fingerprint nBits (default: 2048)")
+    ap.add_argument("--force-cluster", action="store_true",
+                    help=f"Run clustering even when top-N exceeds {CLUSTER_MAX_ROWS} rows (O(n^2) time/memory; default: skip with a warning)")
     ap.add_argument("--cluster-rep", choices=["score", "medoid"], default="score",
                     help="Representative selection for diverse lists (default: score)")
     ap.add_argument("--out-prefix", default=None, help="Output prefix (default: derived from input dir)")
@@ -624,11 +632,12 @@ def main() -> int:
         "LFC_NEG_R1_vs_DEL2", "LFC_NEG_R2_vs_DEL2",
         "q_DEL2", "q_BEAD", "q_BEAD_R2", "q_BoostPaired",
     ]
-    # *_CPM and their raw-count columns feed the cluster tie-breakers (README: score/percentile/CPM/reads);
-    # previously they were never loaded, so those tie-breakers were always 0.
+    # *_CPM and their raw-count columns feed the cluster tie-breakers (README: score/percentile/CPM/reads).
+    # They are only needed for the top-N rows, so they are read in a second pass restricted to those rows
+    # (the full table can have 10^6-10^7 rows x dozens of sample columns).
     cpm_cols_hdr = [c for c in header if c.endswith("_CPM")]
     raw_cols_hdr = [c[:-4] for c in cpm_cols_hdr if c[:-4] in header]
-    usecols = [c for c in want if c in header] + cpm_cols_hdr + raw_cols_hdr + [score_col]
+    usecols = [c for c in want if c in header] + [score_col]
     usecols = list(dict.fromkeys(usecols))
 
     df = pd.read_csv(hybrid, sep="\t", usecols=usecols, low_memory=False)
@@ -640,10 +649,16 @@ def main() -> int:
     if n_noscore:
         print(f"[WARN] {n_noscore} rows have no {score_col}; excluded from ranking.")
         df = df[df[score_col].notna()].copy()
+    if df.empty:
+        raise SystemExit(f"[ERROR] no rows with a numeric {score_col} in {hybrid} "
+                         f"({n_noscore} rows had no score); nothing to summarize.")
 
-    top_n = top_n_arg if top_n_arg > 0 else max(1, len(df))
+    top_n = top_n_arg if top_n_arg > 0 else len(df)
     # --top-n <=0 -> "topall_*" outputs (size-independent name); otherwise unchanged "top<N>_*"
     prefix = args.out_prefix or os.path.join(out_dir, "topall" if top_n_arg <= 0 else f"top{top_n}")
+    if args.out_prefix and not os.path.dirname(args.out_prefix):
+        # bare prefix (no directory part): write next to the hybrid table, like the default prefix
+        prefix = os.path.join(out_dir, args.out_prefix)
 
     def _rank_sort(frame: pd.DataFrame) -> pd.DataFrame:
         # Deterministic ordering: score desc, then HitScore_RS desc, then ID asc (stable mergesort).
@@ -661,12 +676,44 @@ def main() -> int:
         order = tmp.sort_values(keys, ascending=asc, kind="mergesort").index
         return frame.loc[order]
 
-    df_top = _rank_sort(df).head(top_n).copy().reset_index(drop=True)
+    df_top = _rank_sort(df).head(top_n).copy()
+    # Second pass: *_CPM / raw count columns for the selected rows only. df_top's index labels are the 0-based data-row
+    # positions of the first read (RangeIndex preserved through filtering/sorting), i.e. file line = position + 1.
+    extra_cols = [c for c in cpm_cols_hdr + raw_cols_hdr if c not in df_top.columns]
+    if extra_cols:
+        top_pos = set(int(i) for i in df_top.index)
+        # re-read the compound ID too, to verify row alignment (ID is a joined string, so its dtype cannot drift
+        # between the two reads the way numeric-looking BB/LIB columns could)
+        id_hdr = pick_col(header, "ID_x", "ID", "ID_y")
+        check_cols = [id_hdr] if id_hdr is not None and id_hdr in df_top.columns else []
+        extra = pd.read_csv(hybrid, sep="\t", usecols=list(dict.fromkeys(check_cols + extra_cols)), low_memory=False,
+                            skiprows=lambda i: i > 0 and (i - 1) not in top_pos)
+        aligned = len(extra) == len(top_pos)
+        if aligned:
+            extra.index = sorted(top_pos)          # rows come back in file order
+            extra = extra.loc[df_top.index]
+            for k in check_cols:
+                if not (extra[k].astype(str).values == df_top[k].astype(str).values).all():
+                    aligned = False
+                    break
+        if aligned:
+            df_top = pd.concat([df_top, extra[extra_cols]], axis=1)
+        else:
+            print(f"[WARN] CPM/raw re-read did not align with the top rows ({len(extra)} vs {len(top_pos)} rows); "
+                  f"CPM/reads tie-breakers disabled for this run.")
+    df_top = df_top.reset_index(drop=True)
     df_top["rank"] = np.arange(1, len(df_top) + 1, dtype=int)
 
     cluster_df = None
     cluster_summary = None
-    if int(args.cluster) == 1:
+    do_cluster = int(args.cluster) == 1
+    if do_cluster and len(df_top) > CLUSTER_MAX_ROWS and not args.force_cluster:
+        n = len(df_top)
+        print(f"[WARN] top_n={n} > {CLUSTER_MAX_ROWS}: Butina clustering is O(n^2) "
+              f"(~{n * (n - 1) // 2:,} pairwise distances); clustering skipped. "
+              f"Use --top-n <= {CLUSTER_MAX_ROWS} or --force-cluster to override.")
+        do_cluster = False
+    if do_cluster:
         df_top, cluster_df = _cluster_top_hits(
             df_top,
             score_col=score_col,
@@ -765,6 +812,8 @@ def main() -> int:
         unclustered = diverse[~has_cluster]
         diverse = pd.concat([clustered, unclustered], axis=0)
         diverse = diverse.drop(columns=["_is_rep"])
+    else:
+        print(f"[INFO] no cluster columns (cluster_id/{rep_col}); {os.path.basename(prefix)}_diverse.tsv equals the recommended list.")
     diverse = _rank_sort(diverse).head(rec_n).copy()
 
     # Save tables
@@ -776,6 +825,8 @@ def main() -> int:
     diverse.to_csv(diverse_path, sep="\t", index=False)
 
     html_path = args.html_out or f"{prefix}_interactive.html"
+    if not args.no_html and len(df_top) > CLUSTER_MAX_ROWS:
+        print(f"[WARN] interactive HTML embeds all {len(df_top)} top rows; the file will be very large (use --no-html or a smaller --top-n).")
     if not args.no_html:
         bb_smiles_map = build_bb_smiles_map(df_top)
         build_interactive_html(df_top, rec, diverse, freq_df, html_path, score_col, top_n, rec_n,
@@ -792,7 +843,7 @@ def main() -> int:
     if bb_cols and not freq_df.empty:
         print("[INFO] most frequent BB per column:")
         for col in bb_cols:
-            sub = freq_df[freq_df["bb_col"] == col].sort_values("count", ascending=False)
+            sub = freq_df[freq_df["bb_col"] == col]   # already sorted (count desc, bb asc) above
             if not sub.empty:
                 row = sub.iloc[0]
                 bb = row.get("bb", "NA")

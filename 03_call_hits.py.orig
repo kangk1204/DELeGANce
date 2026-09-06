@@ -32,7 +32,7 @@ except Exception:
 _HAS_TORCH = True
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")   # Best-effort: reduce TorchDynamo overhead on PyTorch 2.x
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1") # Best-effort: skip TorchDynamo compile path when supported
-if os.environ.get("DELEGANCE_DISABLE_TORCH", "").strip().lower() in ("1","true","yes","y"):
+if os.environ.get("DELEGANCE_DISABLE_TORCH", "").strip() in ("1","true","TRUE","yes"):
     _HAS_TORCH = False
 else:
     try:
@@ -1325,8 +1325,6 @@ def main():
     if int(getattr(args, 'hard_filter', 0)) == 1:
         _apply_neg_heavy(args)
         print("[PRESET] hard_filter=1 → neg_heavy preset applied")
-        if getattr(args, 'preset', 'auto') not in ('auto', 'neg_heavy'):
-            print(f"[WARN] --hard_filter 1 takes precedence: --preset {args.preset} is ignored")
     elif getattr(args, 'preset', 'auto') == 'neg_heavy':
         _apply_neg_heavy(args); print("[PRESET] preset=neg_heavy applied")
     elif getattr(args, 'preset', 'auto') == 'balanced':
@@ -1344,21 +1342,17 @@ def main():
     # kept. Add the parameter name to --auto_lock to keep a q gate anyway.
     _n_rep_r1 = len(args.r1_cols) if isinstance(args.r1_cols, (list, tuple)) else 0
     _n_rep_r2 = len(args.r2_cols) if isinstance(args.r2_cols, (list, tuple)) else 0
-    auto_lock = set(args.auto_lock or [])  # shared by the q-gate rule, pre-GLM and post-GLM tuning
+    _lock = set(args.auto_lock or [])
     for _qname, _nrep in (("max_q_bead", _n_rep_r1), ("max_q_bead_r2", _n_rep_r2), ("max_q_paired_boost", min(_n_rep_r1, _n_rep_r2))):
         _qv = getattr(args, _qname, None)
         if _nrep == 0:
             continue  # condition absent (e.g. no R2) -> gate is inert anyway
-        if _qv is not None and _nrep < 4 and _qname not in auto_lock:
+        if _qv is not None and _nrep < 4 and _qname not in _lock:
             print(f"[WARN] {_qname}={_qv} but only {_nrep} replicates: a q-value gate has no statistical power at n<4 "
                   f"→ disabling this gate (add '{_qname}' to --auto_lock to keep it)")
             setattr(args, _qname, None)
 
-    # The pseudocount epsk = pseudocount_k * max(1, DEL2_norm) is the denominator floor of every LFC and of the GLM
-    # delta_min clamp; k <= 0 would divide/log by zero on DEL2=0 rows (kept by the default prefilter).
-    if not (float(args.pseudocount_k) > 0.0):
-        raise SystemExit(f"[ERROR] --pseudocount_k must be > 0 (got {args.pseudocount_k})")
-
+    # Load & sum-by-ID
     # Load & sum-by-ID
     if not os.path.isfile(args.matrix_tsv):
         raise SystemExit(
@@ -1448,9 +1442,8 @@ def main():
     df_sum.to_csv(raw_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {raw_out}")
 
     # Parse ID → cycles, BB1..BB4, CP
-    # (list-based build instead of .apply(pd.Series): same columns/values, O(N) instead of one Series per row)
-    parsed = pd.DataFrame([parse_id_fields(v) for v in df_sum[id_col].tolist()],
-                          index=df_sum.index, columns=["cycles","BB1","BB2","BB3","BB4","CP"])
+    parsed = df_sum[id_col].apply(parse_id_fields).apply(pd.Series)
+    parsed.columns = ["cycles","BB1","BB2","BB3","BB4","CP"]
     for c in ["BB1","BB2","BB3","BB4","CP"]:
         parsed[c] = parsed[c].astype(str)
     df_sum = pd.concat([df_sum, parsed], axis=1)
@@ -1568,12 +1561,14 @@ def main():
         neg_groups.append([neg_r1_col])
     if neg_r2_col:
         neg_groups.append([neg_r2_col])
-    # auto_lock (built once above) applies to both phases and to the neg_strict override
-    # NEG overdispersion can only be learned from >=2 NEG replicate columns; with the single NEG_R1/NEG_R2 columns
-    # the tuner keeps fix_neg_poisson=1 / w_neg=0 (unless neg_strict).
-    _neg_tunable = any(len(g) >= 2 for g in neg_groups)
+    auto_lock = set(args.auto_lock or [])
     if int(args.auto_tune) == 1:
         pre = autotune_pre(df_sum, r1_cols, r2_cols, neg_groups, r3_cols, sfs)
+        # NEG 강화 모드
+        if args.neg_strict == 1 and neg_r1_col:
+            pre["w_neg"] = max(pre.get("w_neg", 0.0), 0.6)
+            pre["fix_neg_poisson"] = 0
+            print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
         for k in ["w_neg", "w_r1", "w_r2"]:
             if k not in auto_lock:
                 setattr(args, k, float(pre.get(k, getattr(args, k))))
@@ -1581,17 +1576,12 @@ def main():
             args.w_r3 = float(pre.get("w_r3", args.w_r3))
         if "fix_neg_poisson" not in auto_lock:
             args.fix_neg_poisson = int(pre.get("fix_neg_poisson", args.fix_neg_poisson))
-    # NEG 강화 모드 — applied identically for auto_tune=1/0; a locked parameter is never overridden
-    if args.neg_strict == 1 and neg_r1_col:
-        _ns = []
-        if "w_neg" not in auto_lock:
-            args.w_neg = max(float(args.w_neg), 0.6); _ns.append("w_neg>=0.6")
-        if "fix_neg_poisson" not in auto_lock:
-            args.fix_neg_poisson = 0; _ns.append("fix_neg_poisson=0")
-        print("[NEG] neg_strict=1 → " + (", ".join(_ns) if _ns else "no change (w_neg/fix_neg_poisson locked by --auto_lock)"))
-    _pre_label = "Pre-GLM tuned" if int(args.auto_tune) == 1 else "auto_tune=0 → using CLI values"
-    print(f"[AUTO] {_pre_label}: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}"
-          + ("" if (_neg_tunable or int(args.auto_tune) != 1) else " (NEG: single replicate column → w_neg/fix_neg_poisson not tuned)"))
+        print(f"[AUTO] Pre-GLM tuned: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
+    else:
+        if args.neg_strict == 1 and neg_r1_col:
+            args.w_neg = max(float(args.w_neg), 0.6); args.fix_neg_poisson = 0
+            print("[NEG] neg_strict=1 → w_neg>=0.6, fix_neg_poisson=0")
+        print(f"[AUTO] auto_tune=0 → using CLI values: w_neg={args.w_neg:.2f}, w_r1={args.w_r1:.2f}, w_r2={args.w_r2:.2f}" + (f", w_r3={args.w_r3:.2f}" if has_r3 else "") + f", fix_neg_poisson={args.fix_neg_poisson}")
     if not has_r2:
         args.w_r2 = 0.0
 
@@ -1662,8 +1652,7 @@ def main():
         tag_id = str(row[id_col]); del2_val = float(row[del2_col]); lib_val = row.get("LIB_ID", "")
         if i not in to_fit_set:
             # Placeholder; downstream will fall back to baseline LFCs
-            # alpha_for_penalty is left NaN here (written as empty in 03_glm_results.csv) and imputed for scoring below
-            glm_rows.append({"ID": tag_id, "LIB_ID": lib_val, "DEL2_sum": del2_val, "alpha_for_penalty": np.nan})
+            glm_rows.append({"ID": tag_id, "LIB_ID": lib_val, "DEL2_sum": del2_val, "alpha_for_penalty": 0.0})
             continue
         y_dict = {"R1": row[r1_cols].values.astype(float)}
         offs_dict = {"R1": offs_r1_map.get(lib_val, np.zeros_like(offs_r1_map.get(lib_val, np.array([]))))}
@@ -1698,16 +1687,6 @@ def main():
     df_glm = df_glm.merge(df_sum_id[keep_bl], on=["ID","LIB_ID"], how="left")
     glm_out = os.path.join(args.outdir, "03_glm_results.csv")
     df_glm.to_csv(glm_out, index=False); print(f"[OK] Wrote {glm_out}")
-    # glm_mode=top: rows that were not fitted carry no dispersion estimate. Penalising only the fitted top-K with
-    # lambda_alpha*alpha while the rest get 0 inverts ranks at the K boundary, so impute the fitted rows' median alpha
-    # (0.0 when nothing was fitted, i.e. glm_mode=skip -> identical to the previous behaviour).
-    if "alpha_for_penalty" in df_glm.columns:
-        _a = pd.to_numeric(df_glm["alpha_for_penalty"], errors="coerce")
-        if _a.isna().any():
-            _a_fill = float(np.nanmedian(_a.values)) if _a.notna().any() else 0.0
-            df_glm["alpha_for_penalty"] = _a.fillna(_a_fill)
-            if _a.notna().any():
-                print(f"[GLM] alpha_for_penalty imputed for {int(_a.isna().sum()):,} non-fitted rows (median of fitted = {_a_fill:.4f})")
 
     # Choose LFC pref vs baseline
     # NOTE: df_sum_id already has baseline columns; df_glm may also carry them (merged above).
@@ -1824,7 +1803,7 @@ def main():
             rho_syn = 0.15
         else:
             q05 = np.nanquantile(syn, 0.05); q95 = np.nanquantile(syn, 0.95)
-            denom = max(abs(q95), abs(q05), 1e-6); rho_syn = float(np.clip(float(syn_target_amp) / denom, 0.05, 0.35))  # --auto_syn_target (default 0.20)
+            denom = max(abs(q95), abs(q05), 1e-6); rho_syn = float(np.clip(0.20 / denom, 0.05, 0.35))
         out.update({"rho_syn": rho_syn})
         return out
     if int(args.auto_tune) == 1:
@@ -1865,7 +1844,7 @@ def main():
             json.dump(_used, _fh, indent=1, ensure_ascii=False, default=str)
         print(f"[OK] Wrote {_auto_json}")
     except Exception as _e:
-        warnings.warn(f"could not write {_auto_json}: {_e}", stacklevel=2)
+        warnings.warn(f"could not write {_auto_json}: {_e}", stacklevel=1)
 
     # E/W/Synthon/Penalty/HitScore_GLM
     e1 = np.array([winsorize(x, 0.0, args.c1) for x in pd.to_numeric(m["LFC_R1_vs_DEL2_used"], errors="coerce").fillna(0.0)], dtype=float)
@@ -1967,7 +1946,7 @@ def main():
         if args.max_q_paired_boost is not None and np.isfinite(r["q_BoostPaired"]) and (r["q_BoostPaired"] > args.max_q_paired_boost): fs.append("R2Boost_paired_q")
         if args.min_zscore_avgR1 is not None and np.isfinite(r["zscore_avgR1"]) and (r["zscore_avgR1"] < args.min_zscore_avgR1): fs.append("zscore")
         return fs
-    df_rs["fail_reasons"] = df_rs.apply(lambda r: ";".join(fail_reason_rs(r)), axis=1)  # ";".join([]) == "" (one call per row)
+    df_rs["fail_reasons"] = df_rs.apply(lambda r: ";".join(fail_reason_rs(r)) if len(fail_reason_rs(r))>0 else "", axis=1)
     df_rs["pass_filters"] = df_rs["fail_reasons"].astype(str).str.strip().eq("")
     rs_out = os.path.join(args.outdir, "04_read_scaler.tsv")
     df_rs.to_csv(rs_out, sep="\t", index=False, na_rep="NA"); print(f"[OK] Wrote {rs_out}")
@@ -2002,10 +1981,8 @@ def main():
                 "bb4_id","bb4_smiles","bb4_tag_uid","bb4_tag_seq",
                 "BB_SMILES_CONCAT"]
     ann_df = pd.DataFrame(index=tmp.index, columns=ann_cols, dtype="object")
-    # tmp.index is the RangeIndex of df_sum_id (positional == label), so a plain list lookup replaces DataFrame.iloc per row
-    _libs_ann = df_sum_id["LIB_ID"].tolist() if "LIB_ID" in df_sum_id.columns else [""] * len(df_sum_id)
     for idx, r in tmp.iterrows():
-        lib = _libs_ann[idx]
+        lib = df_sum_id.iloc[idx]["LIB_ID"] if "LIB_ID" in df_sum_id.columns else ""
         sm_list = []
         for i in range(1,5):
             bb = str(r[f"bb{i}_id"])

@@ -52,6 +52,16 @@ if _HAS_BOKEH and not (_HAS_PANEL or _HAS_TABPANEL):
     _HAS_BOKEH = False
     _BOKEH_IMPORT_ERR = "neither bokeh.models.Panel nor bokeh.models.TabPanel is importable"
 
+# bokeh 3.x renders every component in its own shadow root, so a <style> block
+# inside a Div does not reach DataTable cells. InlineStyleSheet (attached per
+# component) is the supported way to style them; fall back silently on 2.x.
+# (Same approach as 06_compare_top_hits.py.)
+_InlineStyleSheet = None
+try:
+    from bokeh.models import InlineStyleSheet as _InlineStyleSheet  # type: ignore
+except Exception:
+    _InlineStyleSheet = None
+
 _HAS_RDKIT = True
 _RDKIT_IMPORT_ERR = ""
 _HAS_FPGEN = False
@@ -76,9 +86,7 @@ _TRANSPARENT_PNG = (
 )
 
 
-def _style_block() -> str:
-    return """
-<style>
+_CSS_TEXT = """
 .summary-cards { display:flex; flex-wrap:wrap; gap:12px; margin:6px 0 10px 0; }
 .summary-card { background:#f7f7fb; border:1px solid #dedee6; border-radius:8px; padding:8px 12px; min-width:160px; }
 .summary-label { font-size:11px; color:#666; letter-spacing:0.2px; text-transform:uppercase; }
@@ -92,8 +100,20 @@ def _style_block() -> str:
 .struct-thumb .struct-popup { display:none; position:absolute; z-index:10; left:70px; top:-10px; background:#fff; padding:6px; border:1px solid #ddd; box-shadow:0 2px 6px rgba(0,0,0,0.2); }
 .struct-thumb:hover .struct-popup { display:block; }
 .group-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; color:#fff; }
-</style>
 """
+
+
+def _stylesheets() -> dict:
+    """kwargs to attach the shared CSS to a bokeh component (fresh model per call:
+    a bokeh model may belong to only one Document)."""
+    if _InlineStyleSheet is None:
+        return {}
+    return {"stylesheets": [_InlineStyleSheet(css=_CSS_TEXT)]}
+
+
+def _style_block() -> str:
+    # Kept for bokeh 2.x (no shadow DOM); on 3.x the same CSS is attached via _stylesheets().
+    return "\n<style>" + _CSS_TEXT + "</style>\n"
 
 
 def _summary_cards(cards: List[Tuple[str, str]]) -> str:
@@ -246,6 +266,25 @@ def _passthrough_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 def _sanitize_label(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "run"
+
+
+def _default_label(p: str) -> str:
+    """Default run label from a run path.
+
+    Directory input -> its basename (unchanged). A 05_hybrid_annot.tsv file path would give
+    the label '05_hybrid_annot.tsv' (and '<...>_2' for the second run), so for file inputs the
+    run root name is used when the layout is <run>/03_normalized/<preset>/05_hybrid_annot.tsv;
+    otherwise the parent directory name.
+    """
+    norm = os.path.normpath(p)
+    if not os.path.isfile(norm):
+        return os.path.basename(norm)
+    preset_dir = os.path.dirname(norm)
+    parent = os.path.dirname(preset_dir)
+    if os.path.basename(parent) == "03_normalized":
+        run_root = os.path.dirname(parent)
+        return os.path.basename(run_root) or os.path.basename(preset_dir)
+    return os.path.basename(preset_dir) or os.path.basename(norm)
 
 
 def _infer_score_col(paths: List[str], preset: Optional[str], override: Optional[str]) -> str:
@@ -558,7 +597,8 @@ def _bbavg_similarity(fps_a: List[Optional[object]], fps_b: List[Optional[object
     return float(sum(sims) / len(sims))
 
 
-def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _tie_break_arrays(df: pd.DataFrame, primary_col: str,
+                      exclude_prefixes: Optional[List[str]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     scores = pd.to_numeric(df.get(primary_col, np.nan), errors="coerce").fillna(float("-inf")).to_numpy()
     if "rank_pct" in df.columns:
         rank_pct = pd.to_numeric(df["rank_pct"], errors="coerce").fillna(0.0).to_numpy()
@@ -567,7 +607,10 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
     else:
         rank_pct = np.zeros(len(df), dtype=float)
 
-    cpm_cols = [c for c in df.columns if c.endswith("_CPM")]
+    # Only the coalesced (unprefixed) sample columns: the <label>_<sample>_CPM copies would
+    # double-count the same values.
+    pref = tuple(exclude_prefixes or [])
+    cpm_cols = [c for c in df.columns if c.endswith("_CPM") and not (pref and c.startswith(pref))]
     raw_cols = [c[:-4] for c in cpm_cols if c[:-4] in df.columns]
     if cpm_cols:
         cpm_mean = (
@@ -585,7 +628,8 @@ def _tie_break_arrays(df: pd.DataFrame, primary_col: str) -> Tuple[np.ndarray, n
 
 
 def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
-                        radius: int, nbits: int, mode: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+                        radius: int, nbits: int, mode: str,
+                        sample_prefixes: Optional[List[str]] = None) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     if not _HAS_RDKIT:
         print(f"[WARN] RDKit not available ({_RDKIT_IMPORT_ERR}); clustering skipped.")
         out = df.copy()
@@ -676,13 +720,18 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
     cutoff = max(0.0, min(1.0, 1.0 - float(sim_cutoff)))
     clusters = Butina.ClusterData(dists, len(valid_fps), cutoff, isDistData=True)
 
+    def _pair_dist(i: int, j: int) -> float:
+        # dists is in Butina lower-triangle order: (1,0), (2,0), (2,1), (3,0), ...
+        a, b = (i, j) if i > j else (j, i)
+        return dists[a * (a - 1) // 2 + b]
+
     out = df.reset_index(drop=True).copy()
     out["cluster_id"] = "NA"
     out["cluster_size"] = 0
     out["cluster_rep"] = 0
     out["cluster_medoid"] = 0
 
-    scores, rank_pct, cpm_mean, raw_sum = _tie_break_arrays(out, rep_score_col)
+    scores, rank_pct, cpm_mean, raw_sum = _tie_break_arrays(out, rep_score_col, sample_prefixes)
     id_col_name = _id_col(out)
     cluster_rows = []
     for cid, members in enumerate(clusters, start=1):
@@ -701,17 +750,11 @@ def _cluster_candidates(df: pd.DataFrame, rep_score_col: str, sim_cutoff: float,
         else:
             medoid_scores: Dict[int, float] = {}
             for i in members:
-                if mode == "compound_or":
-                    others = [valid_fps[j] for j in members if j != i]
-                    sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], others) if others else []
-                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
-                else:
-                    sims = []
-                    for j in members:
-                        if j == i:
-                            continue
-                        sims.append(_bbavg_similarity(valid_fps[i], valid_fps[j]))
-                    medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
+                # Reuse the pairwise distances already computed for Butina (same definition as
+                # _bbavg_similarity / Tanimoto) instead of recomputing O(m^2) similarities per
+                # cluster in Python.
+                sims = [1.0 - _pair_dist(i, j) for j in members if j != i]
+                medoid_scores[i] = float(np.mean(sims)) if sims else 1.0
             medoid_valid = max(
                 members,
                 key=lambda i: (
@@ -807,10 +850,62 @@ def _img_formatter(width: int, zoom: int) -> HTMLTemplateFormatter:
     return HTMLTemplateFormatter(template=template)
 
 
+# Shared client-side sort used by the search/reset/prev/next/download callbacks.
+_SORT_JS = """
+const sortCol = sort_col.value || "__none__";
+const sortDir = sort_dir.value || "desc";
+if (sortCol !== "__none__" && out[sortCol] !== undefined) {
+  const arr = out[sortCol];
+  const idx = Array.from({length: arr.length}, (_, i) => i);
+  const toNumber = (v) => {
+    if (v === null || v === undefined || v === '' || v === '-') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  // Group-first ordering: within-group rank columns (group_rank, ...) are only meaningful
+  // per group, so tables that mix groups (e.g. the Final hits tab) are ordered by group
+  // (in the order the groups first appear in the full table = Python order) and then by
+  // the selected column. Single-group tables are unaffected.
+  const groupFirst = (group_sort_col && group_first_cols.indexOf(sortCol) >= 0 && out[group_sort_col] !== undefined);
+  const groupOrder = {};
+  if (groupFirst) {
+    const gcol = data[group_sort_col];
+    for (let i = 0; i < gcol.length; i++) {
+      const g = String(gcol[i]);
+      if (!(g in groupOrder)) { groupOrder[g] = Object.keys(groupOrder).length; }
+    }
+  }
+  const garr = groupFirst ? out[group_sort_col] : null;
+  idx.sort((a, b) => {
+    if (groupFirst) {
+      const ga = groupOrder[String(garr[a])] ?? 0;
+      const gb = groupOrder[String(garr[b])] ?? 0;
+      if (ga !== gb) return ga - gb;
+    }
+    const va = arr[a];
+    const vb = arr[b];
+    const na = toNumber(va);
+    const nb = toNumber(vb);
+    let cmp = 0;
+    if (na !== null && nb !== null) {
+      cmp = na - nb;
+    } else {
+      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  const sorted = {};
+  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
+  out = sorted;
+}
+"""
+
+
 def _make_table_controls(source: ColumnDataSource, full: ColumnDataSource,
                          filename: str, group_col: Optional[str],
                          page_state: ColumnDataSource, page_size: int,
-                         search_cols: Optional[List[str]] = None) -> row:
+                         search_cols: Optional[List[str]] = None,
+                         group_sort_col: Optional[str] = None) -> row:
     total = 0
     if full.data:
         first_key = next(iter(full.data.keys()))
@@ -882,33 +977,7 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
-const sortCol = sort_col.value || "__none__";
-const sortDir = sort_dir.value || "desc";
-if (sortCol !== "__none__" && out[sortCol] !== undefined) {
-  const arr = out[sortCol];
-  const idx = Array.from({length: arr.length}, (_, i) => i);
-  const toNumber = (v) => {
-    if (v === null || v === undefined || v === '' || v === '-') return null;
-    const n = parseFloat(v);
-    return isNaN(n) ? null : n;
-  };
-  idx.sort((a, b) => {
-    const va = arr[a];
-    const vb = arr[b];
-    const na = toNumber(va);
-    const nb = toNumber(vb);
-    let cmp = 0;
-    if (na !== null && nb !== null) {
-      cmp = na - nb;
-    } else {
-      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
-  const sorted = {};
-  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
-  out = sorted;
-}
+""" + _SORT_JS + """
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -930,6 +999,8 @@ count_div.text = `<span class='table-count'>Showing ${shown} of ${total} (page $
         group=group_select, group_col=group_col or "", page_state=page_state, page_size=page_size,
         sort_col=sort_select, sort_dir=sort_dir,
         search_cols=list(search_cols), filename=filename,
+        group_sort_col=(group_sort_col if group_sort_col and group_sort_col in sort_cols else ""),
+        group_first_cols=["group_rank", "final_group_rank", "group_rank_score"],
     )
     callback = CustomJS(args=args, code=filter_js)
     search.js_on_change("value", callback)
@@ -945,33 +1016,7 @@ if (group !== null) { group.value = group.options; }
 const cols = Object.keys(data);
 let out = {};
 for (const c of cols) { out[c] = data[c].slice(); }
-const sortCol = sort_col.value || "__none__";
-const sortDir = sort_dir.value || "desc";
-if (sortCol !== "__none__" && out[sortCol] !== undefined) {
-  const arr = out[sortCol];
-  const idx = Array.from({length: arr.length}, (_, i) => i);
-  const toNumber = (v) => {
-    if (v === null || v === undefined || v === '' || v === '-') return null;
-    const n = parseFloat(v);
-    return isNaN(n) ? null : n;
-  };
-  idx.sort((a, b) => {
-    const va = arr[a];
-    const vb = arr[b];
-    const na = toNumber(va);
-    const nb = toNumber(vb);
-    let cmp = 0;
-    if (na !== null && nb !== null) {
-      cmp = na - nb;
-    } else {
-      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
-  const sorted = {};
-  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
-  out = sorted;
-}
+""" + _SORT_JS + """
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -1020,33 +1065,7 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
-const sortCol = sort_col.value || "__none__";
-const sortDir = sort_dir.value || "desc";
-if (sortCol !== "__none__" && out[sortCol] !== undefined) {
-  const arr = out[sortCol];
-  const idx = Array.from({length: arr.length}, (_, i) => i);
-  const toNumber = (v) => {
-    if (v === null || v === undefined || v === '' || v === '-') return null;
-    const n = parseFloat(v);
-    return isNaN(n) ? null : n;
-  };
-  idx.sort((a, b) => {
-    const va = arr[a];
-    const vb = arr[b];
-    const na = toNumber(va);
-    const nb = toNumber(vb);
-    let cmp = 0;
-    if (na !== null && nb !== null) {
-      cmp = na - nb;
-    } else {
-      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
-  const sorted = {};
-  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
-  out = sorted;
-}
+""" + _SORT_JS + """
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -1098,33 +1117,7 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
-const sortCol = sort_col.value || "__none__";
-const sortDir = sort_dir.value || "desc";
-if (sortCol !== "__none__" && out[sortCol] !== undefined) {
-  const arr = out[sortCol];
-  const idx = Array.from({length: arr.length}, (_, i) => i);
-  const toNumber = (v) => {
-    if (v === null || v === undefined || v === '' || v === '-') return null;
-    const n = parseFloat(v);
-    return isNaN(n) ? null : n;
-  };
-  idx.sort((a, b) => {
-    const va = arr[a];
-    const vb = arr[b];
-    const na = toNumber(va);
-    const nb = toNumber(vb);
-    let cmp = 0;
-    if (na !== null && nb !== null) {
-      cmp = na - nb;
-    } else {
-      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
-  const sorted = {};
-  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
-  out = sorted;
-}
+""" + _SORT_JS + """
 const total = cols.length ? out[cols[0]].length : 0;
 const pageSize = Math.max(1, page_size);
 const pages = total > 0 ? Math.ceil(total / pageSize) : 0;
@@ -1187,33 +1180,7 @@ for (let i = 0; i < n; i++) {
     for (const c of cols) { out[c].push(data[c][i]); }
   }
 }
-const sortCol = sort_col.value || "__none__";
-const sortDir = sort_dir.value || "desc";
-if (sortCol !== "__none__" && out[sortCol] !== undefined) {
-  const arr = out[sortCol];
-  const idx = Array.from({length: arr.length}, (_, i) => i);
-  const toNumber = (v) => {
-    if (v === null || v === undefined || v === '' || v === '-') return null;
-    const n = parseFloat(v);
-    return isNaN(n) ? null : n;
-  };
-  idx.sort((a, b) => {
-    const va = arr[a];
-    const vb = arr[b];
-    const na = toNumber(va);
-    const nb = toNumber(vb);
-    let cmp = 0;
-    if (na !== null && nb !== null) {
-      cmp = na - nb;
-    } else {
-      cmp = String(va ?? '').localeCompare(String(vb ?? ''));
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
-  const sorted = {};
-  for (const c of cols) { sorted[c] = idx.map(i => out[c][i]); }
-  out = sorted;
-}
+""" + _SORT_JS + """
 const nout = cols.length ? out[cols[0]].length : 0;
 let csv = cols.join(',') + '\\n';
 for (let i = 0; i < nout; i++) {
@@ -1237,7 +1204,7 @@ URL.revokeObjectURL(url);
     if group_select is not None:
         controls.append(group_select)
     controls.extend([prev_btn, next_btn, reset_btn, download_btn, count_div])
-    return row(*controls, css_classes=["table-controls"])
+    return row(*controls, css_classes=["table-controls"], **_stylesheets())
 
 def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
                 with_structure: bool, sample_cols: List[str], page_size: int,
@@ -1343,16 +1310,20 @@ def _make_table(df: pd.DataFrame, with_images: bool, max_rows: int,
         width=table_width,
         index_position=None,
         frozen_columns=frozen_columns,
+        **_stylesheets(),
     )
     group_col = "group" if "group" in table_df.columns else None
     search_cols = [c for c in table_df.columns
                    if not (c.endswith("_img") or c in ("structure_html", "group_badge"))]
+    # Tables that mix groups (Final hits tab) are re-sorted group-first by the JS callbacks so
+    # that paging/search keeps the group -> group_rank order of the first page.
+    group_sort_col = "group_code" if "group_code" in table_df.columns else None
     controls = _make_table_controls(source, full_source, download_name, group_col, page_state, page_size,
-                                    search_cols=search_cols)
+                                    search_cols=search_cols, group_sort_col=group_sort_col)
     table_layout = column(controls, table, sizing_mode="stretch_width")
     struct_div = None
     if with_structure and "structure_html" in table_df.columns:
-        struct_div = Div(text="<i>Click a row to view structure</i>")
+        struct_div = Div(text="<i>Click a row to view structure</i>", **_stylesheets())
         callback = CustomJS(args=dict(source=source, div=struct_div), code="""
 const inds = source.selected.indices;
 if (inds.length === 0) {
@@ -1463,7 +1434,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
         print(f"[WARN] bokeh is not available ({_BOKEH_IMPORT_ERR}); skipping interactive HTML output.")
         return
 
-    items = [Div(text=_style_block())]
+    items = [Div(text=_style_block(), **_stylesheets())]
     summary = group_tables.get("summary", {})
     group_defs = summary.get("group_defs", {})
     active_code = group_codes.get("active", "Active-specific")
@@ -1501,7 +1472,7 @@ def build_html(df_all: pd.DataFrame, group_tables: Dict[str, Dict[str, pd.DataFr
         "<li>Cutoffs use rank_pct percentiles per run (e.g., 99 = top 1% within that run; higher is better).</li>",
         "</ul>",
     ]
-    items.append(Div(text="\n".join(summary_lines)))
+    items.append(Div(text="\n".join(summary_lines), **_stylesheets()))
 
     df_plot = df_all.copy()
     df_plot["group_code"] = df_plot.get("group_code", df_plot.get("group", "Other"))
@@ -1705,7 +1676,8 @@ def main() -> int:
     if labels and len(labels) != len(run_paths):
         raise SystemExit("[ERROR] --labels must match number of runs (active/inactive/(both))")
     if not labels:
-        labels = [os.path.basename(os.path.normpath(p)) or f"run{i+1}" for i, p in enumerate(run_paths)]
+        labels = [_default_label(p) or f"run{i+1}" for i, p in enumerate(run_paths)]
+        print(f"[INFO] run labels (from paths): {labels}; pass --labels to set explicit labels")
     labels = [_sanitize_label(lab) for lab in labels]
     # Duplicate labels (e.g. both runs given as .../05_hybrid_annot.tsv, or same preset dir name)
     # would produce identical column prefixes and silently break the sample-column merge.
@@ -1839,9 +1811,17 @@ def main() -> int:
     maps_inactive = _rank_maps(df_inactive, score_col)
     maps_both = _rank_maps(df_both, score_col) if df_both is not None else None
 
-    df_active_best = df_active.sort_values(score_col, ascending=False).drop_duplicates("compound_key")
-    df_inactive_best = df_inactive.sort_values(score_col, ascending=False).drop_duplicates("compound_key")
-    df_both_best = df_both.sort_values(score_col, ascending=False).drop_duplicates("compound_key") if df_both is not None else None
+    def _best_rows(df: pd.DataFrame) -> pd.DataFrame:
+        # Stable sort + ID tie-breaker so that, when the same compound_key occurs in several
+        # libraries with tied scores, the retained row (and its sample counts) is deterministic.
+        idc = _id_col(df)
+        by = [score_col] + ([idc] if idc else [])
+        asc = [False] + ([True] if idc else [])
+        return df.sort_values(by, ascending=asc, kind="mergesort").drop_duplicates("compound_key")
+
+    df_active_best = _best_rows(df_active)
+    df_inactive_best = _best_rows(df_inactive)
+    df_both_best = _best_rows(df_both) if df_both is not None else None
 
     def _sample_block(df_best: pd.DataFrame, cols: List[str], rename: Dict[str, str]) -> Optional[pd.DataFrame]:
         if df_best is None or df_best.empty or not cols:
@@ -1885,7 +1865,7 @@ def main() -> int:
         if col in df_base.columns:
             df_base[col] = pd.to_numeric(df_base[col], errors="coerce")
     prefixes = [f"{active_label}_", f"{inactive_label}_"]
-    if both_label and both_label not in (active_label, inactive_label):
+    if args.both_run and both_label and both_label not in (active_label, inactive_label):
         prefixes.append(f"{both_label}_")
     df_base = _coalesce_unprefixed_samples(df_base, base_sample_cols, prefixes)
     display_sample_cols = []
@@ -1905,7 +1885,6 @@ def main() -> int:
         out = []
         for item in items or []:
             for tok in str(item).replace(",", " ").split():
-                tok = tok.strip()
                 if tok:
                     out.append(tok)
         return out
@@ -1968,6 +1947,8 @@ def main() -> int:
     df_base["inactive_rank_pct"] = df_base["compound_key"].map(maps_inactive["rank_pct_map"]).fillna(0.0)
     # Presence flags: a compound absent from a run gets rank_pct 0 above (kept for backward
     # compatibility); these flags make "absent" distinguishable from "ranked at the bottom".
+    # "present" = the compound has a finite score in that run (i.e. it was ranked there);
+    # rows of the run whose score is NaN are flagged 0 like compounds missing from the file.
     df_base["active_present"] = df_base["compound_key"].isin(maps_active["rank_map"]).astype(int)
     df_base["inactive_present"] = df_base["compound_key"].isin(maps_inactive["rank_map"]).astype(int)
 
@@ -2051,10 +2032,18 @@ def main() -> int:
             radius=int(args.cluster_radius),
             nbits=int(args.cluster_nbits),
             mode=str(args.cluster_mode),
+            sample_prefixes=prefixes,
         )
+        if cluster_df is None:
+            print("[INFO] clustering unavailable (see warning above); *_diverse.tsv will be empty "
+                  "and final hits fall back to the full group lists.")
     else:
         cluster_df = None
-        print("[INFO] clustering disabled (--cluster 0); *_diverse.tsv will equal the full group lists.")
+        print("[INFO] clustering disabled (--cluster 0); *_diverse.tsv will be empty "
+              "and final hits fall back to the full group lists.")
+    # Diverse lists are cluster representatives; when clustering did not run (disabled or
+    # RDKit/SMILES unavailable) they are empty in both cases (same rule as 06_compare_top_hits).
+    clustering_on = cluster_df is not None
 
     group_order = [group_active, group_inactive, group_both, group_other]
     df_base["group_code"] = pd.Categorical(df_base["group_code"], categories=group_order, ordered=True)
@@ -2167,9 +2156,10 @@ def main() -> int:
         }
     for group, tag in group_map.items():
         df_group = df_base[df_base["group_code"] == group].copy()
-        df_div = df_group.copy()
-        if rep_col in df_div.columns:
-            df_div = df_div[_to_int_series(df_div[rep_col]) == 1].copy()
+        if clustering_on and rep_col in df_group.columns:
+            df_div = df_group[_to_int_series(df_group[rep_col]) == 1].copy()
+        else:
+            df_div = df_group.head(0).copy()
         df_group_path = f"{prefix}_{tag}.tsv"
         df_div_path = f"{prefix}_{tag}_diverse.tsv"
         df_group.to_csv(df_group_path, sep="\t", index=False)
@@ -2200,7 +2190,7 @@ def main() -> int:
         "n_inactive": len(groups.get(group_inactive, {}).get("all", [])),
         "n_both": len(groups.get(group_both, {}).get("all", [])),
         "n_other": len(df_other),
-        "n_diverse": diverse_total,
+        "n_diverse": diverse_total if clustering_on else "n/a (clustering disabled)",
         "n_active_diverse": len(groups.get(group_active, {}).get("diverse", [])),
         "n_inactive_diverse": len(groups.get(group_inactive, {}).get("diverse", [])),
         "n_both_diverse": len(groups.get(group_both, {}).get("diverse", [])),

@@ -7,12 +7,16 @@ from typing import List
 import pandas as pd
 
 # Anchored: strip only a trailing "_LIB<lib>" namespace token (same rule as 06/07 _strip_lib_suffix)
-LIB_SUFFIX_RE = re.compile(r"_LIB[^_]+$")
+LIB_SUFFIX_RE = re.compile(r"_LIB[\w.-]+$")
 
 
-# Missing-BB placeholder inside compound_key. NOTE: the reviewed 06/07 sources emit "NA" here;
-# the approved fix plan specifies "" — keep this constant in sync with 06/07 when their patch lands.
-KEY_NA = "NA"   # must match 06_compare_top_hits.py / 07_tiered_report.py (_make_compound_key uses fillna("NA"))
+# Missing-BB placeholder inside compound_key: "NA", exactly as 06_compare_top_hits.py / 07_tiered_report.py
+# (_make_compound_key uses fillna("NA") + _strip_lib_suffix) so merged_all.tsv can be joined with their outputs.
+KEY_NA = "NA"
+
+# Key columns are normalised to the 03 "<name>_x" contract right after loading; plain names (ID, BB1 ...)
+# are accepted too (03 may drop the _x suffix in a later release).
+KEY_COL_BASES = ("ID", "LIB_ID", "CP", "BB1", "BB2", "BB3", "BB4")
 
 
 def strip_lib_suffix(value) -> str:
@@ -54,9 +58,28 @@ def sample_cols_from_header(header: List[str]) -> List[str]:
     return raw_cols + cpm_cols
 
 
+def normalize_key_columns(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Rename plain key columns (ID, LIB_ID, CP, BB1..BB4) to <name>_x when the _x form is absent, so the
+    rest of the script (and 06/07 outputs) see one contract. Aborts when no BB column exists at all:
+    every compound_key would collapse to NA|NA|NA|NA and the merge would silently shrink to one row."""
+    ren = {}
+    for base in KEY_COL_BASES:
+        if f"{base}_x" not in df.columns:
+            if base in df.columns:
+                ren[base] = f"{base}_x"
+            elif f"{base}_y" in df.columns and base.startswith("BB"):
+                ren[f"{base}_y"] = f"{base}_x"
+    if ren:
+        print(f"[WARN] {label}: key columns without _x suffix normalised: {ren}")
+        df = df.rename(columns=ren)
+    if not any(f"BB{i}_x" in df.columns for i in (1, 2, 3, 4)):
+        raise SystemExit(f"[ERROR] {label}: no BB1..BB4 column (BB1_x/BB1/BB1_y) found; cannot build compound_key")
+    return df
+
+
 def add_compound_key(df: pd.DataFrame) -> pd.DataFrame:
-    """compound_key = BB1|BB2|BB3|BB4 with the LIB namespace suffix removed and NaN -> "" —
-    the same definition as 06_compare_top_hits.py / 07_tiered_report.py and the README, so
+    """compound_key = BB1|BB2|BB3|BB4 with the LIB namespace suffix removed and NaN -> "NA" —
+    the same definition as 06_compare_top_hits.py / 07_tiered_report.py (and the README), so
     merged_all.tsv can be joined with those outputs. (Previously CP_x was included, the LIB
     suffix was kept and NaN became "nan", which made the key incompatible.)"""
     out = df.copy()
@@ -79,6 +102,7 @@ def reorder_cols(df: pd.DataFrame) -> pd.DataFrame:
 def load_full(run_root: str, preset: str | None) -> tuple[pd.DataFrame, List[str]]:
     path = resolve_hybrid_path(run_root, preset)
     df = pd.read_csv(path, sep="\t", low_memory=False)
+    df = normalize_key_columns(df, str(path))
     df = add_compound_key(df)
     df = reorder_cols(df)
     sample_cols = sample_cols_from_header(df.columns.tolist())
@@ -109,6 +133,8 @@ def main() -> int:
     ap.add_argument("--inactive-label", default="inactive")
     args = ap.parse_args()
 
+    if args.active_label == args.inactive_label:
+        raise SystemExit(f"[ERROR] --active-label and --inactive-label must differ (both {args.active_label!r})")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,8 +144,8 @@ def main() -> int:
     # Save full per-run TSVs
     active_path = out_dir / f"{args.active_label}_all.tsv"
     inactive_path = out_dir / f"{args.inactive_label}_all.tsv"
-    df_active.to_csv(active_path, sep="\t", index=False)
-    df_inactive.to_csv(inactive_path, sep="\t", index=False)
+    df_active.to_csv(active_path, sep="\t", index=False, na_rep="NA")
+    df_inactive.to_csv(inactive_path, sep="\t", index=False, na_rep="NA")
 
     # Merge by compound_key
     df_a = df_active.drop_duplicates("compound_key")
@@ -138,7 +164,7 @@ def main() -> int:
 
     merged = reorder_cols(merged)
     merged_path = out_dir / "merged_all.tsv"
-    merged.to_csv(merged_path, sep="\t", index=False)
+    merged.to_csv(merged_path, sep="\t", index=False, na_rep="NA")
 
     print("[INFO] wrote:")
     print(f"  {active_path}")

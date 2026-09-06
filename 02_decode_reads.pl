@@ -159,6 +159,7 @@ my %OPT = (
     help               => 0,
 );
 
+my $NO_CLI_ARGS = (@ARGV == 0) ? 1 : 0;   # bare invocation (no options at all) -> usage
 GetOptions(
     'target-protein|p=s'     => \$OPT{target_protein},
     'fastp-outdir-name|n=s'  => \$OPT{fastp_outdir_name},
@@ -191,11 +192,9 @@ GetOptions(
     'help|h'                  => \$OPT{help},
 ) or die "Error parsing options. Use -h for usage.\n";
 
-# 무옵션 실행 시 설명서 출력
-if (!@ARGV && !$OPT{help} && !defined $OPT{merged_dir} && !defined $OPT{fixed_bb_file}) {
-    print_usage_and_exit();
-}
-if ($OPT{help}) { print_usage_and_exit(); }
+# 무옵션 실행 시 설명서 출력 (exit 2: 인자 부족). -p/-o 등 어떤 옵션이든 주어지면 -m/-b 는 기본 경로로 진행한다.
+if ($OPT{help}) { print_usage_and_exit(0); }
+if ($NO_CLI_ARGS) { print_usage_and_exit(2); }
 
 # Validate
 my %VALID_DEN = map { $_=>1 } qw(sample_decoded sample_length_passed sample_total_raw library_decoded);
@@ -247,7 +246,8 @@ my $MAX_FAILED_DUMP   = $OPT{max_failed_dump} // 100000;
 
 # 길이 필터 정책/오차 (기본)
 my $LENGTH_FILTER_MODE = $OPT{length_filter_mode};  # 'reject_outside' or 'reject_inside'
-my $LENGTH_TOL         = $OPT{length_tol}+0;
+my $LENGTH_TOL_BASE    = $OPT{length_tol}+0;   # CLI value; never mutated
+my $LENGTH_TOL         = $LENGTH_TOL_BASE;      # per-sample working value (may be changed by -U 1)
 
 # 설계상 Canonical 길이 (옵션 오버라이드 지원)
 my $HP_CAN_LEN    = defined $OPT{hp_len}    ? $OPT{hp_len}+0    : 8;
@@ -302,7 +302,7 @@ unlink($DONE_MARKER) if -e $DONE_MARKER;
 sub ts { scalar localtime() }
 sub log_msg { my ($lvl,$msg)=@_; my $ln=ts()." [$lvl] $msg\n"; print $ln; print $LOG_FH $ln; }
 $SIG{__WARN__} = sub { my $m=join("",@_); chomp($m); log_msg("WARN",$m); };
-$SIG{__DIE__}  = sub { my $m=join("",@_); chomp($m); log_msg("DIE",$m); CORE::die("$m\n"); };
+$SIG{__DIE__}  = sub { return if $^S; my $m=join("",@_); chomp($m); log_msg("DIE",$m); CORE::die("$m\n"); };   # $^S: inside eval -> caller handles it, do not log as DIE
 
 sub dump_effective_config {
     my %conf = (
@@ -356,9 +356,12 @@ sub one_bp_deletion  { my ($s)=@_; my @o; for my $i(0..length($s)-1){ push @o, s
 sub one_bp_insertion {
     my ($s)=@_; my @o; my @nuc=qw(A G C T);
     my $L=length($s); my $first=substr($s,0,1); my $last=substr($s,-1,1);
+    # Insertions at the two ends (i==0, i==L) are deliberately excluded: those strings contain the perfect
+    # anchor as a substring and are already found by the substring search. Inserting $first at i==1 (or
+    # $last at i==L-1) yields the same string as an end insertion, so those are skipped for the same reason.
     for my $i(1..$L-1){ for my $n(@nuc){
-        next if (($i==0||$i==1) && $n eq $first);
-        next if ((($i==$L)||($i==$L-1)) && $n eq $last);
+        next if ($i==1    && $n eq $first);
+        next if ($i==$L-1 && $n eq $last);
         push @o, substr($s,0,$i).$n.substr($s,$i);
     }} @o
 }
@@ -378,21 +381,58 @@ sub mismatch_enabled_for_type {
 }
 
 # --------- BB 파일 로드 & Trie 구축 ----------
-my %VARIANT_SKIPPED;   # type -> count of 1-bp variants dropped because they collide with another anchor of the same lib
-sub _insert_variant_safe {
-    # A 1-bp variant of anchor A may coincide with (a variant of) another anchor B of the same lib when
-    # edit-distance(A,B) <= 2. Such a variant is ambiguous: keep the perfect-match entries and drop the variant
-    # with a warning instead of dying inside LibraryTrie::insert with a cryptic "dup sequence" message.
-    my ($trie, $type, $seq, $info, $lib, $tag_id) = @_;
+my %VARIANT_SKIPPED;   # type -> count of 1-bp variants dropped (collision with a perfect anchor or with another anchor's variant)
+my %VARIANT_AMBIG;     # {type}{lib}{seq} = 1 : variant sequence shared by >=2 anchors of the same lib -> removed from the trie for good
+my %ROWS_SKIPPED;      # reason -> count of BB rows silently ignored (reported once after loading)
+my %ANCHOR_ROWS;       # type -> count of loaded perfect anchor rows
+
+sub _trie_walk {
+    # returns the node for $seq if every character exists on the path, else undef
+    my ($trie, $seq) = @_;
     my $node = $trie;
-    my $exists = 1;
     foreach my $ch (split //, $seq) {
-        if (!exists $node->{children}{$ch}) { $exists = 0; last; }
+        return undef unless exists $node->{children}{$ch};
         $node = $node->{children}{$ch};
     }
-    if ($exists && $node->{is_end} && exists $node->{values}{$lib} && @{ $node->{values}{$lib} }) {
-        $VARIANT_SKIPPED{$type}++;
-        log_msg("WARN", "$type 1-bp variant '$seq' of tag $tag_id (lib '$lib') collides with an existing $type entry; variant skipped (anchors within edit distance 2)")
+    return $node;
+}
+sub _info_qual { my ($info)=@_; my @f = split /\Q$INFO_SEP\E/, $info; return $f[4] // ''; }
+sub _insert_perfect_checked {
+    # Pass 1: perfect anchors only. The only fatal condition is a genuine duplicate of the same perfect sequence
+    # within the same lib/type; report it with the offending tag ids instead of LibraryTrie's generic message.
+    my ($trie, $type, $seq, $info, $lib, $tag_id, $ln) = @_;
+    my $node = _trie_walk($trie, $seq);
+    if ($node && $node->{is_end} && exists $node->{values}{$lib} && @{ $node->{values}{$lib} }) {
+        my @prev_tags = map { (split /\Q$INFO_SEP\E/, $_)[1] // '?' } @{ $node->{values}{$lib} };
+        die "Duplicate $type anchor sequence $seq in lib '$lib' (line $ln, tag $tag_id; already loaded as tag @prev_tags)\n";
+    }
+    $trie->insert($seq, $info, $lib);
+    $ANCHOR_ROWS{$type}++;
+}
+sub _insert_variant_safe {
+    # Pass 2: 1-bp variants. Because every perfect anchor is already in the trie, the outcome does not depend on
+    # the row order of the BB file:
+    #   (i)  variant == perfect sequence of another anchor (edit distance 1)  -> drop the variant, keep the perfect entry
+    #   (ii) variant == variant of another anchor (edit distance 2)           -> ambiguous: drop BOTH (empty the lib's
+    #        values at that node) and remember the sequence so a third anchor cannot re-insert it
+    my ($trie, $type, $seq, $info, $lib, $tag_id) = @_;
+    if ($VARIANT_AMBIG{$type}{$lib}{$seq}) { $VARIANT_SKIPPED{$type}++; return 0; }
+    my $node = _trie_walk($trie, $seq);
+    if ($node && $node->{is_end} && exists $node->{values}{$lib} && @{ $node->{values}{$lib} }) {
+        my @vals = @{ $node->{values}{$lib} };
+        if (grep { _info_qual($_) eq 'perf' } @vals) {
+            $VARIANT_SKIPPED{$type}++;
+            log_msg("WARN", "$type 1-bp variant '$seq' of tag $tag_id (lib '$lib') equals a perfect $type anchor; variant dropped (anchors within edit distance 1)")
+                if $VARIANT_SKIPPED{$type} <= 20;
+            return 0;
+        }
+        # only variants of other anchor(s) live here -> ambiguous sequence, remove them too
+        my @other_tags = remove_dups(map { (split /\Q$INFO_SEP\E/, $_)[1] // '?' } @vals);
+        delete $node->{values}{$lib};
+        $node->{is_end} = 0 unless %{ $node->{values} };
+        $VARIANT_AMBIG{$type}{$lib}{$seq} = 1;
+        $VARIANT_SKIPPED{$type} += 1 + scalar(@vals);
+        log_msg("WARN", "$type 1-bp variant '$seq' is shared by tags @other_tags and $tag_id (lib '$lib'); ambiguous variant removed for all of them (anchors within edit distance 2)")
             if $VARIANT_SKIPPED{$type} <= 20;
         return 0;
     }
@@ -404,16 +444,27 @@ sub load_fixed_bb_and_build_tries {
     log_msg("INFO","Loading fixed BB info: $file");
     open(my $IN,"<",$file) or die "Cannot open $file: $!\n";
     my $ln=0;
+    my @anchor_rows;   # deferred: {trie,type,seq,info_p,info_m,lib,tag_id,ln} for HP/OP/CP (variants inserted in pass 2)
+    my %tries = (HP => $HP_TRIE, OP => $OP_TRIE, CP => $CP_TRIE);
     while(my $line=<$IN>){
         $ln++; chomp($line);
         next if $line =~ /^\s*$/ || $line =~ /^\s*#/;
         my @d = split /\t/, $line, -1;
-        next if @d < 7;
-        my ($type,$seq_raw,$bb_id_fixed,$cycle,$tag_id,$lib_id,$smiles)=@d;
-        if ($ln==1 && $type =~ /^(type|bb[_-]?type)$/i){ next; } # header
+        if (@d < 7) {
+            $ROWS_SKIPPED{short_row}++;
+            log_msg("WARN", "BB line $ln has ".scalar(@d)." columns (<7); skipped") if $ROWS_SKIPPED{short_row} <= 20;
+            next;
+        }
+        my ($type_raw,$seq_raw,$bb_id_fixed,$cycle,$tag_id,$lib_id,$smiles)=@d;
+        my $type = uc($type_raw // ''); $type =~ s/^\s+|\s+$//g;   # 01_preprocess accepts type case-insensitively -> match that here
+        if ($ln==1 && $type =~ /^(TYPE|BB[_-]?TYPE)$/){ next; } # header
 
         my $seq = uc(join("",(split /\s+/,$seq_raw)));
-        next unless $seq =~ /^[ACGT]+$/;
+        unless ($seq =~ /^[ACGT]+$/) {
+            $ROWS_SKIPPED{non_acgt_seq}++;
+            log_msg("WARN", "BB line $ln ($type_raw $tag_id): sequence is not pure ACGT; skipped") if $ROWS_SKIPPED{non_acgt_seq} <= 20;
+            next;
+        }
 
         # Normalize lib_id: treat placeholders (HP/OP/CP/NA/NONE) as global ('')
         my $lib_norm = defined($lib_id) ? $lib_id : "";
@@ -421,55 +472,62 @@ sub load_fixed_bb_and_build_tries {
             $lib_norm = "";
         }
 
-        if ($type =~ /^Codon/i){
+        if ($type =~ /^CODON/){
             die "Codon row missing lib_id at line $ln (type=Codon)\n" if $lib_norm eq "";
-            my $info = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf",$cycle);
+            my $info = join($INFO_SEP, $type_raw,$tag_id,$bb_id_fixed,$smiles,"perf",$cycle);
             $CODON_TRIE->insert($seq,$info,$lib_norm);
             $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
             if ($lib_norm ne "" && $cycle =~ /^[1-4]$/){
                 $LIB_EXPECTED_CYC{$lib_norm}{$cycle}=1;
+            } elsif ($lib_norm ne "") {
+                $ROWS_SKIPPED{codon_cycle_not_1_4}++;
+                log_msg("WARN", "BB line $ln: Codon cycle '$cycle' is not 1..4; this codon can never be selected") if $ROWS_SKIPPED{codon_cycle_not_1_4} <= 20;
             }
-        } elsif ($type eq "CP"){
-            die "CP row missing lib_id at line $ln (type=CP)\n" if $lib_norm eq "";
+        } elsif ($type eq "CP" || $type eq "HP" || $type eq "OP"){
+            die "CP row missing lib_id at line $ln (type=CP)\n" if $type eq "CP" && $lib_norm eq "";
             my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
-            # Enforce design invariant: CP sequences must not collide across libraries.
-            if (exists $CP_VARIANT_OWNER{$seq} && $CP_VARIANT_OWNER{$seq} ne $lib_norm) {
-                die "CP collision across libs (seq=$seq): $CP_VARIANT_OWNER{$seq} vs $lib_norm\n";
-            }
-            $CP_VARIANT_OWNER{$seq} = $lib_norm;
-            $CP_TRIE->insert($seq,$info_p,$lib_norm);
-            if (mismatch_enabled_for_type('CP')){
-                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-                # Enforce design invariant: CP variants (1bp sub/indel) must never collide across libraries.
-                for my $s (@mis) {
-                    if (exists $CP_VARIANT_OWNER{$s} && $CP_VARIANT_OWNER{$s} ne $lib_norm) {
-                        die "CP collision across libs (variant=$s): $CP_VARIANT_OWNER{$s} vs $lib_norm\n";
-                    }
-                    $CP_VARIANT_OWNER{$s} = $lib_norm;
+            my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
+            if ($type eq "CP") {
+                # Enforce design invariant: CP sequences must not collide across libraries.
+                if (exists $CP_VARIANT_OWNER{$seq} && $CP_VARIANT_OWNER{$seq} ne $lib_norm) {
+                    die "CP collision across libs (seq=$seq): $CP_VARIANT_OWNER{$seq} vs $lib_norm\n";
                 }
-                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ _insert_variant_safe($CP_TRIE, 'CP', $s, $info_m, $lib_norm, $tag_id); }
+                $CP_VARIANT_OWNER{$seq} = $lib_norm;
+                $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
             }
-            $LIB_IDS{$lib_norm}=1 if $lib_norm ne "";
-        } elsif ($type eq "HP"){
-            my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
-            $HP_TRIE->insert($seq,$info_p,$lib_norm);
-            if (mismatch_enabled_for_type('HP')){
-                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ _insert_variant_safe($HP_TRIE, 'HP', $s, $info_m, $lib_norm, $tag_id); }
-            }
-        } elsif ($type eq "OP"){
-            my $info_p = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"perf");
-            $OP_TRIE->insert($seq,$info_p,$lib_norm);
-            if (mismatch_enabled_for_type('OP')){
-                my @mis = remove_dups(one_bp_substitution($seq), one_bp_deletion($seq), one_bp_insertion($seq));
-                my $info_m = join($INFO_SEP, $type,$tag_id,$bb_id_fixed,$smiles,"miss");
-                for my $s (@mis){ _insert_variant_safe($OP_TRIE, 'OP', $s, $info_m, $lib_norm, $tag_id); }
-            }
+            # pass 1: perfect sequence now; variants deferred to pass 2
+            _insert_perfect_checked($tries{$type}, $type, $seq, $info_p, $lib_norm, $tag_id, $ln);
+            push @anchor_rows, { type=>$type, seq=>$seq, info_m=>$info_m, lib=>$lib_norm, tag_id=>$tag_id, ln=>$ln }
+                if mismatch_enabled_for_type($type);
+        } else {
+            $ROWS_SKIPPED{unknown_type}++;
+            log_msg("WARN", "BB line $ln: unknown type '$type_raw' (expected CODON/HP/OP/CP); skipped") if $ROWS_SKIPPED{unknown_type} <= 20;
         }
     }
     close($IN);
+
+    # pass 2: 1-bp variants (sub/del/ins) of every anchor, in file order; collisions are resolved order-independently
+    for my $r (@anchor_rows) {
+        my $type = $r->{type};
+        my @mis = remove_dups(one_bp_substitution($r->{seq}), one_bp_deletion($r->{seq}), one_bp_insertion($r->{seq}));
+        if ($type eq 'CP') {
+            # Enforce design invariant: CP variants (1bp sub/indel) must never collide across libraries.
+            for my $s (@mis) {
+                if (exists $CP_VARIANT_OWNER{$s} && $CP_VARIANT_OWNER{$s} ne $r->{lib}) {
+                    die "CP collision across libs (variant=$s): $CP_VARIANT_OWNER{$s} vs $r->{lib}\n";
+                }
+                $CP_VARIANT_OWNER{$s} = $r->{lib};
+            }
+        }
+        for my $s (@mis){ _insert_variant_safe($tries{$type}, $type, $s, $r->{info_m}, $r->{lib}, $r->{tag_id}); }
+    }
+
+    # sanity: something must be decodable
+    if (%ROWS_SKIPPED) {
+        log_msg("WARN", "BB rows skipped: ".join(", ", map { "$_=$ROWS_SKIPPED{$_}" } sort keys %ROWS_SKIPPED));
+    }
+    die "No CP rows loaded from $file (check the 'type' column: CODON/HP/OP/CP)\n" unless $ANCHOR_ROWS{CP};
+    for my $t (qw(HP OP)) { log_msg("WARN", "No $t rows loaded from $file; no read can be decoded") unless $ANCHOR_ROWS{$t}; }
 
     # lib별 expected cycle 확정 (Codon 기반)
     my %final;
@@ -482,7 +540,9 @@ sub load_fixed_bb_and_build_tries {
     %LIB_EXPECTED_CYC = %final;
 
     my @cycle_str = map { "$_:$LIB_EXPECTED_CYC{$_}" } sort keys %LIB_EXPECTED_CYC;
-    log_msg("INFO","Trie build complete. Libs=".scalar(keys %LIB_IDS)."; cycles=".join(", ", @cycle_str));
+    my $skipped_str = %VARIANT_SKIPPED ? join(",", map { "$_:$VARIANT_SKIPPED{$_}" } sort keys %VARIANT_SKIPPED) : "none";
+    log_msg("INFO","Trie build complete. Libs=".scalar(keys %LIB_IDS)."; cycles=".join(", ", @cycle_str)
+                   ."; anchors=".join(",", map { "$_:".($ANCHOR_ROWS{$_}//0) } qw(HP OP CP))."; variants_dropped=$skipped_str");
 }
 
 # --------- Decoding helpers ----------
@@ -615,27 +675,30 @@ sub try_decode_direction {
         my $op_cands = pick_best_anchor_before($op_hits,$cp_pos,$MAX_ANCHOR_CANDS);
         next CP unless $op_cands && @$op_cands;
 
+        # HP hits do not depend on the OP candidate: search once per CP candidate (was inside the OP loop)
+        # Use lib-specific HP hits (and allow global anchors if present)
+        my $hp_hits = $HP_TRIE->search_substrings_by_lib_id($seq, $lib_id);
+        if ($lib_id ne ''){
+            my $hp_glob = $HP_TRIE->search_substrings_by_lib_id($seq, '');
+            push @$hp_hits, @$hp_glob if $hp_glob && @$hp_glob;
+        }
+        next CP unless @$hp_hits;
+        my $expected_cycles = $LIB_EXPECTED_CYC{$lib_id} // 3;
+
         OP: for my $op (@$op_cands){
             my $op_pos=$op->{position};
             my $op_end = $op_pos + length($op->{sequence}) - 1;
-            # Use lib-specific HP hits (and allow global anchors if present)
-            my $hp_hits = $HP_TRIE->search_substrings_by_lib_id($seq, $lib_id);
-            if ($lib_id ne ''){
-                my $hp_glob = $HP_TRIE->search_substrings_by_lib_id($seq, '');
-                push @$hp_hits, @$hp_glob if $hp_glob && @$hp_glob;
-            }
-            next OP unless @$hp_hits;
             my $hp_cands = pick_best_anchor_before($hp_hits,$op_pos,$MAX_ANCHOR_CANDS);
             next OP unless $hp_cands && @$hp_cands;
 
-            my $expected_cycles = $LIB_EXPECTED_CYC{$lib_id} // 3;
+            # Codon selection depends only on (lib, OP end, CP pos): compute once per OP candidate (was inside the HP loop)
+            my $codon_sel = pick_codons_by_adjacency($lib_id,$seq,$op_end,$cp_pos,$expected_cycles,$ADJ_TOL);
+            next OP unless $codon_sel;
 
             HP: for my $hp (@$hp_cands){
                 my $hp_pos=$hp->{position};
                 my $hp_end = $hp_pos + length($hp->{sequence}) - 1;
                 next HP unless _gap_ok($op_pos, $hp_end, $ADJ_TOL);
-                my $codon_sel = pick_codons_by_adjacency($lib_id,$seq,$op_end,$cp_pos,$expected_cycles,$ADJ_TOL);
-                next HP unless $codon_sel;
 
                 my @bbs; for my $c (1..$expected_cycles){ push @bbs, $codon_sel->{$c}{bb_id}; }
                 push @bbs, "NA" if $expected_cycles==3;
@@ -723,8 +786,11 @@ sub list_merged_fastqs {
     my @sel = sort map { $pick{$_}{fn} } keys %pick;
     return map { File::Spec->catfile($dir,$_) } @sel;
 }
+my %SAMPLE_NAME_CACHE;   # "$dir\0$fn" -> sample (avoids repeating the JSON lookup and its WARN for the same file)
 sub sample_name_from_filename {
     my ($fn, $dir)=@_;
+    my $ck = ($dir // '')."\0".$fn;
+    return $SAMPLE_NAME_CACHE{$ck} if exists $SAMPLE_NAME_CACHE{$ck};
     my $s = $fn;
     $s =~ s/\.gz$//i;
     $s =~ s/\.(?:fastq|fq)$//i;
@@ -743,10 +809,14 @@ sub sample_name_from_filename {
         } elsif ($json_stripped && $json_base){
             log_msg("WARN","Ambiguous sample name for $fn (fastp JSON matches '$base' and '$stripped'); keeping '$base'");
         } elsif (!$json_stripped && !$json_base){
-            log_msg("WARN","No fastp JSON to disambiguate $fn; keeping sample name '$base' (suffix preserved)");
+            # The file-name regex only admits merge suffixes (_merged / .fpmerged), so stripping them is unambiguous;
+            # this keeps '<SAMPLE>' as the column name in the --skip-fastp path (README: FASTQ naming), as documented.
+            log_msg("INFO","No fastp JSON for $fn; using sample name '$stripped' (merge suffix stripped)");
+            $base = $stripped;
         }
     }
     $base =~ s/[._-]$//;
+    $SAMPLE_NAME_CACHE{$ck} = $base;
     return $base;
 }
 sub open_maybe_gzip {
@@ -779,6 +849,27 @@ sub open_maybe_gzip {
         open(my $FH, "<", $path) or die "Cannot open $path: $!\n";
         binmode($FH);
         return $FH;
+    }
+}
+sub close_input_or_die {
+    # A truncated/corrupt .gz makes `gzip -cd` exit non-zero while Perl only sees EOF; without this check the sample
+    # would be counted as complete (exit 0, .decode_done written) with a silently reduced read count.
+    my ($fh, $path, $sample) = @_;
+    if (ref($fh) && eval { $fh->isa('IO::Uncompress::Gunzip') }) {
+        my $err = $IO::Uncompress::Gunzip::GunzipError;
+        $fh->close();
+        die "Decompression of $path ($sample) failed: $err. Input may be truncated; aborting to avoid partial counts.\n"
+            if defined $err && length $err;
+        return;
+    }
+    local $! = 0;
+    unless (close($fh)) {
+        my $status = $?;
+        my $rc  = $status >> 8;
+        my $sig = $status & 127;
+        die sprintf("Input stream for %s (%s) ended abnormally (decompressor exit=%d%s%s). Input may be truncated; aborting to avoid partial counts.\n",
+                    $sample, $path, $rc, ($sig ? ", signal=$sig" : ""), ($! ? ", err=$!" : ""))
+            if $status != 0 || $!;
     }
 }
 sub find_fastp_json_for_sample {
@@ -834,12 +925,12 @@ sub _sum_range {
 }
 sub _argmax_key {
     my ($href)=@_; my ($best_k,$best_v)=(undef,-1e99);
-    for my $k (keys %$href){ my $v=$href->{$k}; next unless defined $v; if ($v>$best_v){ $best_v=$v; $best_k=$k; } }
+    for my $k (sort { $a <=> $b } keys %$href){ my $v=$href->{$k}; next unless defined $v; if ($v>$best_v){ $best_v=$v; $best_k=$k; } }   # ties -> smallest length (deterministic)
     return $best_k;
 }
 sub _top_k_peaks {
     my ($href,$k,$min_sep,$min_frac,$total) = @_;
-    my @pairs = sort { $href->{$b} <=> $href->{$a} } keys %$href; # by count desc
+    my @pairs = sort { $href->{$b} <=> $href->{$a} || $a <=> $b } keys %$href; # by count desc, ties by length asc (deterministic across runs)
     my (@sel,@sel_counts);
     CAND: for my $x (@pairs){
         my $cnt = $href->{$x}+0;
@@ -942,7 +1033,7 @@ sub process_merged_dir {
     die "No merged fastq found in $dir (regex=".($OPT{fastq_regex}//'AUTO').")\n"
         unless @fq_paths;
 
-    log_msg("INFO","Length policy = $LENGTH_FILTER_MODE; TOL=$LENGTH_TOL; base exp3=$EXP_LEN_3_BASE; base exp4=$EXP_LEN_4_BASE");
+    log_msg("INFO","Length policy = $LENGTH_FILTER_MODE; TOL=$LENGTH_TOL_BASE; base exp3=$EXP_LEN_3_BASE; base exp4=$EXP_LEN_4_BASE");
     log_msg("INFO","Scaling denominator policy = $SCALING_DENOM");
     log_msg("INFO","FASTQ match regex = ".($OPT{fastq_regex}//'AUTO')."; files=".scalar(@fq_paths));
     for my $p (@fq_paths){ log_msg("INFO","  found: ".basename($p)); }
@@ -954,10 +1045,11 @@ sub process_merged_dir {
         $SAMPLES{$sample}=1;
 
         # --- fastp 기반 자동 길이 감지/조정 (Top-K => multi) ---
-        my ($exp3_local,$exp4_local,$tol_local,$mode_local) = ($EXP_LEN_3_BASE,$EXP_LEN_4_BASE,$LENGTH_TOL,'both');
+        # NOTE: start from the CLI base values every sample; $LENGTH_TOL is overwritten per sample below (-U 1)
+        my ($exp3_local,$exp4_local,$tol_local,$mode_local) = ($EXP_LEN_3_BASE,$EXP_LEN_4_BASE,$LENGTH_TOL_BASE,'both');
         my (@centers_local, @peaks_local, @peak_counts_local);
         if ($AUTO_INSERT_DETECT){
-            my $det = detect_insert_size_for_sample($dir,$sample,$EXP_LEN_3_BASE,$EXP_LEN_4_BASE,$LENGTH_TOL,
+            my $det = detect_insert_size_for_sample($dir,$sample,$EXP_LEN_3_BASE,$EXP_LEN_4_BASE,$LENGTH_TOL_BASE,
                                                     $PEAK_TOP_K,$PEAK_MIN_SEP,$PEAK_MIN_FRAC);
             if ($det && ref($det->{peaks}) eq 'ARRAY' && @{$det->{peaks}}){
                 @peaks_local       = @{$det->{peaks}};
@@ -985,8 +1077,15 @@ sub process_merged_dir {
                     if (defined $det->{support3} && defined $det->{support4} && $det->{total}){
                         my $r3 = $det->{support3} / $det->{total};
                         my $r4 = $det->{support4} / $det->{total};
-                        if ($r3 >= 0.20 && $r4 >= 0.20) { $mode_local = 'both'; }
-                        else { $mode_local = ($r3 >= $r4) ? '3' : '4'; }
+                        if ($r3 <= 0 && $r4 <= 0) {
+                            # no fastp reads near either design length: a 3/4 choice would be arbitrary -> keep Top-K 'multi'
+                            log_msg("WARN", sprintf("%s: -W 1 requested but fastp shows no support for the 3- or 4-cycle window (exp3=%d, exp4=%d, tol=%d); keeping 'multi'",
+                                                    $sample, $EXP_LEN_3_BASE, $EXP_LEN_4_BASE, $LENGTH_TOL_BASE));
+                        } else {
+                            if ($r3 >= 0.20 && $r4 >= 0.20) { $mode_local = 'both'; }
+                            else { $mode_local = ($r3 >= $r4) ? '3' : '4'; }
+                            @centers_local = ();   # centres are only meaningful in 'multi' mode
+                        }
                     }
                 }
                 if ($AUTO_CENTER_WINDOW){
@@ -997,9 +1096,15 @@ sub process_merged_dir {
                         if (defined $target){
                             my $best_d=1e9;
                             for my $p (@peaks_local){ my $d=abs($p-$target); if ($d<$best_d){$best_d=$d;$nearest_peak=$p;} }
-                            if (defined $nearest_peak){
+                            # Only re-centre within a bounded shift; a far-away Top-K peak (adapter dimer, off-design
+                            # product) must not drag the design window away from every real read.
+                            my $max_shift = 2*$LENGTH_TOL_BASE; $max_shift = 6 if $max_shift < 6;
+                            if (defined $nearest_peak && $best_d <= $max_shift){
                                 if ($mode_local eq '3'){ $exp3_local = $nearest_peak; }
                                 if ($mode_local eq '4'){ $exp4_local = $nearest_peak; }
+                            } elsif (defined $nearest_peak) {
+                                log_msg("WARN", sprintf("%s: nearest fastp peak %d is %d nt from design length %d (> max shift %d); window not re-centred",
+                                                        $sample, $nearest_peak, $best_d, $target, $max_shift));
                             }
                         }
                     }
@@ -1049,9 +1154,12 @@ sub process_merged_dir {
         while (1){
             my $hdr = <$IN>; last unless defined $hdr;
             my $seq = <$IN>; my $plus = <$IN>; my $qual = <$IN>;
-            last unless defined $qual;
+            if (!defined $qual) {
+                log_msg("WARN", "$sample: truncated FASTQ record after read $total_reads (header present, <4 lines); dropped");
+                last;
+            }
             chomp($hdr); chomp($seq);
-            $seq =~ s/\r\z//; $seq = uc($seq);   # tolerate CRLF and lower-case FASTQ
+            $hdr =~ s/\r\z//; $seq =~ s/\r\z//; $seq = uc($seq);   # tolerate CRLF (header + sequence) and lower-case FASTQ
             $total_reads++;
             my $read_id=$hdr; $read_id =~ s/^\@//;
             my $read_len=length($seq);
@@ -1087,14 +1195,15 @@ sub process_merged_dir {
                     push @cpos,$p; push @clen,$l;
                 }
 
-                for my $l (@clen){ $QC{$sample}{codon_len_not9}++ if ($l != 9); }
+                # QC thresholds follow the canonical lengths (-c / -Q); column names kept for compatibility
+                for my $l (@clen){ $QC{$sample}{codon_len_not9}++ if ($l != $CODON_CAN_LEN); }
                 my $order_ok = 1;
                 $order_ok &&= ($hp_pos <= $op_pos);
                 my $prev = $op_pos;
                 for my $p (@cpos){ $order_ok &&= ($prev <= $p); $prev = $p; }
                 $order_ok &&= ($cpos[-1] <= $cp_pos);
                 $QC{$sample}{order_violation}++ unless $order_ok;
-                $QC{$sample}{cp_len_out_of_27_29}++ unless ($cp_len >= 27 && $cp_len <= 29);
+                $QC{$sample}{cp_len_out_of_27_29}++ unless ($cp_len >= $CP_CAN_LEN-1 && $cp_len <= $CP_CAN_LEN+1);
 
                 if (!$order_ok){
                     $fail{order_violation}++;
@@ -1145,27 +1254,18 @@ sub process_merged_dir {
                 ), "\n";
 
             } else {
-                my $cp=$CP_TRIE->search_substrings($seq);
-                my $cp_found = (@$cp?1:0);
-                if (!$cp_found){ $fail{no_cp}++; }
-                else {
-                    my $op=$OP_TRIE->search_substrings($seq);
-                    my $op_found = (@$op?1:0);
-                    if (!$op_found){ $fail{no_op}++; }
-                    else {
-                        my $hp=$HP_TRIE->search_substrings($seq);
-                        my $hp_found = (@$hp?1:0);
-                        if (!$hp_found){ $fail{no_hp}++; }
-                        else { $fail{codon_fail}++; }
-                    }
+                # Failure reason: probe the orientation in which a CP exists (decode_one_read tries forward then
+                # revcomp), so revcomp reads are classified by their real missing element instead of always 'no_cp'.
+                # Each trie is searched once; the flags are reused for the undecoded dump.
+                my ($probe,$cp_found) = ($seq,0);
+                for my $s ($seq, rc($seq)){
+                    if (@{ $CP_TRIE->search_substrings($s) }){ $cp_found=1; $probe=$s; last; }
                 }
+                my $op_found = $cp_found ? (@{ $OP_TRIE->search_substrings($probe) } ? 1 : 0) : 0;
+                my $hp_found = $op_found ? (@{ $HP_TRIE->search_substrings($probe) } ? 1 : 0) : 0;
+                my $reason = (!$cp_found) ? "no_cp" : (!$op_found ? "no_op" : (!$hp_found ? "no_hp" : "codon_fail"));
+                $fail{$reason}++;
                 if ($und_written < $MAX_FAILED_DUMP){
-                    my ($op_found,$hp_found)=(0,0);
-                    if ($cp_found){
-                        my $op=$OP_TRIE->search_substrings($seq); $op_found=(@$op?1:0);
-                        if ($op_found){ my $hp=$HP_TRIE->search_substrings($seq); $hp_found=(@$hp?1:0); }
-                    }
-                    my $reason = (!$cp_found) ? "no_cp" : (!$op_found ? "no_op" : (!$hp_found ? "no_hp" : "codon_fail"));
                     print $FUND join("\t",$read_id,$read_len,$seq,$reason,$cp_found,$op_found,$hp_found), "\n";
                     $und_written++;
                 }
@@ -1175,7 +1275,7 @@ sub process_merged_dir {
                 log_msg("INFO","  $sample progress: $total_reads reads, decoded=$decoded");
             }
         }
-        close($IN);
+        close_input_or_die($IN, $path, $sample);
 
         $SUMMARY{$sample}{total_reads}         = $total_reads;
         $SUMMARY{$sample}{length_passed_reads} = $length_passed;
@@ -1206,8 +1306,9 @@ sub print_tsv_header {
     my $line = join("\t", @$cols_ref);
     my $expected = ($label eq 'decoded') ? 35 : 7;
     my $n = scalar(@$cols_ref);
-    if ($n != $expected){ log_msg("DIE","Header[$label] has $n cols (exp $expected)"); die "Header[$label] invalid.\n"; }
-    if ($label eq 'decoded' && $line =~ /OP_seqCP_pos/){ log_msg("DIE","Header concat detected"); die "Header concat.\n"; }
+    # die() alone is enough: $SIG{__DIE__} logs the message once as [DIE]
+    if ($n != $expected){ die "Header[$label] invalid: has $n cols (exp $expected).\n"; }
+    if ($label eq 'decoded' && $line =~ /OP_seqCP_pos/){ die "Header concat detected.\n"; }
     print $fh $line, "\n";
     log_msg("INFO","Header[$label] columns = $n");
 }
@@ -1376,7 +1477,7 @@ sub write_length_window_stats {
         my $wb  = $LEN_WIN{$s}{within_both} // 0;
         my $wm  = $LEN_WIN{$s}{within_multi}// 0;
         my $out = $LEN_WIN{$s}{outside}     // 0;
-        my $conf = $LEN_CONF{$s} // { policy=>$LENGTH_FILTER_MODE, tol=>$LENGTH_TOL, exp3=>$EXP_LEN_3_BASE, exp4=>$EXP_LEN_4_BASE, active_mode=>'both' };
+        my $conf = $LEN_CONF{$s} // { policy=>$LENGTH_FILTER_MODE, tol=>$LENGTH_TOL_BASE, exp3=>$EXP_LEN_3_BASE, exp4=>$EXP_LEN_4_BASE, active_mode=>'both' };
         my $peaks_str   = (exists $conf->{fastp_peaks} && ref($conf->{fastp_peaks}) eq 'ARRAY') ? join(",", @{$conf->{fastp_peaks}}) : "NA";
         my $centers_str = (exists $conf->{active_centers} && ref($conf->{active_centers}) eq 'ARRAY') ? join(",", @{$conf->{active_centers}}) : "NA";
         print $OUT join("\t", $s, $w3, $w4, $wb, $wm, $out,
@@ -1435,6 +1536,7 @@ exit 0;
 # Helpers
 ############################
 sub print_usage_and_exit {
+    my ($code) = @_; $code //= 0;   # 0 for -h; 2 when invoked without any argument
     print <<"USAGE";
 Usage:
   perl $0 -m <MERGED_DIR> -b <FIXED_BB_TSV> [options]
@@ -1465,9 +1567,11 @@ Length filter (base)
   -J, --adj-tol <INT>              Adjacency tolerance between HP/OP/Codon/CP (default: $OPT{adj_tol})
 
 fastp-based auto adjust
-  -A, --auto-insert-detect 0|1     Enable auto detection from fastp JSON (default: 1)
-  -W, --auto-select-window 0|1     Select active window (3/4) from support (mixed => both) (default: 1)
-  -C, --auto-center-window 0|1     Center selected canonical window to nearest peak (default: 1)
+  -A, --auto-insert-detect 0|1     Enable auto detection from fastp JSON (default: $OPT{auto_insert_detect})
+  -W, --auto-select-window 0|1     Select active window (3/4) from support (mixed => both; no support => keep multi)
+                                   (default: $OPT{auto_select_window})
+  -C, --auto-center-window 0|1     Center selected canonical window to nearest peak, requires -W 1; shift capped at
+                                   max(2*length-tol, 6) nt (default: $OPT{auto_center_window})
   -U, --auto-tol-from-fastp 0|1    If width available, set TOL to width/2 (clamped 2..20) (default: 0)
 
 Mixed DEL (Top-K peaks)
@@ -1483,9 +1587,9 @@ General
   -h, --help                       Show this help and exit
 
 Notes
-- Run without options to see this help.
+- Run without options to see this help (exit code 2); -h exits 0.
 - Per-sample policy actually used is saved to length_window_stats.tsv, incl. fastp peaks and active centers.
 - Input fastqs auto-detected: *.fpmerged.fq(.gz), *_merged.fq/.fastq(.gz).
 USAGE
-    exit 0;
+    exit $code;
 }

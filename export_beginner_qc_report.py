@@ -121,10 +121,21 @@ def _auto_del2_col(cols: List[str]) -> Optional[str]:
 
 
 # Anchored: strips only a trailing "_LIB<lib>" namespace token from a single BB value.
-_LIBDEL_RE = re.compile(r"_LIB[^_]+$")
-# Token-anchored variant for full tag IDs (cycles_BB1_BB2_BB3[_BB4]): removes each "_LIB<lib>" token
-# without consuming the following "_BB" tokens (the old unanchored pattern truncated the whole ID).
+_LIBDEL_RE = re.compile(r"_LIB[\w.-]+$")
+# Fallback for full tag IDs (cycles_BB1_BB2_BB3[_BB4]) when no lib_id is known: removes each "_LIB<lib>"
+# token without consuming the following "_BB" tokens. It is ambiguous for lib_ids that contain "_"
+# (01_preprocess allows [A-Za-z0-9_.-]), so callers pass the run's known lib_ids whenever available.
 _LIBDEL_TOKEN_RE = re.compile(r"_LIB[^_]+(?=_|$)")
+_NA_LIB_VALUES = {"", "na", "nan", "none", "<na>"}
+
+
+def _known_libs(series) -> Tuple[str, ...]:
+    """Distinct real lib_ids from a LIB_ID column (NA-like values dropped), longest first."""
+    if series is None:
+        return ()
+    vals = {str(v).strip() for v in series.dropna().unique()}
+    vals = {v for v in vals if v.lower() not in _NA_LIB_VALUES}
+    return tuple(sorted(vals, key=len, reverse=True))
 
 
 def _strip_libdel(value) -> str:
@@ -133,10 +144,18 @@ def _strip_libdel(value) -> str:
     return _LIBDEL_RE.sub("", str(value))
 
 
-def _strip_libdel_anywhere(value) -> str:
+def _strip_libdel_anywhere(value, known_libs: Tuple[str, ...] = ()) -> str:
+    """Remove "_LIB<lib>" tokens from a full tag ID. With known lib_ids only the exact tokens
+    "_LIB<lib_id>" (followed by "_" or end) are removed; the generic regex is used only when no
+    lib_id is known for the run."""
     if pd.isna(value):
         return ""
-    return _LIBDEL_TOKEN_RE.sub("", str(value))
+    s = str(value)
+    if known_libs:
+        for lib in known_libs:
+            s = re.sub(r"_LIB" + re.escape(lib) + r"(?=_|$)", "", s)
+        return s
+    return _LIBDEL_TOKEN_RE.sub("", s)
 
 
 def _pick_bb_value(row: pd.Series, base: str) -> str:
@@ -146,11 +165,13 @@ def _pick_bb_value(row: pd.Series, base: str) -> str:
     return ""
 
 
-def _make_display_id(lib: str, bb1: str, bb2: str, bb3: str, bb4: str, fallback_id: str) -> str:
-    lib = (lib or "").strip()
-    if lib:
+def _make_display_id(lib: str, bb1: str, bb2: str, bb3: str, bb4: str, fallback_id: str,
+                     known_libs: Tuple[str, ...] = ()) -> str:
+    # NaN (pandas reads a literal "NA" lib_id as NaN) is truthy, so test with isna before str()
+    lib = "" if (lib is None or (isinstance(lib, float) and np.isnan(lib))) else str(lib).strip()
+    if lib and lib.lower() not in _NA_LIB_VALUES:
         return f"{lib}_{bb1}_{bb2}_{bb3}_{bb4}"
-    return _strip_libdel_anywhere(fallback_id)
+    return _strip_libdel_anywhere(fallback_id, known_libs)
 
 
 def _neg_quantile_threshold(series: pd.Series, quantile: float) -> Optional[float]:
@@ -223,6 +244,13 @@ def _build_top_table(df: pd.DataFrame, top_n: int, neg_high_quantile: float,
                      diverse_key: str) -> Tuple[pd.DataFrame, str, dict, dict]:
     df_all = _add_hit_score(df.copy())
     df_all = df_all[np.isfinite(df_all["HitScore"])].copy()
+    # Coerce the metric columns used by _qc_flags once (non-numeric strings become NaN instead of raising)
+    for c in ("LFC_NEG_centered", "LFC_NEG_centered_R1", "LFC_R1_vs_DEL2_used", "LFC_R2_vs_DEL2_used",
+              "LFC_R1_vs_DEL2", "LFC_R2_vs_DEL2"):
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+    lib_col_all = _pick_col(list(df_all.columns), ["LIB_ID", "LIB_ID_x", "LIB_ID_y"])
+    known_libs = _known_libs(df_all[lib_col_all]) if lib_col_all else ()
     neg_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered"), neg_high_quantile)
     neg_r1_thr = _neg_quantile_threshold(df_all.get("LFC_NEG_centered_R1"), neg_high_quantile)
 
@@ -297,6 +325,7 @@ def _build_top_table(df: pd.DataFrame, top_n: int, neg_high_quantile: float,
                 r.get("BB3", "NA"),
                 r.get("BB4", "NA"),
                 raw_id.loc[r.name],
+                known_libs,
             ),
             axis=1,
         )
@@ -418,9 +447,19 @@ def main() -> None:
         summary["run"] = run_name
         summaries.append(summary)
 
-        # DEL2 column: explicit --del2_col > hit_params.json (orchestrator) > name heuristic
-        del2_override = args.del2_col or _load_del2_from_params(annot_path) or ""
-        if del2_override and del2_override in df.columns:
+        # DEL2 column: explicit --del2_col > hit_params.json (orchestrator/03) > name heuristic.
+        # An explicit name that is not a column falls through to the next source (with a warning)
+        # instead of silently skipping hit_params.json.
+        del2_from_params = _load_del2_from_params(annot_path)
+        del2_override = ""
+        for cand in (args.del2_col, del2_from_params):
+            if cand and cand in df.columns:
+                del2_override = cand
+                break
+        if args.del2_col and args.del2_col not in df.columns:
+            nxt = f"hit_params.json ({del2_from_params})" if del2_override else "name heuristic"
+            print(f"[WARN] --del2_col {args.del2_col!r} is not a column of {annot_path}; using {nxt}")
+        if del2_override:
             df = df.rename(columns={del2_override: "DEL2_OVERRIDE"})
         top_table, del2_col, th, rec = _build_top_table(
             df, args.top_n, args.neg_high_quantile,
@@ -429,12 +468,13 @@ def main() -> None:
         top_table.insert(1, "Run", run_name)
         top_tables.append(top_table)
 
+        def _fmt_thr(v) -> str:
+            return f"≥ {v:.3f}" if v is not None else "n/a (column missing)"
+
         thr_note = (
-            f"<p class='small'>QC thresholds: NEG_HIGH ≥ {th['neg_high_thr']:.3f}, "
-            f"NEG_R1_HIGH ≥ {th['neg_r1_high_thr']:.3f} "
+            f"<p class='small'>QC thresholds: NEG_HIGH {_fmt_thr(th['neg_high_thr'])}, "
+            f"NEG_R1_HIGH {_fmt_thr(th['neg_r1_high_thr'])} "
             f"(quantile={th['neg_high_quantile']:.2f}, min=0)</p>"
-            if th["neg_high_thr"] is not None and th["neg_r1_high_thr"] is not None
-            else "<p class='small'>QC thresholds: NEG_HIGH/NEG_R1_HIGH unavailable (missing columns).</p>"
         )
         rec_html = (
             f"<h3>Recommended Tier A (Top {args.recommend_a})</h3>"
@@ -505,6 +545,7 @@ def main() -> None:
   <ul class="small">
     <li><b>LOW_DEL2</b>: DEL2 raw count &lt; 10 (기저 카운트가 낮아 변동성 큼)</li>
     <li><b>NEG_HIGH</b>: LFC_NEG_centered ≥ Q{int(args.neg_high_quantile * 100)} (per-run, 최소 0)</li>
+    <li><b>NEG_R1_HIGH</b>: LFC_NEG_centered_R1 ≥ Q{int(args.neg_high_quantile * 100)} (per-run, 최소 0)</li>
     <li><b>R2_DROP</b>: LFC_R2_vs_DEL2가 R1보다 1.0 이상 낮음 (재결합 단계에서 급감)</li>
     <li><b>BB_MISSING</b>: BB1~BB3 중 누락</li>
     <li><b>NEG_HARD_FAIL</b>: NEG_hard_fail = TRUE</li>

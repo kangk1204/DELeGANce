@@ -94,15 +94,30 @@ def _file_or_gz_exists(path: str) -> bool:
     return os.path.isfile(path) or os.path.isfile(path + ".gz")
 
 
-def _log_has_marker(path: str, marker: str) -> bool:
+def _log_done_after_last_start(path: str, start_markers, done_marker: str) -> bool:
+    """True only if the LAST run recorded in an append-mode stage log completed.
+
+    The Perl stages append to their logs, so an 'All done.' line from an earlier successful run
+    survives a later failed rerun. We therefore require the last `done_marker` line to appear
+    AFTER the last run-start line (any of `start_markers`). Logs without any start line (very old
+    runs) fall back to plain presence of the done marker.
+    """
+    last_start = -1
+    last_done = -1
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if marker in line:
-                    return True
+            for i, line in enumerate(f):
+                if any(m in line for m in start_markers):
+                    last_start = i
+                if done_marker in line:
+                    last_done = i
     except Exception:
         return False
-    return False
+    if last_done < 0:
+        return False
+    if last_start < 0:
+        return True
+    return last_done > last_start
 
 
 def _env_int(name: str, default: int) -> int:
@@ -118,13 +133,16 @@ def _env_int(name: str, default: int) -> int:
 # files (written by the stage on success); accept the log marker only as legacy fallback.
 PREPROCESS_DONE_MARKER = os.path.join('01_fastp_out', '.preprocess_done')
 DECODE_DONE_MARKER = os.path.join('02_decoded', '.decode_done')
+# First log line each Perl stage writes at run start (present in legacy versions as well).
+PREPROCESS_START_MARKERS = ("Starting preprocess.",)
+DECODE_START_MARKERS = ("Merged dir = ", "Effective config:")
 
 
-def _stage_done(marker_path: str, log_path: str) -> bool:
-    """True if the stage marker file exists, or (legacy runs) the log contains 'All done.'."""
+def _stage_done(marker_path: str, log_path: str, start_markers) -> bool:
+    """True if the stage marker file exists, or (legacy runs) the log's LAST run ends with 'All done.'."""
     if os.path.isfile(marker_path):
         return True
-    return _log_has_marker(log_path, "All done.")
+    return _log_done_after_last_start(log_path, start_markers, "All done.")
 
 
 def _clear_marker(marker_path: str):
@@ -162,7 +180,7 @@ def _has_fastp_outputs(run_root: str) -> bool:
     log_path = os.path.join(run_root, '01_preprocess_reads.log')
     marker = os.path.join(run_root, PREPROCESS_DONE_MARKER)
     merged = _list_merged_fastqs(merged_dir)
-    return bool(merged) and _file_or_gz_exists(fixed_bb) and _stage_done(marker, log_path)
+    return bool(merged) and _file_or_gz_exists(fixed_bb) and _stage_done(marker, log_path, PREPROCESS_START_MARKERS)
 
 
 def _has_merged_fastqs(run_root: str) -> bool:
@@ -179,7 +197,7 @@ def _has_decoded_outputs(run_root: str) -> bool:
     raw = os.path.join(decoded_dir, 'raw_counts_matrix.tsv')
     log_path = os.path.join(decoded_dir, '02_decode_reads.log')
     marker = os.path.join(run_root, DECODE_DONE_MARKER)
-    return _file_or_gz_exists(raw) and _stage_done(marker, log_path)
+    return _file_or_gz_exists(raw) and _stage_done(marker, log_path, DECODE_START_MARKERS)
 
 
 def _pick_decoded_matrix(run_root: str) -> str:
@@ -220,7 +238,8 @@ def _estimate_rows(path: str) -> int:
     """Heuristically estimate row count for (possibly gzipped) TSV, ignoring header.
 
     Result is memoised per path: a multi-GB matrix must not be re-scanned for every
-    auto-optimisation question asked in one run. Returns -1 (with a warning) on failure.
+    auto-optimisation question asked in one run. Returns -1 when the file does not exist, or
+    (with a warning) when counting fails.
     """
     if path in _ESTIMATE_ROWS_CACHE:
         return _ESTIMATE_ROWS_CACHE[path]
@@ -356,28 +375,44 @@ def _fastq_dir_fingerprint(fastq_dir: str):
     return items
 
 
-def _build_preproc_payload(args, preproc_path: str, fastq_dir: str, bbinfo: str):
+def _merged_dir_fingerprint(merged_dir: str):
+    items = []
+    for name in _list_merged_fastqs(merged_dir):
+        fp = _file_fingerprint(os.path.join(merged_dir, name))
+        if fp:
+            items.append(fp)
+    return sorted(items, key=lambda x: x["path"])
+
+
+def _build_preproc_payload(args, preproc_path: str, fastq_dir: str, bbinfo: str, merged_dir: str):
+    skip_fastp = bool(args.skip_fastp)
     return {
         "version": 1,
         "script": os.path.basename(preproc_path),
         "script_mtime": os.path.getmtime(preproc_path) if os.path.isfile(preproc_path) else None,
         "fastq_dir": os.path.abspath(fastq_dir) if fastq_dir else "",
-        "fastq_fingerprint": _fastq_dir_fingerprint(fastq_dir) if fastq_dir else [],
+        # With --skip-fastp the raw FASTQs are never read (01 skips run_fastp); the merged FASTQs
+        # already present in 01_fastp_out are the real inputs, so fingerprint those instead.
+        "fastq_fingerprint": _fastq_dir_fingerprint(fastq_dir) if (fastq_dir and not skip_fastp) else [],
+        "merged_fingerprint": _merged_dir_fingerprint(merged_dir) if skip_fastp else [],
         "bbinfo": _file_fingerprint(bbinfo),
         "mismatch": args.mismatch,
-        "skip_fastp": bool(args.skip_fastp),
+        "skip_fastp": skip_fastp,
         # NOTE: fastp thread count does not change outputs; deliberately not part of the hash.
     }
 
 
-def _build_decode_payload(decode_path: str, merged_dir: str, fixed_bb: str, preproc_hash: str, mismatch: str):
+def _build_decode_payload(decode_path: str, merged_dir: str, fixed_bb: str, mismatch: str):
+    # v2: the input dependency is the fingerprint of the merged FASTQs the decoder reads (plus the
+    # fixed BB table). v1 chained the preprocess hash, which depended on raw-FASTQ mtimes, so
+    # deleting the raw FASTQ directory after a successful run invalidated the decode cache.
     return {
-        "version": 1,
+        "version": 2,
         "script": os.path.basename(decode_path),
         "script_mtime": os.path.getmtime(decode_path) if os.path.isfile(decode_path) else None,
         "merged_dir": os.path.abspath(merged_dir),
+        "merged_fingerprint": _merged_dir_fingerprint(merged_dir),
         "fixed_bb": _file_fingerprint(fixed_bb),
-        "preprocess_hash": preproc_hash,
         "mismatch": mismatch,
     }
 
@@ -399,9 +434,6 @@ def _write_json(path: str, payload: dict):
         print(f"[WARN] Failed to write {path}: {e}")
 
 
-# (deduplicated helper definitions)
-
-
 def build_parser():
     p = argparse.ArgumentParser(
         description="DELeGANce — End‑to‑End pipeline runner",
@@ -410,7 +442,7 @@ def build_parser():
 
     # Core inputs (REQUIRED by default)
     p.add_argument('--fastq-dir', required=False,
-                   help='Directory containing paired FASTQs (required if running preprocess)')
+                   help='Directory containing paired FASTQs (required if running preprocess without --skip-fastp)')
     p.add_argument('--bbinfo', required=False,
                    help='BB information file (required if running preprocess)')
     p.add_argument('--output-dir', required=True,
@@ -441,7 +473,7 @@ def build_parser():
     # Accept comma- or space-separated lists for R1/R2; NEG supports 1 or 2 names (R1, optional R2)
     p.add_argument('--r1', nargs='+', required=False, help='R1 columns (one or more)')
     p.add_argument('--r2', nargs='+', required=False, help='R2 columns (optional; omit for R1-only)')
-    p.add_argument('--neg', nargs='+', required=False, help='NEG columns: R1 [R2 optional]')
+    p.add_argument('--neg', nargs='+', required=False, help='NEG columns: R1 [R2 optional] (at most two)')
     p.add_argument('--del2', required=False, help='DEL2 column name')
 
     # Advanced: pass-through knobs for all-in-one (optional; else defaults apply)
@@ -498,10 +530,11 @@ def main():
     base_dir = os.getcwd()
     run_root_abs = os.path.abspath(os.path.join(base_dir, args.output_dir)) if not os.path.isabs(args.output_dir) else os.path.abspath(args.output_dir)
     run_root_rel = os.path.relpath(run_root_abs, base_dir)
-    ensure_dir(run_root_abs)
     # Default normalized root; the final per-run output directory will be set after auto-opt
     norm_root_abs = os.path.join(run_root_abs, '03_normalized')
-    ensure_dir(norm_root_abs)
+    if not args.dry_run:
+        ensure_dir(run_root_abs)
+        ensure_dir(norm_root_abs)
     hit_out = None  # decide after auto-optimization so that GLM mode suffix is reflected
     hit_out_abs = None
 
@@ -549,6 +582,9 @@ def main():
         if len(neg_cols) == 0:
             print('[ERROR] --neg must specify at least one column (NEG for R1; optional second for R2)')
             return 2
+        if len(neg_cols) > 2:
+            print(f"[ERROR] --neg accepts at most two columns (NEG for R1, optional NEG for R2); got {len(neg_cols)}: {' '.join(neg_cols)}")
+            return 2
         if del2_col == '':
             print('[ERROR] --del2 must not be empty')
             return 2
@@ -558,6 +594,7 @@ def main():
     preproc_out_dir = os.path.join(run_root_abs, '01_fastp_out')
     preproc_params_path = os.path.join(preproc_out_dir, 'preprocess_params.json')
     preproc_marker = os.path.join(run_root_abs, PREPROCESS_DONE_MARKER)
+    merged_dir = preproc_out_dir
     cached_preproc = _load_json(preproc_params_path)
     # Effective inputs: explicit CLI values win; otherwise fall back to what the cached run used.
     fastq_dir_eff = args.fastq_dir or ""
@@ -570,31 +607,42 @@ def main():
             if isinstance(bb_fp, dict):
                 bbinfo_eff = str(bb_fp.get("path") or "")
     preprocess_done = _has_fastp_outputs(run_root_abs)
-    preproc_payload = _build_preproc_payload(args, preproc, fastq_dir_eff, bbinfo_eff)
+    preproc_payload = _build_preproc_payload(args, preproc, fastq_dir_eff, bbinfo_eff, merged_dir)
     preproc_hash = _hash_payload(preproc_payload)
     preproc_payload["hash"] = preproc_hash
     preproc_cache_ok = preprocess_done and isinstance(cached_preproc, dict) and str(cached_preproc.get("hash", "")) == preproc_hash
     will_run_preprocess = args.only in ('all', 'preprocess') and (args.force_preprocess or not preproc_cache_ok)
+    preproc_skip_note = f"outputs + cache match (hash={preproc_hash[:12]})"
     if preprocess_done and not preproc_cache_ok and args.only in ('all', 'preprocess'):
         cached_hash = cached_preproc.get("hash") if isinstance(cached_preproc, dict) else None
         if cached_hash:
             print(f"[INFO] Preprocess outputs found but parameter hash differs (cached={cached_hash[:12]}, current={preproc_hash[:12]}). Will rerun.")
         else:
             print("[INFO] Preprocess outputs found but cache missing/invalid. Will rerun.")
-    if not preproc_cache_ok:
-        preprocess_done = False
-
     if will_run_preprocess and (not args.skip_fastp) and not which('fastp'):
+        if not _has_merged_fastqs(run_root_abs):
+            print('[ERROR] fastp not found in PATH and no merged FASTQs exist under RUN_ROOT/01_fastp_out.')
+            print('        Install fastp, or provide pre-merged FASTQs in 01_fastp_out and pass --skip-fastp.')
+            return 2
         print('[WARN] fastp not found; switching to --skip-fastp for preprocess')
         args.skip_fastp = True
         preproc_payload["skip_fastp_effective"] = True  # informational only (hash already computed)
 
-    # Validate required inputs only if we will actually run preprocess
+    # Validate required inputs only if we will actually run preprocess. With --skip-fastp the
+    # preprocess stage never reads the raw FASTQ directory (01 skips run_fastp), so it is optional.
     if will_run_preprocess:
-        if not fastq_dir_eff or not os.path.isdir(fastq_dir_eff):
-            print('[ERROR] --fastq-dir is required for preprocess and must exist (or provide existing, cache-matching outputs under RUN_ROOT/01_fastp_out)')
-            return 2
-        if not bbinfo_eff or not os.path.isfile(bbinfo_eff):
+        if not args.skip_fastp and (not fastq_dir_eff or not os.path.isdir(fastq_dir_eff)):
+            if preprocess_done and not args.force_preprocess:
+                # Outputs + completion marker exist and only the raw FASTQs are gone (e.g. deleted to
+                # save space): keep the existing preprocess outputs instead of failing the whole run.
+                print('[WARN] Raw FASTQ directory is missing but complete preprocess outputs exist under RUN_ROOT; '
+                      'keeping them (preprocess cache not refreshed). Use --force-preprocess with --fastq-dir to redo.')
+                will_run_preprocess = False
+                preproc_skip_note = "existing outputs kept (raw FASTQ dir missing; cache not refreshed)"
+            else:
+                print('[ERROR] --fastq-dir is required for preprocess and must exist (or provide existing, cache-matching outputs under RUN_ROOT/01_fastp_out)')
+                return 2
+        if will_run_preprocess and (not bbinfo_eff or not os.path.isfile(bbinfo_eff)):
             print('[ERROR] --bbinfo is required for preprocess and must point to a file (or provide existing, cache-matching outputs under RUN_ROOT)')
             return 2
 
@@ -602,13 +650,12 @@ def main():
     decode_out_dir = os.path.join(run_root_abs, '02_decoded')
     decode_params_path = os.path.join(decode_out_dir, 'decode_params.json')
     decode_marker = os.path.join(run_root_abs, DECODE_DONE_MARKER)
-    merged_dir = os.path.join(run_root_abs, '01_fastp_out')
     fixed_bb   = os.path.join(run_root_abs, 'BB_information_fixed.tsv')
 
-    # If we are skipping fastp, merged FASTQs must already exist. BB_information_fixed.tsv is
-    # produced by the preprocess stage itself (also with --skip-fastp), so it is only required
-    # when preprocess will NOT run in this invocation.
-    if args.skip_fastp and args.only in ('all', 'decode', 'hit'):
+    # If we are skipping fastp, merged FASTQs must already exist for preprocess/decode (the hit
+    # stage only needs the decoded matrix). BB_information_fixed.tsv is produced by the preprocess
+    # stage itself (also with --skip-fastp), so it is only required when preprocess will NOT run.
+    if args.skip_fastp and args.only in ('all', 'decode'):
         if not _has_merged_fastqs(run_root_abs):
             print('[ERROR] --skip-fastp requested but no merged FASTQs found under RUN_ROOT/01_fastp_out.')
             print('        Either run fastp (omit --skip-fastp) or provide merged FASTQs in 01_fastp_out first.')
@@ -628,19 +675,23 @@ def main():
     rc = 0
     if args.only in ('all', 'preprocess'):
         if not will_run_preprocess:
-            print(f"[INFO] Preprocess outputs + cache match (hash={preproc_hash[:12]}); skipping preprocess.")
+            print(f"[INFO] Preprocess {preproc_skip_note}; skipping preprocess.")
         else:
             cmd = ['perl', preproc]
             cmd += ['-b', bbinfo_eff]
             # pass absolute run_root to preprocess; it detects absolute and uses it directly
-            cmd += ['-f', fastq_dir_eff, '-o', run_root_abs, '-t', str(int(args.threads)), '--mismatch', args.mismatch]
+            if fastq_dir_eff:
+                cmd += ['-f', fastq_dir_eff]
+            cmd += ['-o', run_root_abs, '-t', str(int(args.threads)), '--mismatch', args.mismatch]
             if args.skip_fastp:
                 cmd += ['--skip-fastp']
             print(f"[INFO] Preprocess → RUN_ROOT={run_root_abs}")
             if args.dry_run:
                 print('DRY-RUN:', ' '.join(cmd))
             else:
+                # A failed rerun must not leave the previous run's marker/cache behind.
                 _clear_marker(preproc_marker)
+                _clear_marker(preproc_params_path)
                 rc = run_cmd(cmd, master_log)
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] Preprocess failed; aborting.')
@@ -653,7 +704,7 @@ def main():
     # Decode cache/hash setup — computed here, after preprocess has (re)written
     # BB_information_fixed.tsv, so the stored fingerprint matches the file the decode actually used.
     decode_done = _has_decoded_outputs(run_root_abs)
-    decode_payload = _build_decode_payload(decode, merged_dir, fixed_bb, preproc_hash, args.mismatch)
+    decode_payload = _build_decode_payload(decode, merged_dir, fixed_bb, args.mismatch)
     decode_hash = _hash_payload(decode_payload)
     decode_payload["hash"] = decode_hash
     cached_decode = _load_json(decode_params_path)
@@ -679,6 +730,7 @@ def main():
                 print('DRY-RUN:', ' '.join(cmd))
             else:
                 _clear_marker(decode_marker)
+                _clear_marker(decode_params_path)
                 rc = run_cmd(cmd, master_log)
                 if rc != 0 and args.stop_on_error:
                     print('[ERROR] Decode failed; aborting.')
@@ -688,8 +740,9 @@ def main():
                     _write_json(decode_params_path, decode_payload)
                     print(f"[OK] Stored decode parameter hash: {decode_hash[:12]}")
 
-    # Auto-optimization: choose device/dtype/GLM mode heuristically if not specified
-    if int(getattr(args, 'auto_opt', 1)) == 1:
+    # Auto-optimization: choose device/dtype/GLM mode heuristically if not specified.
+    # Only when the hit stage will run: estimating the matrix size scans the (possibly multi-GB) file.
+    if int(getattr(args, 'auto_opt', 1)) == 1 and args.only in ('all', 'hit'):
         # Device/dtype
         # Honour DELEGANCE_DISABLE_TORCH (03_call_hits.py does): otherwise the output dir would be
         # labelled dev_cuda_fp32 while the hit-caller actually runs its CPU/float64 fallback.
@@ -751,6 +804,16 @@ def main():
             args.prefilter_min_total = min_tot
             args.prefilter_min_del2 = min_del2
             print(f"[AUTO] Prefilter tuned: del2_q={q}, min_total={min_tot}, min_del2={min_del2}")
+        # 03_call_hits.py forces glm_mode=top back to CPU unless the GPU is explicitly forced
+        # (--force_gpu_top 1 or DELEGANCE_FORCE_GPU_TOP). Mirror that here so the output directory
+        # token (dev_*) and hit_params.json describe the device actually used.
+        env_force_gpu = os.environ.get("DELEGANCE_FORCE_GPU_TOP", "").strip().lower() in ("1", "true", "yes", "y")
+        if (args.glm_mode == 'top' and str(args.device or '').startswith('cuda')
+                and int(args.force_gpu_top or 0) != 1 and not env_force_gpu):
+            print('[AUTO] glm_mode=top on CUDA is forced to CPU by 03_call_hits.py; using --device cpu '
+                  '(pass --force-gpu-top 1 to keep CUDA)')
+            args.device = 'cpu'
+            args.dtype = None
 
     # Decide final output directory name (after auto-opt so we know glm_mode)
     if args.hit_out:
@@ -856,7 +919,7 @@ def main():
             print(f"[INFO] Cached HitCaller outputs match parameters (hash={current_hash[:12]}). Skipping recompute.")
         else:
             cmd = [sys.executable, hitter, '--run_root', run_root_abs, '--outdir', hit_out]
-        # Column names
+            # Column names
             cmd += ['--del2_col', del2_col]
             cmd += ['--r1_cols', *r1_cols]
             if len(r2_cols) > 0:
@@ -865,7 +928,7 @@ def main():
                 cmd += ['--neg_r1_col', neg_cols[0]]
             if len(neg_cols) >= 2:
                 cmd += ['--neg_r2_col', neg_cols[1]]
-        # Optional passthroughs
+            # Optional passthroughs
             if args.neg_gate_mode: cmd += ['--neg_gate_mode', args.neg_gate_mode]
             if args.neg_centering is not None: cmd += ['--neg_centering', str(int(args.neg_centering))]
             if args.topk is not None: cmd += ['--topk', str(int(args.topk))]
@@ -1059,7 +1122,6 @@ def main():
                     *_result_items(rel_base, norm_root_abs),
                     *inter_items,
                     "</ul>",
-                    f"<p>Interactive: <a href='{_h(rel_base)}/interactive_hits.html'>interactive_hits.html</a></p>" if inter_iframe else "",
                     inter_iframe,
                     "</section>",
                 ]
@@ -1067,9 +1129,14 @@ def main():
             for name, absdir in presets:
                 rel = os.path.relpath(absdir, run_root_abs)
                 inter_items, inter_iframe = _interactive_items(rel, absdir)
-                # Derive preset and tags from folder name convention
-                if '_' in name:
-                    preset_name = name.split('_', 1)[0]
+                # Derive preset and tags from folder name convention. Directories created without
+                # --preset start directly with a tag token (glm_/r1only/dev_/pf_/legacy_).
+                first_tok = name.split('_', 1)[0]
+                if first_tok in ('glm', 'r1only', 'dev', 'pf'):
+                    preset_name = '(none)'
+                    tag_str = name
+                elif '_' in name:
+                    preset_name = first_tok
                     tag_str = name[len(preset_name)+1:]
                 else:
                     preset_name = name
@@ -1081,14 +1148,16 @@ def main():
                     *_result_items(rel, absdir),
                     *inter_items,
                     "</ul>",
-                    f"<p>Interactive: <a href='{_h(rel)}/interactive_hits.html'>interactive_hits.html</a></p>" if inter_iframe else "",
                     inter_iframe,
                     "</section>",
                 ]
             html += ["</body></html>"]
-            with open(index_html, 'w', encoding='utf-8') as f:
-                f.write("\n".join(html))
-            print(f"[OK] Wrote index.html → {index_html}")
+            if args.dry_run:
+                print(f"DRY-RUN: would write {index_html}")
+            else:
+                with open(index_html, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(html))
+                print(f"[OK] Wrote index.html → {index_html}")
         except Exception as e:
             print(f"[WARN] Failed to write index.html: {e}")
 

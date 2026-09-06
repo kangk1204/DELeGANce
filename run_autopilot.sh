@@ -43,7 +43,7 @@ Usage:
   $(basename "$0") tail       # tail pipeline log
 
 Env overrides:
-  RUN_NAME, RUN_ROOT, SRC_FASTP_OUT, FASTQ_DIR, BBINFO, THREADS, MISMATCH_MODE, DEL2_COL
+  RUN_NAME, RUN_ROOT, SRC_FASTP_OUT, FASTQ_DIR (optional; not read with --skip-fastp), BBINFO, THREADS, MISMATCH_MODE, DEL2_COL
   R1_COLS, R2_COLS, NEG_COLS   (space-separated column lists; R2_COLS="" for R1-only)
   DELEGANCE_DISABLE_TORCH      (default 1: hit-caller uses the lightweight CPU GLM fallback,
                                 which 03_call_hits.py reports as reduced accuracy; set 0 to use torch)
@@ -66,7 +66,12 @@ link_fastp_outputs() {
     local base dest
     base="$(basename "$src")"
     dest="$RUN_ROOT/01_fastp_out/$base"
-    if [[ -e "$dest" ]]; then
+    # A dangling symlink (e.g. left by an older run that linked a relative SRC_FASTP_OUT) makes
+    # `-e` false but still blocks `ln -s`; replace it instead of aborting under set -e.
+    if [[ -L "$dest" && ! -e "$dest" ]]; then
+      rm -f "$dest"
+    fi
+    if [[ -e "$dest" || -L "$dest" ]]; then
       continue
     fi
     ln -s "$src" "$dest"
@@ -98,7 +103,9 @@ run_pipeline() {
     echo "[ERROR] BBINFO not found: $BBINFO" >&2
     exit 2
   fi
-  if [[ ! -d "$FASTQ_DIR" ]]; then
+  # The pipeline is run with --skip-fastp (merged FASTQs are linked from SRC_FASTP_OUT), so the raw
+  # FASTQ directory is never read; it is only validated/passed when one was actually given/found.
+  if [[ -n "$FASTQ_DIR" && ! -d "$FASTQ_DIR" ]]; then
     echo "[ERROR] FASTQ_DIR not found: $FASTQ_DIR" >&2
     exit 2
   fi
@@ -111,7 +118,7 @@ run_pipeline() {
   export DELEGANCE_DISABLE_TORCH="${DELEGANCE_DISABLE_TORCH:-1}"
 
   python3 "$ROOT_DIR/run_delegance_pipeline.py" \
-    --fastq-dir "$FASTQ_DIR" \
+    ${FASTQ_DIR:+--fastq-dir "$FASTQ_DIR"} \
     --bbinfo "$BBINFO" \
     --output-dir "$RUN_ROOT" \
     --threads "$THREADS" \
